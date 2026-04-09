@@ -202,9 +202,9 @@ class GaussianModel:
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._extinction], 'lr': training_args.opacity_lr, "name": "extinction"},
+            {'params': [self._extinction], 'lr': training_args.extiction_lr, "name": "extinction"},
             {'params': [self._albedo], 'lr': training_args.feature_lr, "name": "albedo"},
-            {'params': [self._g_factor], 'lr': training_args.opacity_lr / 10.0, "name": "g_factor"},
+            {'params': [self._g_factor], 'lr': training_args.g_factor_lr, "name": "g_factor"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 
@@ -231,17 +231,38 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+        # Physical parameter LR decay: decay to 1/10 of initial by end of training
+        decay_ratio = 0.1
+        iters = training_args.iterations
+        self.extinction_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.extiction_lr,
+            lr_final=training_args.extiction_lr * decay_ratio,
+            max_steps=iters)
+        self.albedo_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.feature_lr,
+            lr_final=training_args.feature_lr * decay_ratio,
+            max_steps=iters)
+        self.g_factor_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.g_factor_lr,
+            lr_final=training_args.g_factor_lr * decay_ratio,
+            max_steps=iters)
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
 
+        _sched_map = {
+            "xyz": self.xyz_scheduler_args,
+            "extinction": self.extinction_scheduler_args,
+            "albedo": self.albedo_scheduler_args,
+            "g_factor": self.g_factor_scheduler_args,
+        }
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
+            name = param_group["name"]
+            if name in _sched_map:
+                param_group['lr'] = _sched_map[name](iteration)
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
