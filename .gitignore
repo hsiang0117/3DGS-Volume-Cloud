@@ -1,0 +1,5 @@
+.idea
+.venv
+output
+submodules/*/build
+submodules/*/*.egg-info
