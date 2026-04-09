@@ -311,6 +311,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         metrics["test_ssim"] = float(sum(ssims) / len(ssims))
                         metrics["test_lpips"] = None
 
+# git checkout test
 def prepare_output_and_logger(args):    
     if not args.model_path:
         args.model_path = build_timestamped_model_path()
