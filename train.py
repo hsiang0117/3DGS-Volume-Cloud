@@ -96,6 +96,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    scaling_frozen = False
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -118,6 +119,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        if (not scaling_frozen) and iteration > opt.densify_until_iter:
+            gaussians._scaling.requires_grad_(False)
+            scaling_frozen = True
+            print(f"\n[ITER {iteration}] Freezing scaling after densification stage.")
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -192,6 +198,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sigma_t = gaussians.get_extinction
                 albedo = gaussians.get_albedo
                 g = gaussians.get_g_factor
+                scales = gaussians.get_scaling
                 sun_dir = gaussians.get_sun_dir
 
                 def _ms(x):
@@ -201,12 +208,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 m_sig, s_sig = _ms(sigma_t)
                 m_alb, s_alb = _ms(albedo)
                 m_g, s_g = _ms(g)
+                m_scale, s_scale = _ms(scales)
+                gscale = torch.pow(torch.prod(scales, dim=1) + 1e-8, 1.0 / 3.0)
+                min_gscale = gscale.min().item()
 
                 print(
-                    f"\n[ITER {iteration}] Physical stats | "
-                    f"sigma_t mean/std: {m_sig:.4f}/{s_sig:.4f} | "
+                    f"\n [ITER {iteration}] Physical stats | "
+                    f"\n sigma_t mean/std: {m_sig:.4f}/{s_sig:.4f} | "
                     f"albedo mean/std: {m_alb:.4f}/{s_alb:.4f} | "
-                    f"g mean/std: {m_g:.4f}/{s_g:.4f} | "
+                    f"g mean/std: {m_g:.4f}/{s_g:.4f}"
+                    f"\n scale mean/std: {m_scale:.4f}/{s_scale:.4f} | "
+                    f"gscale min: {min_gscale:.6f} | "
                     f"sun_dir: [{sun_dir[0].item():.3f}, {sun_dir[1].item():.3f}, {sun_dir[2].item():.3f}]"
                 )
                 # Diagnostic: T_light and Lk statistics to detect collapse
