@@ -17,18 +17,35 @@ from utils.sh_utils import eval_sh
 from utils.general_utils import build_rotation
 
 
-def compute_T_light(means3D, sigma_t, scales, sun_dir, grid_res=128):
+def normalized_gaussian_line_integral(scales, dirs_local):
+    """
+    Center-line integral of a normalized 3D Gaussian along a unit direction.
+
+    For N(x; μ, Σ) with Σ = R diag(s^2) R^T and unit ray direction d_local in the
+    Gaussian local frame, the full-line integral through the Gaussian centre is
+
+        ∫ N(μ + t d) dt = 1 / (2π |S| prod(s) sqrt(sum((d_i / s_i)^2)))
+
+    which is the exact 1D Gaussian integral for a normalized 3D Gaussian.
+    """
+    denom = (2.0 * math.pi) * torch.prod(scales, dim=1, keepdim=True) * torch.sqrt(
+        torch.sum((dirs_local / scales) ** 2, dim=1, keepdim=True) + 1e-8
+    )
+    return 1.0 / (denom + 1e-8)
+
+
+def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     """
     Approximate per-Gaussian sun transmittance via voxel grid.
-    Fully differentiable w.r.t. sigma_t (and means3D through grid_sample).
+    Fully differentiable w.r.t. tau_per_gauss (and means3D through grid_sample).
 
-    1. Build extinction field on a 3D grid (point-deposit at Gaussian centers).
+    1. Build optical-depth field on a 3D grid (point-deposit at Gaussian centers).
     2. Exclusive prefix sum along sun direction → cumulative optical depth above each cell.
     3. Trilinear sample at each Gaussian center → T_light = exp(-tau_sun).
 
     Args:
         means3D: (P, 3)  Gaussian centres
-        sigma_t: (P, 1)  extinction coefficient (activated)
+        tau_per_gauss: (P, 1) per-Gaussian optical depth along the sun direction
         scales:  (P, 3)  Gaussian scales
         sun_dir: (3,)    normalised sun direction  (currently assumed [0,1,0])
         grid_res: int    voxel resolution per axis
@@ -52,17 +69,17 @@ def compute_T_light(means3D, sigma_t, scales, sun_dir, grid_res=128):
         gi = ((means3D - bbox_min) / cell_size).long().clamp(0, grid_res - 1)  # (P,3)
         flat_idx = gi[:, 0] * (grid_res * grid_res) + gi[:, 1] * grid_res + gi[:, 2]
 
-    # --- 2. Scatter sigma_t into voxel grid (differentiable w.r.t. sigma_t) ---
+    # --- 2. Scatter per-Gaussian tau into voxel grid (differentiable) ---
     volume = torch.zeros(grid_res * grid_res * grid_res, device=device, dtype=dtype)
-    volume = volume.scatter_add(0, flat_idx, sigma_t.squeeze(-1))  # out-of-place → differentiable
+    volume = volume.scatter_add(0, flat_idx, tau_per_gauss.squeeze(-1))  # out-of-place → differentiable
     volume = volume.view(grid_res, grid_res, grid_res)  # indexed [x, y, z]
 
     # --- 3. Exclusive prefix sum along Y (sun direction = +Y) ---
-    # tau_above[x,y,z] = Σ_{y'>y} volume[x,y',z] · cell_size_y
+    # tau_above[x,y,z] = Σ_{y'>y} volume[x,y',z]
     flipped = torch.flip(volume, [1])
     inclusive_cs = torch.cumsum(flipped, dim=1)
     exclusive_cs = inclusive_cs - flipped               # exclude current cell
-    tau_above = torch.flip(exclusive_cs, [1]) * cell_size[1]
+    tau_above = torch.flip(exclusive_cs, [1])
 
     # --- 4. Trilinear sample at Gaussian centers ---
     import torch.nn.functional as F
@@ -120,9 +137,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    # Analytic optical thickness τ_k = σ_t,k * Δt, with Δt approximated by the ellipsoid
-    # extent along the integration direction (view / sun). This makes transmittance direction-aware.
-    sigma_t = pc.get_extinction  # (P,1)
+    # Total extinction mass carried by each normalized Gaussian.
+    extinction_mass = pc.get_extinction  # (P,1)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -137,9 +153,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = pc.get_rotation
 
     # --- Physical cloud shading (static sun lighting) ---
-    # Fixed environment
-    L_sun = torch.tensor([1.0, 1.0, 1.0], device="cuda", dtype=means3D.dtype)
-    # Sun direction in world space (normalized): learned global parameter.
+    # Sun irradiance: 4π compensates the 1/(4π) in the normalized HG phase function,
+    # so that an isotropic (g=0), unit-albedo medium scatters all incoming light uniformly.
+    sun_intensity = 4.0 * math.pi
+    L_sun = torch.tensor([sun_intensity, sun_intensity, sun_intensity], device="cuda", dtype=means3D.dtype)
     L_dir = pc.get_sun_dir.to(dtype=means3D.dtype)
 
     # View direction: from point to camera (normalized)
@@ -153,47 +170,46 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Local directions
     v_local = torch.bmm(R_t, v.unsqueeze(-1)).squeeze(-1)               # (P,3)
-    l_local = torch.matmul(R_t, L_dir.view(3, 1)).squeeze(-1)           # (P,3) via broadcast matmul
+    l_local = torch.matmul(R_t, L_dir.view(3, 1)).squeeze(-1)           # (P,3)
 
     s = pc.get_scaling * scaling_modifier  # (P,3)
 
-    # Analytic path length: for 3D Gaussian with Σ = R·diag(s²)·Rᵀ, the ray integral
-    # ∫G(o+td)dt = √(2π / (d^T Σ^{-1} d)) · G_2D(pixel).  CUDA already evaluates
-    # G_2D per pixel, so we precompute h = √(2π) / ||d_local / s||.
-    dt_view = math.sqrt(2.0 * math.pi) / torch.sqrt(torch.sum((v_local / s) ** 2, dim=1, keepdim=True) + 1e-8)
-    dt_sun  = math.sqrt(2.0 * math.pi) / torch.sqrt(torch.sum((l_local / s) ** 2, dim=1, keepdim=True) + 1e-8)
+    # Exact full-line 1D Gaussian integral for a normalized 3D Gaussian, evaluated
+    # on the centre ray. Rasterization later multiplies by the projected 2D Gaussian,
+    # yielding the intended approximation τ(x') ≈ τ_center · G_2D(x').
+    line_int_view = normalized_gaussian_line_integral(s, v_local)
+    line_int_sun = normalized_gaussian_line_integral(s, l_local)
 
-    tau_view = sigma_t * dt_view
+    tau_view = extinction_mass * line_int_view
     tau_precomp = tau_view
     opacity = 1.0 - torch.exp(-tau_view)
 
     # cos(theta) between view dir and light dir
     cos_theta = torch.clamp((v * L_dir[None, :]).sum(dim=1, keepdim=True), -1.0, 1.0)
 
-    # Henyey-Greenstein phase function — no 1/(4π) normalization.
+    # Henyey-Greenstein phase function with 1/(4π) normalization.
     g = pc.get_g_factor  # (P,1) in (-1,1)
     eps = 1e-6
-
-    # Sun transmittance: how much light reaches each Gaussian from the sun,
-    # computed via differentiable voxel-grid prefix sum along the sun direction.
-    T_light = compute_T_light(means3D, sigma_t, s, L_dir, grid_res=128)
+    inv_4pi = 1.0 / (4.0 * math.pi)
 
     # Multi-octave scattering approximation (Frostbite / Wrenninge 2015).
     # Simulates multiple scattering bounces using the same physical parameters.
     # Higher octaves: less energy (a^n), less attenuation (T^(b^n)), more isotropic (g·c^n).
-    # NOTE: no 1/(4π) — single directional light, energy scale absorbed by rho.
     ms_a = 0.5    # energy attenuation per bounce
     ms_b = 0.5    # transmittance power decay
     ms_c = 0.5    # phase isotropization rate
     num_octaves = 6
 
-    scatter_sum = torch.zeros_like(sigma_t)  # (P,1)
+    tau_sun_per_gauss = extinction_mass * line_int_sun
+    T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
+
+    scatter_sum = torch.zeros_like(extinction_mass)  # (P,1)
     for n in range(num_octaves):
         energy   = ms_a ** n
         g_eff    = g * (ms_c ** n)
         T_eff    = torch.pow(T_light.clamp(min=1e-8), ms_b ** n)
         denom_hg = torch.pow(1.0 + g_eff * g_eff - 2.0 * g_eff * cos_theta, 1.5) + eps
-        HG_n     = (1.0 - g_eff * g_eff) / denom_hg
+        HG_n     = inv_4pi * (1.0 - g_eff * g_eff) / denom_hg
         scatter_sum = scatter_sum + energy * T_eff * HG_n
 
     rho = pc.get_albedo  # (P,3)
