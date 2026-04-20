@@ -29,6 +29,11 @@ except:
 
 class GaussianModel:
 
+    @staticmethod
+    def _softplus_inverse(y, eps=1e-8):
+        y = torch.clamp(y, min=eps)
+        return torch.log(torch.expm1(y) + eps)
+
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -44,7 +49,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
         self.extinction_activation = lambda x: torch.clamp(torch.nn.functional.softplus(x), max=10.0)
         self.albedo_activation = torch.sigmoid
-        self.g_factor_activation = torch.tanh
+        self.g_factor_activation = lambda x: 0.8 * torch.tanh(x)
 
 
     def __init__(self, sh_degree, optimizer_type="default"):
@@ -53,7 +58,8 @@ class GaussianModel:
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         # Physical appearance parameters (raw, pre-activation)
-        self._extinction = torch.empty(0)   # (P,1) raw -> exp
+        # `_extinction` stores total extinction mass, not peak extinction coefficient.
+        self._extinction = torch.empty(0)   # (P,1) raw -> softplus(total extinction mass)
         self._albedo = torch.empty(0)       # (P,3) raw -> sigmoid
         self._g_factor = torch.empty(0)     # (P,1) raw -> tanh
 
@@ -133,14 +139,15 @@ class GaussianModel:
     def get_opacity(self):
         """
         Compatibility proxy for pruning / logging: interpret opacity as the
-        analytic transmittance through a Gaussian along view direction with
-        a local path-length proxy Δt ≈ mean(scale).
+        analytic center-line transmittance of a normalized Gaussian using an
+        isotropic proxy based on the geometric mean scale.
         """
         if self._xyz.numel() == 0:
             return torch.empty(0, device="cuda")
-        sigma_t = self.get_extinction
-        dt = torch.mean(self.get_scaling, dim=1, keepdim=True)
-        tau = sigma_t * dt
+        extinction_mass = self.get_extinction
+        scales = self.get_scaling
+        gscale = torch.pow(torch.prod(scales, dim=1, keepdim=True) + 1e-8, 1.0 / 3.0)
+        tau = extinction_mass / (2.0 * np.pi * gscale * gscale + 1e-8)
         return 1.0 - torch.exp(-tau)
     
     @property
@@ -173,12 +180,17 @@ class GaussianModel:
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        actual_scales = torch.exp(scales)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
         # Physical parameter initialization (raw / pre-activation)
-        # inverse softplus: x = log(exp(y) - 1) for target y = 0.1
-        extinction_raw = torch.log(torch.exp(torch.full((P, 1), 0.1, dtype=torch.float, device="cuda")) - 1.0)
+        # Interpret extinction as total mass of a normalized 3D Gaussian.
+        # Choose the mass such that the initial peak extinction coefficient is ~0.1,
+        # i.e. mass = beta_peak * (2π)^(3/2) * |Σ|^(1/2).
+        beta_peak_init = torch.full((P, 1), 0.1, dtype=torch.float, device="cuda")
+        target_mass = beta_peak_init * ((2.0 * np.pi) ** 1.5) * torch.prod(actual_scales, dim=1, keepdim=True)
+        extinction_raw = self._softplus_inverse(target_mass)
         albedo_raw = inverse_sigmoid(torch.full((P, 3), 0.8, dtype=torch.float, device="cuda"))
         g_factor_raw = torch.atanh(torch.full((P, 1), 0.7, dtype=torch.float, device="cuda"))
 
@@ -453,9 +465,11 @@ class GaussianModel:
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8 * N ** (1/3)))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
-        new_extinction = self._extinction[selected_pts_mask].repeat(N,1)
+        parent_mass = self.get_extinction[selected_pts_mask]
+        child_mass = torch.clamp(parent_mass / float(N), min=1e-8)
+        new_extinction = self._softplus_inverse(child_mass).repeat(N,1)
         new_albedo = self._albedo[selected_pts_mask].repeat(N,1)
         new_g_factor = self._g_factor[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
@@ -488,9 +502,15 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
+        parent_mass = self.get_extinction[selected_pts_mask]
+        half_mass = torch.clamp(parent_mass * 0.5, min=1e-8)
+        half_mass_raw = self._softplus_inverse(half_mass)
+        with torch.no_grad():
+            self._extinction[selected_pts_mask] = half_mass_raw
+
         new_xyz = self._xyz[selected_pts_mask]
-        new_extinction = self._extinction[selected_pts_mask]
+        new_extinction = half_mass_raw
         new_albedo = self._albedo[selected_pts_mask]
         new_g_factor = self._g_factor[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
