@@ -3,3 +3,4 @@
 output
 submodules/*/build
 submodules/*/*.egg-info
+**/__pycache__
