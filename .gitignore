@@ -1,5 +1,6 @@
 .idea
 .venv
+.claude
 output
 submodules/*/build
 submodules/*/*.egg-info
