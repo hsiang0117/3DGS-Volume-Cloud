@@ -137,8 +137,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    # Total extinction mass carried by each normalized Gaussian.
-    extinction_mass = pc.get_extinction  # (P,1)
+    # Peak extinction coefficient β_peak (intensive, 1/length). Mass is derived below
+    # once we have scale with scaling_modifier applied.
+    beta_peak = pc.get_extinction  # (P,1)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -173,6 +174,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     l_local = torch.matmul(R_t, L_dir.view(3, 1)).squeeze(-1)           # (P,3)
 
     s = pc.get_scaling * scaling_modifier  # (P,3)
+    mass = beta_peak * ((2.0 * math.pi) ** 1.5) * torch.prod(s, dim=1, keepdim=True)
 
     # Exact full-line 1D Gaussian integral for a normalized 3D Gaussian, evaluated
     # on the centre ray. Rasterization later multiplies by the projected 2D Gaussian,
@@ -180,7 +182,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     line_int_view = normalized_gaussian_line_integral(s, v_local)
     line_int_sun = normalized_gaussian_line_integral(s, l_local)
 
-    tau_view = extinction_mass * line_int_view
+    tau_view = mass * line_int_view
     tau_precomp = tau_view
     opacity = 1.0 - torch.exp(-tau_view)
 
@@ -200,10 +202,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     ms_c = 0.5    # phase isotropization rate
     num_octaves = 6
 
-    tau_sun_per_gauss = extinction_mass * line_int_sun
+    tau_sun_per_gauss = mass * line_int_sun
     T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
 
-    scatter_sum = torch.zeros_like(extinction_mass)  # (P,1)
+    scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):
         energy   = ms_a ** n
         g_eff    = g * (ms_c ** n)
