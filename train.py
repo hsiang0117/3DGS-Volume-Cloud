@@ -96,7 +96,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-    scaling_frozen = False
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -119,11 +118,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-
-        if (not scaling_frozen) and iteration > opt.densify_until_iter:
-            gaussians._scaling.requires_grad_(False)
-            scaling_frozen = True
-            print(f"\n[ITER {iteration}] Freezing scaling after densification stage.")
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -188,6 +182,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        scales = gaussians.get_scaling
+        L_vol = (scales.prod(dim=1)).mean()
+        loss += 1e-4 * L_vol
+
         loss.backward()
 
         iter_end.record()
@@ -195,7 +193,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Physical parameter statistics
             if iteration % 500 == 0:
-                sigma_t = gaussians.get_extinction
+                beta_peak = gaussians.get_extinction
                 albedo = gaussians.get_albedo
                 g = gaussians.get_g_factor
                 scales = gaussians.get_scaling
@@ -205,7 +203,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     x = x.detach()
                     return x.mean().item(), x.std(unbiased=False).item()
 
-                m_sig, s_sig = _ms(sigma_t)
+                m_bp, s_bp = _ms(beta_peak)
                 m_alb, s_alb = _ms(albedo)
                 m_g, s_g = _ms(g)
                 m_scale, s_scale = _ms(scales)
@@ -214,7 +212,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 print(
                     f"\n [ITER {iteration}] Physical stats | "
-                    f"\n sigma_t mean/std: {m_sig:.4f}/{s_sig:.4f} | "
+                    f"\n beta_peak mean/std: {m_bp:.4f}/{s_bp:.4f} | "
                     f"albedo mean/std: {m_alb:.4f}/{s_alb:.4f} | "
                     f"g mean/std: {m_g:.4f}/{s_g:.4f}"
                     f"\n scale mean/std: {m_scale:.4f}/{s_scale:.4f} | "
@@ -228,6 +226,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if diag_Lk is not None:
                     m_lk, s_lk = _ms(diag_Lk)
                     print(f"  Lk mean/std: {m_lk:.4f}/{s_lk:.4f} | max: {diag_Lk.max().item():.4f}")
+
+                # Densification trigger signal distribution. Use these p95 values
+                # to choose --densify_beta_grad_threshold / --densify_scale_grad_threshold.
+                denom = gaussians.denom.clamp(min=1)
+                if gaussians.denom.sum() > 0:
+                    g_xyz = (gaussians.xyz_gradient_accum / denom).squeeze()
+                    g_beta = (gaussians.beta_gradient_accum / denom).squeeze()
+                    g_scl = (gaussians.scale_gradient_accum / denom).squeeze()
+                    qs = torch.tensor([0.5, 0.95, 0.99], device=g_xyz.device)
+                    q_xyz = torch.quantile(g_xyz, qs)
+                    q_beta = torch.quantile(g_beta, qs)
+                    q_scl = torch.quantile(g_scl, qs)
+                    thr = opt.densify_grad_threshold
+                    above_thr = (g_xyz >= thr).sum().item()
+                    print(
+                        f"  grad p50/p95/p99 | "
+                        f"xyz: {q_xyz[0]:.6f}/{q_xyz[1]:.6f}/{q_xyz[2]:.6f} "
+                        f"(>= {thr}: {above_thr}/{g_xyz.numel()}) | "
+                        f"beta: {q_beta[0]:.6f}/{q_beta[1]:.6f}/{q_beta[2]:.6f} | "
+                        f"scale+: {q_scl[0]:.6f}/{q_scl[1]:.6f}/{q_scl[2]:.6f}"
+                    )
 
             if iteration % 1000 == 0:
                 save_periodic_render(scene.model_path, iteration, image_for_loss, viewpoint_cam.image_name)
@@ -256,7 +275,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_min_opacity, scene.cameras_extent, size_threshold, radii,
+                                                max_beta_grad=getattr(opt, "densify_beta_grad_threshold", -1.0),
+                                                max_scale_grad=getattr(opt, "densify_scale_grad_threshold", -1.0))
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -378,7 +399,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram("scene/sigma_t_histogram", scene.gaussians.get_extinction, iteration)
+            tb_writer.add_histogram("scene/beta_peak_histogram", scene.gaussians.get_extinction, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
