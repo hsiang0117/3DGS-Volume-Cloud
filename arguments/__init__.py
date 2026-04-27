@@ -89,6 +89,7 @@ class OptimizationParams(ParamGroup):
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_scale = 0.1
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
@@ -97,9 +98,6 @@ class OptimizationParams(ParamGroup):
         # Minimum opacity below which a point is pruned. Under β_peak parametrization
         # the old 0.005 is over-aggressive (small-gscale points fall below it easily).
         self.prune_min_opacity = 0.001
-        # Set >0 to also trigger densification when β_peak / scale-growth gradients
-        # exceed these thresholds. -1 disables (xyz-grad only, original behavior).
-        self.densify_beta_grad_threshold = -1.0
         self.densify_scale_grad_threshold = 1e-6
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01

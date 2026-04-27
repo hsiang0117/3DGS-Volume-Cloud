@@ -71,6 +71,7 @@ class GaussianModel:
         self._sun_dir = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.scale_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
@@ -209,9 +210,6 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        # Supplementary trigger signals for densification. xyz gradient alone is too weak
-        # in the volumetric-cloud regime (most residual flows into β_peak / scale / albedo).
-        self.beta_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         # Scale signal accumulates only the "growing-scale" direction.
         # In log-scale parameterization a negative grad on _scaling increases s.
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -413,7 +411,6 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-        self.beta_gradient_accum = self.beta_gradient_accum[valid_points_mask]
         self.scale_gradient_accum = self.scale_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
@@ -461,7 +458,6 @@ class GaussianModel:
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.beta_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -505,7 +501,6 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.beta_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -547,24 +542,16 @@ class GaussianModel:
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.beta_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
-                          max_beta_grad=None, max_scale_grad=None):
+                        max_scale_grad=None):
         denom = self.denom.clamp(min=1)
         grads = self.xyz_gradient_accum / denom
         grads[grads.isnan()] = 0.0
 
-        # Optional: blend β_peak and scale-growth gradient signals into the trigger.
-        # xyz-grad alone is too weak in cloud rendering (residual flows into β_peak/scale).
-        # A point is densified if ANY of the three normalized signals crosses its threshold.
-        if max_beta_grad is not None and max_beta_grad > 0:
-            grads_beta = self.beta_gradient_accum / denom
-            grads_beta[grads_beta.isnan()] = 0.0
-            grads = torch.maximum(grads, grads_beta * (max_grad / max_beta_grad))
         if max_scale_grad is not None and max_scale_grad > 0:
             grads_scale = self.scale_gradient_accum / denom
             grads_scale[grads_scale.isnan()] = 0.0
@@ -575,31 +562,13 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        # Prune breakdown diagnostics (printed if any source fires).
-        n_opacity = int(prune_mask.sum().item())
-        n_big_vs = 0
-        n_big_ws = 0
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            n_big_vs = int((big_points_vs & ~prune_mask).sum().item())
-            n_big_ws = int((big_points_ws & ~prune_mask & ~big_points_vs).sum().item())
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        n_total = int(prune_mask.sum().item())
-        if n_total > 0:
-            print(f"  [prune] total={n_total} | opacity<{min_opacity}: {n_opacity} | "
-                  f"big_vs(px): {n_big_vs} | big_ws(world): {n_big_ws}")
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        # |∂L/∂_extinction|: picks up "wants more/less density here" residual pressure.
-        if self._extinction.grad is not None:
-            self.beta_gradient_accum[update_filter] += self._extinction.grad[update_filter].detach().abs()
         # Only the scale-growing direction (negative raw grad → larger s in log-parameterization).
         if self._scaling.grad is not None:
             grow = (-self._scaling.grad[update_filter]).detach().clamp(min=0).sum(dim=-1, keepdim=True)
