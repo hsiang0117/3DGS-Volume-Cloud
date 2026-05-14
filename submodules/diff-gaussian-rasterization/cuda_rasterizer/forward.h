@@ -44,6 +44,8 @@ namespace FORWARD
 		float* cov3Ds,
 		float* colors,
 		float4* conic_opacity,
+		float* sigma_v_inv,
+		float* q_view,
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered,

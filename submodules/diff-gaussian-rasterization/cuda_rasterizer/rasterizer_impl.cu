@@ -65,16 +65,24 @@ __global__ void checkFrustum(int P,
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
-// Generates one key/value pair for all Gaussian / tile overlaps. 
+// Generates one key/value pair for all Gaussian / tile overlaps.
 // Run once per Gaussian (1:N mapping).
+// The depth half of the key is the *per-tile* max-response depth t* of this
+// Gaussian along the tile's centre ray, computed from precomputed Σ_v^-1 and
+// q = Σ_v^-1 μ_v. This replaces the centre depth used by stock 3DGS, which
+// flips alpha-blend order across tiles for elongated ellipsoids.
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
 	const float* depths,
+	const float* sigma_v_inv,
+	const float* q_view,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
+	int W, int H,
+	float tan_fovx, float tan_fovy,
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -90,18 +98,50 @@ __global__ void duplicateWithKeys(
 
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-		// For each tile that the bounding rect overlaps, emit a 
-		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values 
-		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth. 
+		const float Sxx = sigma_v_inv[idx * 6 + 0];
+		const float Sxy = sigma_v_inv[idx * 6 + 1];
+		const float Sxz = sigma_v_inv[idx * 6 + 2];
+		const float Syy = sigma_v_inv[idx * 6 + 3];
+		const float Syz = sigma_v_inv[idx * 6 + 4];
+		const float Szz = sigma_v_inv[idx * 6 + 5];
+		const float qx = q_view[idx * 3 + 0];
+		const float qy = q_view[idx * 3 + 1];
+		const float qz = q_view[idx * 3 + 2];
+		const float fallback_depth = depths[idx];
+
+		const float inv_W = 1.0f / (float)W;
+		const float inv_H = 1.0f / (float)H;
+
+		// For each tile that the bounding rect overlaps, emit a
+		// key/value pair. The key is |  tile ID  |  per-tile depth  |.
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
+				// Tile-centre pixel.
+				float px = (float)x * BLOCK_X + 0.5f * BLOCK_X;
+				float py = (float)y * BLOCK_Y + 0.5f * BLOCK_Y;
+				// Pixel → view-space direction. v.z = 1, so no need to normalise:
+				// t* is scale-invariant in v.
+				float vx = (2.0f * px * inv_W - 1.0f) * tan_fovx;
+				float vy = (2.0f * py * inv_H - 1.0f) * tan_fovy;
+
+				// numerator = v · q = v · (Σ_v^-1 μ_v).
+				float vq = vx * qx + vy * qy + qz;
+				// denominator = v^T Σ_v^-1 v.
+				float vSv = Sxx * vx * vx + Syy * vy * vy + Szz
+				          + 2.0f * (Sxy * vx * vy + Sxz * vx + Syz * vy);
+				float t_star = vq / fmaxf(vSv, 1e-20f);
+
+				// Sort key uses float→uint32 bit-cast, which is only monotonic
+				// for non-negative floats. Clamp away near-plane / behind-camera
+				// numerics; fall back to the centre depth on degeneracy.
+				float depth_for_key = (vSv > 1e-20f && t_star > 0.0f) ? t_star : fallback_depth;
+				depth_for_key = fmaxf(depth_for_key, 1e-4f);
+
 				uint64_t key = y * grid.x + x;
 				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
+				key |= *((uint32_t*)&depth_for_key);
 				gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
 				off++;
@@ -166,6 +206,8 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
+	obtain(chunk, geom.sigma_v_inv, P * 6, 128);
+	obtain(chunk, geom.q_view, P * 3, 128);
 	return geom;
 }
 
@@ -273,6 +315,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.cov3D,
 		geomState.rgb,
 		geomState.conic_opacity,
+		geomState.sigma_v_inv,
+		geomState.q_view,
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered,
@@ -291,16 +335,20 @@ int CudaRasterizer::Rasterizer::forward(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	// For each instance to be rendered, produce adequate [ tile | depth ] key 
+	// For each instance to be rendered, produce adequate [ tile | depth ] key
 	// and corresponding dublicated Gaussian indices to be sorted
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
 		geomState.depths,
+		geomState.sigma_v_inv,
+		geomState.q_view,
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
+		width, height,
+		tan_fovx, tan_fovy,
 		tile_grid)
 	CHECK_CUDA(, debug)
 
