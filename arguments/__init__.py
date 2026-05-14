@@ -90,6 +90,22 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_scale = 0.1
+        # Anisotropy penalty (log-ratio form): zero below `aniso_ratio_max`,
+        # quadratic in log-ratio above. Cloud is an isotropic medium; long
+        # ellipsoids cause depth-sort popping.
+        #
+        # Keep λ small. Empirically:
+        #   λ=0.05 → PSNR collapses to ~25 (regularizer dominates fit gradient)
+        #   λ=0.001 → PSNR ~43, aniso largely unbounded
+        # Bounding aniso meaningfully and keeping PSNR high are in tension —
+        # cloud structure (wisps, layers) genuinely benefits from elongated
+        # Gaussians at current capacity. For aggressive aniso bounding, prefer
+        # split-on-densify (`densify_split_aniso_max`) over loss regularisation.
+        self.lambda_aniso = 0.001
+        self.aniso_ratio_max = 5.0
+        # Disable aniso reg after densify ends, so post-densify L_vol pressure
+        # doesn't combine with the regularizer to uniformly shrink the cloud.
+        self.aniso_until_iter = 15_000
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

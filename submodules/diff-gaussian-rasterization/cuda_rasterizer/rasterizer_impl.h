@@ -40,6 +40,11 @@ namespace CudaRasterizer
 		float* rgb;
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
+		// View-space inverse covariance Σ_v^-1 (6 floats per Gaussian, upper triangular:
+		// xx, xy, xz, yy, yz, zz) and q = Σ_v^-1 μ_v (3 floats), used for per-tile
+		// max-response depth sorting.
+		float* sigma_v_inv;
+		float* q_view;
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
