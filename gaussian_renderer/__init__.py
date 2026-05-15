@@ -238,7 +238,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     # Physical cloud shading is always precomputed per Gaussian before rasterization,
     # so the legacy separate SH path is intentionally bypassed here.
-    rendered_image, radii, depth_image = rasterizer(
+    rendered_image, radii, depth_image, contribution = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = None,
@@ -265,6 +265,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "depth" : depth_image,
         "T_light": T_light.detach(),
         "Lk": Lk.detach(),
+        # Per-Gaussian Σ(α·T) over visible pixels — used by the physical
+        # densify_and_prune logic to identify negligible-contribution points.
+        "contribution": contribution.detach(),
         }
     
     return out
