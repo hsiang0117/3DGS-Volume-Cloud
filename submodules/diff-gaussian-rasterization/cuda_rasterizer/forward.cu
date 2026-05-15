@@ -174,6 +174,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	float* sigma_v_inv,
 	float* q_view,
+	float* sigma_d,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
@@ -304,6 +305,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		q_view[idx * 3 + 0] = Sxx * p_view.x + Sxy * p_view.y + Sxz * p_view.z;
 		q_view[idx * 3 + 1] = Sxy * p_view.x + Syy * p_view.y + Syz * p_view.z;
 		q_view[idx * 3 + 2] = Sxz * p_view.x + Syz * p_view.y + Szz * p_view.z;
+
+		// 1σ extent of the Gaussian along the camera-to-centre ray:
+		// σ_d = sqrt(d̂ · Σ_v · d̂), with d̂ = μ_v / |μ_v|.
+		float len_mu = sqrt(p_view.x * p_view.x + p_view.y * p_view.y + p_view.z * p_view.z) + 1e-8f;
+		float dx = p_view.x / len_mu, dy = p_view.y / len_mu, dz = p_view.z / len_mu;
+		float sd2 = Sigma_v[0][0] * dx * dx + Sigma_v[1][1] * dy * dy + Sigma_v[2][2] * dz * dz
+		          + 2.0f * (Sigma_v[0][1] * dx * dy + Sigma_v[0][2] * dx * dz + Sigma_v[1][2] * dy * dz);
+		sigma_d[idx] = sqrtf(fmaxf(sd2, 0.0f));
 
 		// Keep centre depth for the per-pixel invdepth output.
 		depths[idx] = p_view.z;
@@ -514,6 +523,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	float* sigma_v_inv,
 	float* q_view,
+	float* sigma_d,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
@@ -545,6 +555,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		sigma_v_inv,
 		q_view,
+		sigma_d,
 		grid,
 		tiles_touched,
 		prefiltered,

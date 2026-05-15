@@ -61,7 +61,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # Restructure arguments the way that the C++ lib expects them
         args = (
-            raster_settings.bg, 
+            raster_settings.bg,
             means3D,
             colors_precomp,
             opacities,
@@ -81,6 +81,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.antialiasing,
+            raster_settings.k_sigma,
             raster_settings.debug
         )
 
@@ -148,7 +149,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -160,6 +161,15 @@ class GaussianRasterizationSettings(NamedTuple):
     prefiltered : bool
     debug : bool
     antialiasing : bool
+    # k_sigma controls how far the per-tile max-response depth t* may shift
+    # from the centre depth, in units of σ along the view ray. ≤0 disables
+    # the shift (stock 3DGS centre-depth sort). 1.5 is the recommended default:
+    # it kills tile-boundary popping for near-isotropic Gaussians while still
+    # letting elongated ellipsoids shift correctly. Larger values approach the
+    # un-clamped per-tile sort (cleaner long-axis order but tile-edge artefacts
+    # may appear). Marked Optional so callers that don't set it get the kernel
+    # default via the C++ binding's default arg.
+    k_sigma : float = 1.5
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

@@ -45,6 +45,12 @@ namespace CudaRasterizer
 		// max-response depth sorting.
 		float* sigma_v_inv;
 		float* q_view;
+		// 1σ extent of the Gaussian along the camera-to-centre ray. Used in
+		// duplicateWithKeys to clamp the per-tile t* deviation from centre depth
+		// to ±K·σ, which preserves cross-tile ordering for near-isotropic
+		// Gaussians (avoiding tile-boundary popping) while still letting
+		// elongated ellipsoids shift correctly.
+		float* sigma_d;
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};

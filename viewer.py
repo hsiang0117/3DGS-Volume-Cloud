@@ -42,6 +42,7 @@ class _ViewerPipe:
     compute_cov3D_python: bool = False
     debug: bool = False
     antialiasing: bool = False
+    k_sigma: float = 1.5
 
 
 def _quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -266,6 +267,13 @@ def main():
         "Gaussian scale", min=0.1, max=2.0, step=0.05, initial_value=1.0,
         hint="Multiplies all Gaussian scales at render time (visual only, does not modify stored model).",
     )
+    gui_ksigma = server.gui.add_slider(
+        "Sort k·σ clamp", min=0.0, max=3.0, step=0.1, initial_value=1.5,
+        hint="Per-tile max-response sort: how far t* may deviate from centre depth, "
+             "in units of σ along the view ray. 0 = stock 3DGS centre sort. "
+             "1.5 = recommended (no tile artefacts, long-axis popping fixed). "
+             "3.0 ≈ unclamped (cleanest long-axis order, may show tile-edge artefacts).",
+    )
     gui_res = server.gui.add_slider(
         "Render size", min=256, max=1920, step=32, initial_value=args.width,
         hint="Render resolution width; height is derived from client aspect.",
@@ -292,6 +300,7 @@ def main():
 
     gui_mode.on_update(_mark_dirty)
     gui_scaling.on_update(_mark_dirty)
+    gui_ksigma.on_update(_mark_dirty)
     gui_res.on_update(_mark_dirty)
 
     @server.on_client_connect
@@ -374,6 +383,7 @@ def main():
             render_h = max(1, int(render_w / max(cam.aspect, 1e-3)))
             mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far)
             scaling_mod = float(gui_scaling.value)
+            pipe.k_sigma = float(gui_ksigma.value)
             mode = gui_mode.value
 
             if mode == "T_light":
