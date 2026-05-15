@@ -51,6 +51,7 @@ namespace CudaRasterizer
 			const bool prefiltered,
 			float* out_color,
 			float* depth,
+			float* gauss_contribution,
 			bool antialiasing,
 			float k_sigma,
 			int* radii = nullptr,

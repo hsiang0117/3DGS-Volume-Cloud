@@ -124,6 +124,36 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # ---- Physical densify/prune strategy (volume-cloud parameterisation)
+        # "stock" = original 3DGS xyz-grad clone/split + opacity-threshold prune.
+        # "physical" = same growth path (with adaptive grad threshold) but
+        # contribution-based prune + β_peak resurrect (replaces failed opacity_reset).
+        self.densify_strategy = "physical"
+        # Adaptive density threshold: take top `densify_top_frac` of grads each
+        # round so growth doesn't stall when grads decay late in training.
+        self.densify_adaptive = True
+        self.densify_top_frac = 0.005          # top 0.5%
+        self.densify_grad_min = 5e-6           # absolute floor
+        # A Gaussian is pruned iff mean Σ(α·T) over visible frames falls below
+        # this threshold. 1e-4 ≈ 0.01% of one fully-opaque pixel, very lenient
+        # — main role is to remove "ghost" Gaussians, not active ones.
+        self.contribution_threshold = 1e-4
+        self.prune_min_visible_frames = 5      # require at least 5 visible frames before judging
+        self.prune_warmup = 3000               # before this iter, no prune at all
+        self.resurrect_interval = 3000         # every N iters, reset bottom β_peak
+        self.resurrect_fraction = 0.05         # 5% of points
+        # How often to clear the contribution accumulator so the running mean
+        # tracks current model state. Independent of densify_until_iter; keeps
+        # working post-densify. Set ≤0 to never reset (not recommended).
+        self.contribution_reset_interval = 1000
+        # Aniso side-channel for prune: if a Gaussian's s_max/s_min exceeds
+        # this ratio it is pruned (regardless of contribution). Targets the
+        # long ellipsoids that cause viewer popping. Disabled if ≤0.
+        self.prune_aniso_ratio = 100.0
+        # How often to run the prune pass after densify_until_iter has stopped
+        # the regular path. 1000 = drop bad ellipsoids about as often as we
+        # reset accumulator stats. 0 to disable.
+        self.post_densify_prune_interval = 1000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
