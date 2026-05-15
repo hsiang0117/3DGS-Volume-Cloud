@@ -11,6 +11,7 @@
 
 import os
 import torch
+import math
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -186,6 +187,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         L_vol = (scales.prod(dim=1)).mean()
         loss += opt.lambda_scale * L_vol
 
+        # Anisotropy regularizer (log-ratio form, gentle).
+        #
+        # `_scaling` is in log-space (scaling_activation = exp), so
+        # `log(s_max) − log(s_min) = raw_max − raw_min` is free.
+        #
+        # Note: bounding aniso aggressively kills PSNR (cloud needs some
+        # elongation to fit wisps/layers at current capacity). λ is kept
+        # small so the regulariser only nudges the worst tail.
+        # Disabled after densify ends to avoid uniform shrinking under
+        # combined L_vol pressure.
+        if iteration < opt.aniso_until_iter:
+            raw_scaling = gaussians._scaling
+            log_ratio = raw_scaling.max(dim=1).values - raw_scaling.min(dim=1).values
+            log_threshold = math.log(opt.aniso_ratio_max)
+            L_aniso = (log_ratio - log_threshold).clamp(min=0).pow(2).mean()
+            loss += opt.lambda_aniso * L_aniso
+
         loss.backward()
 
         iter_end.record()
@@ -209,6 +227,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 m_scale, s_scale = _ms(scales)
                 gscale = torch.pow(torch.prod(scales, dim=1) + 1e-8, 1.0 / 3.0)
                 min_gscale = gscale.min().item()
+                aniso_ratio = scales.max(dim=1).values / scales.min(dim=1).values.clamp(min=1e-6)
+                m_an, s_an = aniso_ratio.mean().item(), aniso_ratio.std(unbiased=False).item()
+                p99_an = torch.quantile(aniso_ratio, 0.99).item()
 
                 print(
                     f"\n [ITER {iteration}] Physical stats | "
@@ -217,6 +238,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"g mean/std: {m_g:.4f}/{s_g:.4f}"
                     f"\n scale mean/std: {m_scale:.4f}/{s_scale:.4f} | "
                     f"gscale min: {min_gscale:.6f} | "
+                    f"aniso mean/std/p99: {m_an:.2f}/{s_an:.2f}/{p99_an:.2f} | "
                     f"sun_dir: [{sun_dir[0].item():.3f}, {sun_dir[1].item():.3f}, {sun_dir[2].item():.3f}]"
                 )
                 # Diagnostic: T_light and Lk statistics to detect collapse
