@@ -52,6 +52,7 @@ namespace CudaRasterizer
 			float* out_color,
 			float* depth,
 			bool antialiasing,
+			float k_sigma,
 			int* radii = nullptr,
 			bool debug = false);
 

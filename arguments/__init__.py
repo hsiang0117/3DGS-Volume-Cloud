@@ -69,6 +69,11 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
+        # Per-tile max-response sort: how far t* may deviate from centre depth,
+        # in units of σ along the view ray. ≤0 reverts to stock 3DGS centre
+        # sort. 1.5 = current default (no tile artefacts, long-axis popping
+        # fixed).
+        self.k_sigma = 1.5
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
