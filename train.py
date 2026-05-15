@@ -249,6 +249,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     m_lk, s_lk = _ms(diag_Lk)
                     print(f"  Lk mean/std: {m_lk:.4f}/{s_lk:.4f} | max: {diag_Lk.max().item():.4f}")
 
+                # Densify diagnostic: how many points actually qualify for
+                # densification, and how many are in danger of being pruned.
+                # If `n_above_grad` is consistently small (<<1% of n_points)
+                # the densify_grad_threshold is too high for the current
+                # parameterisation. If `n_below_prune` ≈ densify net gain per
+                # round, the cloud is in equilibrium (every new point is
+                # immediately pruned next round).
+                denom_d = gaussians.denom.clamp(min=1)
+                grads_xyz = (gaussians.xyz_gradient_accum / denom_d).squeeze()
+                grads_xyz = torch.where(torch.isnan(grads_xyz), torch.zeros_like(grads_xyz), grads_xyz)
+                n_points = gaussians.get_xyz.shape[0]
+                n_above = int((grads_xyz >= opt.densify_grad_threshold).sum().item())
+                op = gaussians.get_opacity.squeeze()
+                n_below_prune_opacity = int((op < opt.prune_min_opacity).sum().item())
+                # Split path: needs scale_max > percent_dense * scene_extent
+                # Clone path: needs scale_max <= percent_dense * scene_extent
+                scale_max = scales.max(dim=1).values
+                scene_extent = scene.cameras_extent
+                clone_gate = scale_max <= opt.percent_dense * scene_extent
+                split_gate = scale_max > opt.percent_dense * scene_extent
+                grad_pass = grads_xyz >= opt.densify_grad_threshold
+                n_clone_eligible = int((grad_pass & clone_gate).sum().item())
+                n_split_eligible = int((grad_pass & split_gate).sum().item())
+                # Contribution-based prune signal (active under physical strategy)
+                contrib_str = ""
+                if hasattr(gaussians, "contribution_accum") and gaussians.contribution_accum.numel() == n_points:
+                    mean_contrib = gaussians.get_mean_contribution()
+                    n_visible = int((gaussians.contribution_denom >= getattr(opt, "prune_min_visible_frames", 5)).sum().item())
+                    n_below_contrib = int(
+                        ((mean_contrib < getattr(opt, "contribution_threshold", 1e-4)) &
+                         (gaussians.contribution_denom >= getattr(opt, "prune_min_visible_frames", 5)) &
+                         (gaussians.prune_grace == 0)).sum().item()
+                    )
+                    contrib_str = (
+                        f" | contrib mean/median: {mean_contrib.mean().item():.4f}/{mean_contrib.median().item():.4f} | "
+                        f"visible frames p50: {gaussians.contribution_denom.median().item():.0f} | "
+                        f"n_below_contrib: {n_below_contrib}"
+                    )
+                print(
+                    f"  densify diag: n_points={n_points} | "
+                    f"grad max/mean: {grads_xyz.max().item():.6f}/{grads_xyz.mean().item():.6f} | "
+                    f"n_above_thresh: {n_above} ({100.0*n_above/max(n_points,1):.2f}%) | "
+                    f"clone-eligible: {n_clone_eligible} | split-eligible: {n_split_eligible} | "
+                    f"opacity min/median: {op.min().item():.6f}/{op.median().item():.6f} | "
+                    f"n_below_prune_opacity: {n_below_prune_opacity}"
+                    f"{contrib_str}"
+                )
+
             if iteration % 1000 == 0:
                 save_periodic_render(scene.model_path, iteration, image_for_loss, viewpoint_cam.image_name)
 
@@ -268,6 +316,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # Per-Gaussian image-contribution accumulator. Always-on (decoupled
+            # from densify_until_iter) so the diagnostic / future heuristics see
+            # current state, not a frozen snapshot from when densify ended.
+            contribution = render_pkg.get("contribution")
+            if contribution is not None:
+                gaussians.add_contribution_stats(contribution)
+
+            # Post-densify maintenance: resurrect + accumulator reset. Runs the
+            # entire training so the cloud keeps adapting after grad-driven
+            # growth has stopped.
+            if getattr(opt, "densify_strategy", "stock") == "physical":
+                gaussians.tick_post_densify_maintenance(opt, iteration)
+
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -276,8 +337,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_min_opacity, scene.cameras_extent, size_threshold, radii,
-                                                max_scale_grad=getattr(opt, "densify_scale_grad_threshold", -1.0))
+                    if getattr(opt, "densify_strategy", "stock") == "physical":
+                        gaussians.physical_densify_and_prune(opt, iteration, radii, scene.cameras_extent)
+                    else:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_min_opacity, scene.cameras_extent, size_threshold, radii,
+                                                    max_scale_grad=getattr(opt, "densify_scale_grad_threshold", -1.0))
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

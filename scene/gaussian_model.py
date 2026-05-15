@@ -214,6 +214,15 @@ class GaussianModel:
         # In log-scale parameterization a negative grad on _scaling increases s.
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # Per-Gaussian Σ(α·T) accumulator + count of forward passes contributed.
+        # Used by the physical densify_and_prune logic to spot Gaussians with
+        # negligible image contribution (regardless of opacity).
+        self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        # Per-Gaussian "frozen" counter: when a Gaussian was just split / cloned
+        # / resurrected, give it N steps of prune immunity so it has a chance to
+        # absorb gradient before being judged.
+        self.prune_grace = torch.zeros((self.get_xyz.shape[0],), dtype=torch.int32, device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -416,6 +425,10 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
+        if hasattr(self, "contribution_accum") and self.contribution_accum.numel() > 0:
+            self.contribution_accum = self.contribution_accum[valid_points_mask]
+            self.contribution_denom = self.contribution_denom[valid_points_mask]
+            self.prune_grace = self.prune_grace[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -504,6 +517,16 @@ class GaussianModel:
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # Contribution stats reset; new children get a grace period so β_peak
+        # / position have time to adapt before being judged as low-contribution.
+        self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        n_new_children = N * int(selected_pts_mask.sum().item())
+        new_grace = torch.full((n_new_children,), 500, dtype=torch.int32, device="cuda")
+        self.prune_grace = torch.cat([
+            torch.zeros((self.get_xyz.shape[0] - n_new_children,), dtype=torch.int32, device="cuda"),
+            new_grace,
+        ])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -541,10 +564,19 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
+        n_added = int(new_tmp_radii.shape[0])
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # Contribution stats reset; clones get a grace period.
+        self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        new_grace = torch.full((n_added,), 500, dtype=torch.int32, device="cuda")
+        self.prune_grace = torch.cat([
+            torch.zeros((self.get_xyz.shape[0] - n_added,), dtype=torch.int32, device="cuda"),
+            new_grace,
+        ])
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
                         max_scale_grad=None):
@@ -566,6 +598,196 @@ class GaussianModel:
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
+
+    # ---------- Physical densify / prune (cloud parameterisation) ----------
+
+    def add_contribution_stats(self, contribution):
+        """Per-step accumulator for Σ(α·T) per Gaussian.
+
+        contribution: (P,) tensor from the rasterizer's per-Gaussian
+        accumulator. Called after every forward pass during training.
+        """
+        if self.contribution_accum.numel() == 0:
+            self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+            self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+            self.prune_grace = torch.zeros((self.get_xyz.shape[0],), dtype=torch.int32, device="cuda")
+        # contribution may have been recorded for points that have since been
+        # pruned/split; if shapes don't match, just skip (next forward will
+        # re-align after stats reset in densify).
+        if contribution.shape[0] != self.contribution_accum.shape[0]:
+            return
+        with torch.no_grad():
+            self.contribution_accum += contribution
+            # Only count this forward pass for Gaussians that were actually
+            # visible (had non-zero contribution). Prevents off-screen frames
+            # from diluting the average.
+            self.contribution_denom += (contribution > 0).float()
+
+    def get_mean_contribution(self):
+        """Return per-Gaussian average Σ(α·T) over the steps it was visible."""
+        denom = self.contribution_denom.clamp(min=1.0)
+        return self.contribution_accum / denom
+
+    def physical_densify_and_prune(self, opt, iteration, radii, scene_extent):
+        """Cloud-parameterisation-aware densify / prune.
+
+        Density growth: keep stock xyz/scale-grad-driven clone+split (well
+        understood, stable; not the real bottleneck).
+
+        Pruning: replace the opacity-threshold prune with image-contribution
+        prune. A Gaussian is removed iff:
+          - it was visible at all (contribution_denom > some min), AND
+          - its mean contribution Σ(α·T) per visible frame falls below
+            `opt.contribution_threshold`, AND
+          - it is not currently in a grace period (prune_grace == 0).
+
+        Resurrection: every `opt.resurrect_interval` iterations, reset the
+        β_peak of the bottom `opt.resurrect_fraction` of Gaussians (by mean
+        contribution) back toward the initialisation value, and grant them
+        another grace period. This restores the predicate flow stock 3DGS
+        gets from `reset_opacity()` (which is a no-op under our parameterisation).
+        """
+        # 1. Density growth (stock path, with adaptive threshold)
+        denom_g = self.denom.clamp(min=1)
+        grads = self.xyz_gradient_accum / denom_g
+        grads[grads.isnan()] = 0.0
+
+        max_grad_eff = opt.densify_grad_threshold
+        if getattr(opt, "densify_adaptive", False):
+            # Take the top-K% of gradients as the threshold this round so that
+            # densify keeps firing even when grads decay late in training.
+            g = grads.squeeze().abs()
+            valid = g > 0
+            if valid.any():
+                target_q = 1.0 - opt.densify_top_frac
+                max_grad_eff = max(
+                    torch.quantile(g[valid], target_q).item(),
+                    opt.densify_grad_min,
+                )
+
+        if getattr(opt, "densify_scale_grad_threshold", -1.0) > 0:
+            grads_scale = self.scale_gradient_accum / denom_g
+            grads_scale[grads_scale.isnan()] = 0.0
+            grads = torch.maximum(grads, grads_scale * (max_grad_eff / opt.densify_scale_grad_threshold))
+
+        self.tmp_radii = radii
+        self.densify_and_clone(grads, max_grad_eff, scene_extent)
+        self.densify_and_split(grads, max_grad_eff, scene_extent)
+
+        # 2. Contribution + aniso based prune (replaces opacity threshold)
+        if iteration >= opt.prune_warmup:
+            self._prune_by_contribution_and_aniso(opt)
+
+        # Decay grace counter; accumulator reset is handled separately by
+        # tick_post_densify_maintenance() so it stays alive post-densify.
+        with torch.no_grad():
+            self.prune_grace = (self.prune_grace - opt.densification_interval).clamp(min=0)
+
+        self.tmp_radii = None
+        torch.cuda.empty_cache()
+
+    def _prune_by_contribution_and_aniso(self, opt):
+        """Two-channel prune for the physical strategy.
+
+        Channel A (contribution): a Gaussian that has been visible enough
+        frames yet projects almost zero light onto valid pixels is dead
+        weight regardless of its parameters.
+
+        Channel B (aniso): a Gaussian whose s_max/s_min exceeds
+        `opt.prune_aniso_ratio` is degenerate as a volumetric primitive —
+        keeping it just feeds the depth-sort popping the k_sigma clamp is
+        trying to suppress. Reclaim its budget so resurrect can place a
+        well-shaped point elsewhere.
+
+        Both channels require `visible_enough` and `grace_expired` so we
+        don't pop newborn / resurrected points.
+        """
+        if self.get_xyz.shape[0] == 0:
+            return 0
+        visible_enough = self.contribution_denom >= opt.prune_min_visible_frames
+        grace_expired = self.prune_grace == 0
+        mean_contrib = self.get_mean_contribution()
+        below_thresh = mean_contrib < opt.contribution_threshold
+
+        prune_aniso_ratio = getattr(opt, "prune_aniso_ratio", -1.0)
+        if prune_aniso_ratio > 0:
+            s = self.get_scaling
+            ratio = s.max(dim=1).values / s.min(dim=1).values.clamp(min=1e-6)
+            aniso_bad = ratio > prune_aniso_ratio
+        else:
+            aniso_bad = torch.zeros_like(below_thresh)
+
+        prune_mask = visible_enough & grace_expired & (below_thresh | aniso_bad)
+        n = int(prune_mask.sum().item())
+        if n > 0:
+            self.prune_points(prune_mask)
+        return n
+
+    def tick_post_densify_maintenance(self, opt, iteration):
+        """Iteration-driven housekeeping that must keep running even after
+        densify_until_iter:
+
+          - β_peak resurrect of bottom `opt.resurrect_fraction` Gaussians
+            every `opt.resurrect_interval` iterations.
+          - Periodic reset of the contribution accumulators so the running
+            mean tracks the current model state, not stale early-training
+            statistics. Reset every `opt.contribution_reset_interval` iters.
+        """
+        if iteration <= 0:
+            return
+        # 1. Resurrect schedule (independent of densify_until_iter)
+        if (
+            opt.resurrect_interval > 0
+            and iteration % opt.resurrect_interval == 0
+        ):
+            self._resurrect_low_contribution(opt.resurrect_fraction)
+
+        # 2. Accumulator reset
+        reset_iv = getattr(opt, "contribution_reset_interval", 1000)
+        if reset_iv > 0 and iteration % reset_iv == 0:
+            with torch.no_grad():
+                if self.contribution_accum.numel() > 0:
+                    self.contribution_accum.zero_()
+                    self.contribution_denom.zero_()
+
+        # 3. Aniso/contribution prune post-densify. Without this, long
+        # ellipsoids accumulating in the second half of training never get
+        # reclaimed (densify_until_iter has stopped the regular prune path),
+        # which we've seen drive viewer popping back up.
+        prune_iv = getattr(opt, "post_densify_prune_interval", 0)
+        if prune_iv > 0 and iteration % prune_iv == 0 and iteration >= opt.prune_warmup:
+            self._prune_by_contribution_and_aniso(opt)
+            with torch.no_grad():
+                # Match the grace decay rhythm used inside physical_densify_and_prune
+                self.prune_grace = (self.prune_grace - prune_iv).clamp(min=0)
+
+    def _resurrect_low_contribution(self, fraction):
+        """Reset β_peak of the lowest-contribution `fraction` of Gaussians
+        back toward the initial value (0.1), letting them rejoin gradient flow.
+        Only β_peak is touched; xyz / scale / rotation / albedo / g stay put.
+        """
+        if fraction <= 0 or self.get_xyz.shape[0] == 0:
+            return
+        with torch.no_grad():
+            mean_contrib = self.get_mean_contribution()
+            P = mean_contrib.shape[0]
+            k = max(1, int(P * fraction))
+            # Lowest k by mean contribution.
+            _, low_idx = torch.topk(mean_contrib, k, largest=False)
+            # Skip points that are already in grace (recently born).
+            low_idx = low_idx[self.prune_grace[low_idx] == 0]
+            if low_idx.numel() == 0:
+                return
+            init_beta = torch.full((low_idx.numel(), 1), 0.1, device="cuda")
+            new_extinction = self._extinction.detach().clone()
+            new_extinction[low_idx] = self._softplus_inverse(init_beta)
+            # Replace param tensor in the optimiser (uses existing helper).
+            optimizable_tensors = self.replace_tensor_to_optimizer(new_extinction, "extinction")
+            self._extinction = optimizable_tensors["extinction"]
+            # Grant grace so they don't get pruned before β has time to grow.
+            self.prune_grace[low_idx] = 500
+
+    # ----------------------------------------------------------------------
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

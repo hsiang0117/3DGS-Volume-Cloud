@@ -346,7 +346,8 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ invdepth,
+	float* __restrict__ gauss_contribution)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -444,6 +445,13 @@ renderCUDA(
 			if(invdepth)
 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
 
+			// Per-Gaussian image contribution: total light flux this Gaussian
+			// projects onto valid pixels. Used downstream by the physical
+			// densify/prune logic to identify Gaussians that effectively
+			// contribute nothing to the final image (regardless of opacity).
+			if (gauss_contribution)
+				atomicAdd(&gauss_contribution[collected_id[j]], alpha * T);
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -480,7 +488,8 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* depths,
-	float* depth)
+	float* depth,
+	float* gauss_contribution)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -494,8 +503,9 @@ void FORWARD::render(
 		n_contrib,
 		bg_color,
 		out_color,
-		depths, 
-		depth);
+		depths,
+		depth,
+		gauss_contribution);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
