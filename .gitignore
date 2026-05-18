@@ -2,6 +2,7 @@
 .venv
 .claude
 output
+data
 submodules/*/build
 submodules/*/*.egg-info
 **/__pycache__
