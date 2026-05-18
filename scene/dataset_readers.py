@@ -36,6 +36,10 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    # Per-frame sun direction in OpenGL/Blender world coordinates
+    # ("pointing toward the sun"). Defaults to [0,1,0] for legacy datasets
+    # that don't include the field — matches the previous hard-coded behaviour.
+    sun_dir: np.array = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -268,9 +272,19 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
+            sun_dir_raw = frame.get("sun_direction", None)
+            if sun_dir_raw is None:
+                sun_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            else:
+                sun_dir = np.array(sun_dir_raw, dtype=np.float32)
+                norm = np.linalg.norm(sun_dir)
+                if norm > 1e-8:
+                    sun_dir = sun_dir / norm
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test,
+                            sun_dir=sun_dir))
             
     return cam_infos
 

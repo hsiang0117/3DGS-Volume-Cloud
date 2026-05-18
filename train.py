@@ -208,6 +208,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_end.record()
 
+        # Release the just-decoded image/alpha tensors. Camera is lazy-loading
+        # under our refactor (see scene/cameras.py); without this each cam
+        # would hold ~12 MB of GPU memory until next reuse, which on
+        # 2989-frame datasets matters again.
+        if hasattr(viewpoint_cam, "release_loaded"):
+            viewpoint_cam.release_loaded()
+
         with torch.no_grad():
             # Physical parameter statistics
             if iteration % 500 == 0:
@@ -215,7 +222,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 albedo = gaussians.get_albedo
                 g = gaussians.get_g_factor
                 scales = gaussians.get_scaling
-                sun_dir = gaussians.get_sun_dir
+                # Prefer the *current frame's* sun_dir (per-frame, from JSON)
+                # over the model-level fallback so the diag reflects what the
+                # renderer actually used this iteration.
+                if hasattr(viewpoint_cam, "sun_dir") and viewpoint_cam.sun_dir is not None:
+                    sun_dir = viewpoint_cam.sun_dir
+                else:
+                    sun_dir = gaussians.get_sun_dir
 
                 def _ms(x):
                     x = x.detach()
@@ -404,6 +417,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ssims.append(ssim(pred, gt).item())
                             psnrs.append(psnr(pred, gt).mean().item())
 
+                            if hasattr(cam, "release_loaded"):
+                                cam.release_loaded()
+
                         metrics["test_psnr"] = float(sum(psnrs) / len(psnrs))
                         metrics["test_ssim"] = float(sum(ssims) / len(ssims))
                         metrics["test_lpips"] = None
@@ -455,6 +471,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    if hasattr(viewpoint, "release_loaded"):
+                        viewpoint.release_loaded()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
