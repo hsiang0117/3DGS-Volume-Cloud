@@ -39,15 +39,22 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     Approximate per-Gaussian sun transmittance via voxel grid (point-scatter).
     Fully differentiable w.r.t. tau_per_gauss (and means3D through grid_sample).
 
-    1. Build optical-depth field on a 3D grid (point-deposit at Gaussian centres).
-    2. Exclusive prefix sum along sun direction → cumulative optical depth above each cell.
-    3. Trilinear sample at each Gaussian centre → T_light = exp(-tau_sun).
+    Works with an arbitrary sun direction. The grid is built in a *light-space*
+    frame whose third axis is `sun_dir`, so a single 1D prefix sum along that
+    axis gives "tau above this voxel along the ray to the sun".
+
+    1. Build an orthonormal basis (e1, e2, sun_dir) and rotate Gaussian centres
+       into it.
+    2. Build optical-depth field on a 3D grid in light-space (point-deposit).
+    3. Exclusive prefix sum along the +sun axis → cumulative optical depth
+       between each cell and the sun.
+    4. Trilinear sample at each Gaussian centre → T_light = exp(-tau_sun).
 
     Args:
         means3D:        (P, 3) Gaussian centres
         tau_per_gauss:  (P, 1) per-Gaussian optical depth along the sun direction
         scales:         (P, 3) Gaussian scales (used only for bbox padding)
-        sun_dir:        (3,)   normalised sun direction (currently assumed [0,1,0])
+        sun_dir:        (3,)   normalised sun direction (any unit vector)
         grid_res:       int    voxel resolution per axis
 
     Returns:
@@ -58,40 +65,64 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     dtype = means3D.dtype
     P = means3D.shape[0]
 
-    # --- 1. Bounding box with 3-sigma padding (detached to keep grid fixed) ---
+    # --- 0. Light-space orthonormal basis (e1, e2, sun_dir) ----------------
+    # Rotation matrix R_lw maps a world-space vector v_w to light-space:
+    #     v_L = R_lw @ v_w,  with R_lw = [[e1; e2; sun_dir]].
+    # Inverse rotation R_lw^T maps light-space → world.
     with torch.no_grad():
+        s = sun_dir.to(device=device, dtype=dtype).reshape(3)
+        s = s / (torch.linalg.norm(s) + 1e-8)
+        # Pick a helper axis that's not parallel to s.
+        helper = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype)
+        if abs(float(torch.dot(s, helper).item())) > 0.95:
+            helper = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+        e1 = torch.linalg.cross(s, helper)
+        e1 = e1 / (torch.linalg.norm(e1) + 1e-8)
+        e2 = torch.linalg.cross(s, e1)
+        e2 = e2 / (torch.linalg.norm(e2) + 1e-8)
+        R_lw = torch.stack([e1, e2, s], dim=0)              # (3,3) rows are basis
+
+    # --- 1. Light-space bbox with 3-sigma padding (detached) ---------------
+    # Project all Gaussian centres into light-space, take axis-aligned bbox there.
+    with torch.no_grad():
+        means_L = means3D @ R_lw.T                          # (P,3) in light-space
         max_extent = scales.max(dim=1).values.max().item()
         pad = 3.0 * max_extent
-        bbox_min = means3D.min(dim=0).values - pad
-        bbox_max = means3D.max(dim=0).values + pad
-        bbox_size = bbox_max - bbox_min                    # (3,)
-        cell_size = bbox_size / grid_res                   # (3,)
-        # Grid indices (not differentiable, integer)
-        gi = ((means3D - bbox_min) / cell_size).long().clamp(0, grid_res - 1)  # (P,3)
+        bbox_min = means_L.min(dim=0).values - pad
+        bbox_max = means_L.max(dim=0).values + pad
+        bbox_size = bbox_max - bbox_min                     # (3,)
+        cell_size = bbox_size / grid_res                    # (3,)
+        gi = ((means_L - bbox_min) / cell_size).long().clamp(0, grid_res - 1)
         flat_idx = gi[:, 0] * (grid_res * grid_res) + gi[:, 1] * grid_res + gi[:, 2]
 
     # --- 2. Scatter per-Gaussian tau into voxel grid (differentiable) -------
     volume = torch.zeros(grid_res * grid_res * grid_res, device=device, dtype=dtype)
-    volume = volume.scatter_add(0, flat_idx, tau_per_gauss.squeeze(-1))  # out-of-place → differentiable
-    volume = volume.view(grid_res, grid_res, grid_res)  # indexed [x, y, z]
+    volume = volume.scatter_add(0, flat_idx, tau_per_gauss.squeeze(-1))
+    # Indexed [light_x, light_y, light_z=sun_axis]
+    volume = volume.view(grid_res, grid_res, grid_res)
 
-    # --- 3. Exclusive prefix sum along Y (sun direction = +Y) ---------------
-    # tau_above[x,y,z] = Σ_{y'>y} volume[x,y',z]
-    flipped = torch.flip(volume, [1])
-    inclusive_cs = torch.cumsum(flipped, dim=1)
-    exclusive_cs = inclusive_cs - flipped               # exclude current cell
-    tau_above = torch.flip(exclusive_cs, [1])
+    # --- 3. Exclusive prefix sum along the +sun axis (light-Z) -------------
+    # tau_above[i,j,k] = Σ_{k'>k} volume[i,j,k']  (cells closer to the sun)
+    flipped = torch.flip(volume, [2])
+    inclusive_cs = torch.cumsum(flipped, dim=2)
+    exclusive_cs = inclusive_cs - flipped
+    tau_above = torch.flip(exclusive_cs, [2])
 
-    # --- 4. Trilinear sample at Gaussian centres ----------------------------
+    # --- 4. Trilinear sample at Gaussian centres (in light-space) -----------
     with torch.no_grad():
-        coords_norm = 2.0 * (means3D - bbox_min) / bbox_size - 1.0  # (P,3)
+        coords_norm = 2.0 * (means_L - bbox_min) / bbox_size - 1.0  # (P,3)
+        # grid_sample expects (D=light_z, H=light_y, W=light_x) order with
+        # the per-point stack [x, y, z] of *normalised* coords, but PyTorch's
+        # 5D grid_sample is documented as `grid` last-dim = (x,y,z) with x
+        # indexing the last input dim (W). To match the original code's
+        # convention we feed (z, y, x).
         grid_pts = torch.stack([coords_norm[:, 2],
                                 coords_norm[:, 1],
-                                coords_norm[:, 0]], dim=-1)          # (P,3)
-        grid_pts = grid_pts.view(1, 1, 1, P, 3)                     # (1,1,1,P,3)
+                                coords_norm[:, 0]], dim=-1)
+        grid_pts = grid_pts.view(1, 1, 1, P, 3)
 
     tau_sun = F.grid_sample(
-        tau_above.unsqueeze(0).unsqueeze(0),                     # (1,1,X,Y,Z)
+        tau_above.unsqueeze(0).unsqueeze(0),
         grid_pts,
         mode='bilinear', padding_mode='border', align_corners=True
     ).view(P, 1)
@@ -163,12 +194,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
-    # --- Physical cloud shading (static sun lighting) ---
+    # --- Physical cloud shading ---
     # Sun irradiance: 4π compensates the 1/(4π) in the normalized HG phase function,
     # so that an isotropic (g=0), unit-albedo medium scatters all incoming light uniformly.
     sun_intensity = 4.0 * math.pi
     L_sun = torch.tensor([sun_intensity, sun_intensity, sun_intensity], device="cuda", dtype=means3D.dtype)
-    L_dir = pc.get_sun_dir.to(dtype=means3D.dtype)
+    # Per-frame sun direction comes from the camera (set by dataset_readers from
+    # the JSON's sun_direction field). Falls back to the model-level
+    # `pc.get_sun_dir` (currently hard-coded [0,1,0]) for legacy datasets / viewer
+    # paths that don't supply one.
+    if hasattr(viewpoint_camera, "sun_dir") and viewpoint_camera.sun_dir is not None:
+        L_dir = viewpoint_camera.sun_dir.to(dtype=means3D.dtype, device=means3D.device)
+        # Re-normalise defensively; numerical drift from per-frame data is cheap
+        # to fix here and avoids surprising the T_light light-space basis below.
+        L_dir = L_dir / (torch.linalg.norm(L_dir) + 1e-8)
+    else:
+        L_dir = pc.get_sun_dir.to(dtype=means3D.dtype)
 
     # View direction: from point to camera (normalized)
     dir_pc = (viewpoint_camera.camera_center.repeat(means3D.shape[0], 1) - means3D)
