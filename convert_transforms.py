@@ -16,9 +16,20 @@ OpenGL/Blender 坐标系 (右手): X=right, Y=up, Z=-forward
 """
 
 import json
+import math
 import sys
 import copy
 from pathlib import Path
+
+
+def remap_world_vec_ue_to_gl(v):
+    """
+    将一个 UE5 世界坐标系下的向量重映射到 OpenGL 世界坐标系
+        GL_x =  UE_y
+        GL_y =  UE_z
+        GL_z = -UE_x
+    """
+    return [v[1], v[2], -v[0]]
 
 
 def ue_to_opengl(mat):
@@ -54,10 +65,10 @@ def ue_to_opengl(mat):
         return [v[1], v[2], -v[0]]
 
     # 对每个列向量的分量做世界轴重映射
-    new_col0 = remap_vec(col0)  # UE forward
-    new_col1 = remap_vec(col1)  # UE right
-    new_col2 = remap_vec(col2)  # UE up
-    new_pos   = remap_vec(pos)
+    new_col0 = remap_world_vec_ue_to_gl(col0)  # UE forward
+    new_col1 = remap_world_vec_ue_to_gl(col1)  # UE right
+    new_col2 = remap_world_vec_ue_to_gl(col2)  # UE up
+    new_pos  = remap_world_vec_ue_to_gl(pos)
 
     # 在 OpenGL 中相机局部轴: X=right, Y=up, Z=-forward
     # UE 局部轴: col0=forward, col1=right, col2=up
@@ -74,6 +85,18 @@ def ue_to_opengl(mat):
     ]
 
 
+def convert_sun_direction(sun_dir_ue):
+    """
+    将 UE5 坐标系下的太阳方向向量转换为 OpenGL 坐标系下的归一化向量
+    使用与相机世界轴一致的映射：GL_x = UE_y, GL_y = UE_z, GL_z = -UE_x
+    """
+    gl = remap_world_vec_ue_to_gl(sun_dir_ue)
+    length = math.sqrt(gl[0] * gl[0] + gl[1] * gl[1] + gl[2] * gl[2])
+    if length > 1e-8:
+        gl = [gl[0] / length, gl[1] / length, gl[2] / length]
+    return gl
+
+
 def convert_transforms(input_path, output_path=None):
     input_path = Path(input_path)
     if output_path is None:
@@ -88,6 +111,10 @@ def convert_transforms(input_path, output_path=None):
 
     for frame in converted["frames"]:
         frame["transform_matrix"] = ue_to_opengl(frame["transform_matrix"])
+
+        # 太阳方向：UE5 -> OpenGL
+        if "sun_direction_ue" in frame:
+            frame["sun_direction"] = convert_sun_direction(frame["sun_direction_ue"])
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(converted, f, indent=2)
