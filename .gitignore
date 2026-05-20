@@ -1,6 +1,7 @@
 .idea
 .venv
 .claude
+.codex
 output
 data
 submodules/*/build

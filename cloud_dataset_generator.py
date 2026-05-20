@@ -273,7 +273,6 @@ class CloudDatasetGenerator:
             dx /= length
             dy /= length
             dz /= length
-            dz /= length
 
         return [dx, dy, dz]
 
