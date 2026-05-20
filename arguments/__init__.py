@@ -44,16 +44,12 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
-        self.sh_degree = 3
         self._source_path = ""
         self._model_path = ""
-        self._images = "images"
-        self._depths = ""
         self._resolution = -1
         self._white_background = False
-        self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -65,7 +61,6 @@ class ModelParams(ParamGroup):
 
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
-        self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
@@ -88,10 +83,6 @@ class OptimizationParams(ParamGroup):
         self.g_factor_lr = 0.0025
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
-        self.exposure_lr_init = 0.01
-        self.exposure_lr_final = 0.001
-        self.exposure_lr_delay_steps = 0
-        self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_scale = 0.1
@@ -112,28 +103,16 @@ class OptimizationParams(ParamGroup):
         # doesn't combine with the regularizer to uniformly shrink the cloud.
         self.aniso_until_iter = 15_000
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 1e-4
-        # Minimum opacity below which a point is pruned. Under β_peak parametrization
-        # the old 0.005 is over-aggressive (small-gscale points fall below it easily).
-        self.prune_min_opacity = 0.001
         self.densify_scale_grad_threshold = 1e-6
-        self.depth_l1_weight_init = 1.0
-        self.depth_l1_weight_final = 0.01
-        self.random_background = False
         self.optimizer_type = "default"
-        # ---- Physical densify/prune strategy (volume-cloud parameterisation)
-        # "stock" = original 3DGS xyz-grad clone/split + opacity-threshold prune.
-        # "physical" = same growth path (with adaptive grad threshold) but
-        # contribution-based prune + β_peak resurrect (replaces failed opacity_reset).
-        self.densify_strategy = "physical"
         # Adaptive density threshold: take top `densify_top_frac` of grads each
         # round so growth doesn't stall when grads decay late in training.
         self.densify_adaptive = True
         self.densify_top_frac = 0.005          # top 0.5%
-        self.densify_grad_min = 5e-6           # absolute floor
+        self.densify_grad_min = 5e-5           # absolute floor
         # A Gaussian is pruned iff mean Σ(α·T) over visible frames falls below
         # this threshold. 1e-4 ≈ 0.01% of one fully-opaque pixel, very lenient
         # — main role is to remove "ghost" Gaussians, not active ones.
@@ -148,8 +127,15 @@ class OptimizationParams(ParamGroup):
         self.contribution_reset_interval = 1000
         # Aniso side-channel for prune: if a Gaussian's s_max/s_min exceeds
         # this ratio it is pruned (regardless of contribution). Targets the
-        # long ellipsoids that cause viewer popping. Disabled if ≤0.
-        self.prune_aniso_ratio = 100.0
+        # truly degenerate needle/sheet shapes. Disabled if ≤0.
+        #
+        # Empirical sweet spot: 300. Lower (=100) reclaims too many moderately
+        # elongated Gaussians that carry real PSNR (wisps/layers); 51K
+        # one-shot prune at iter 15500 dropped train PSNR from 44 to 40 — the
+        # killed points had been training for 12K steps and the schedule
+        # didn't allow them to regrow. Ratio>300 still catches needles/sheets
+        # that cause severe popping while preserving normal cloud structure.
+        self.prune_aniso_ratio = 300.0
         # How often to run the prune pass after densify_until_iter has stopped
         # the regular path. 1000 = drop bad ellipsoids about as often as we
         # reset accumulator stats. 0 to disable.
