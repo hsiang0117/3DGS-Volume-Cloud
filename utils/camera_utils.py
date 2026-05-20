@@ -13,22 +13,13 @@ from scene.cameras import Camera
 import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
-import cv2
 
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    # Read only PNG header for size + mode (no pixel decode → cheap).
+    # Read only PNG header for size (no pixel decode → cheap).
     with Image.open(cam_info.image_path) as image:
         orig_w, orig_h = image.size
-        is_rgba = image.mode == "RGBA"
-
-    # Validate the depth path eagerly (so we fail fast on missing files);
-    # the actual depth bytes are decoded lazily by Camera.invdepthmap.
-    if cam_info.depth_path != "":
-        invdepth_path = cam_info.depth_path
-    else:
-        invdepth_path = None
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
@@ -50,12 +41,12 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image_path=cam_info.image_path, invdepth_path=invdepth_path,
-                  image_size=(orig_w, orig_h), is_rgba=is_rgba,
+    return Camera(resolution, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                  image_path=cam_info.image_path,
+                  image_size=(orig_w, orig_h),
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
+                  is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   is_nerf_synthetic=is_nerf_synthetic,
                   sun_dir=getattr(cam_info, "sun_dir", None))
 

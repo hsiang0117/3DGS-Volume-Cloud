@@ -53,10 +53,8 @@ class GaussianModel:
         self.g_factor_activation = lambda x: 0.8 * torch.tanh(x)
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
-        self.active_sh_degree = 0
+    def __init__(self, optimizer_type="default"):
         self.optimizer_type = optimizer_type
-        self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         # Physical appearance parameters (raw, pre-activation)
         # `_extinction` stores the peak extinction coefficient β_peak (intensive, 1/length),
@@ -67,8 +65,6 @@ class GaussianModel:
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
-        # Global (scene-level) sun direction, learned. Stored as raw 3D vector and normalized on use.
-        self._sun_dir = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.scale_gradient_accum = torch.empty(0)
@@ -77,42 +73,6 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
-
-    def capture(self):
-        return (
-            self.active_sh_degree,
-            self._xyz,
-            self._extinction,
-            self._albedo,
-            self._g_factor,
-            self._scaling,
-            self._rotation,
-            self._sun_dir,
-            self.max_radii2D,
-            self.xyz_gradient_accum,
-            self.denom,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-        )
-    
-    def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._extinction,
-        self._albedo,
-        self._g_factor,
-        self._scaling, 
-        self._rotation, 
-        self._sun_dir,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_scaling(self):
@@ -152,26 +112,12 @@ class GaussianModel:
         tau_center = beta_peak * (2.0 * math.pi) ** 0.5 * gscale
         return 1.0 - torch.exp(-tau_center)
 
-    @property
-    def get_exposure(self):
-        return self._exposure
-
-    def get_exposure_from_name(self, image_name):
-        if self.pretrained_exposures is None:
-            return self._exposure[self.exposure_mapping[image_name]]
-        else:
-            return self.pretrained_exposures[image_name]
-    
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     @property
     def get_sun_dir(self):
         return torch.tensor([0.0, 1.0, 0.0], device="cuda", dtype=self._xyz.dtype)
-
-    def oneupSHdegree(self):
-        if self.active_sh_degree < self.max_sh_degree:
-            self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
@@ -200,12 +146,7 @@ class GaussianModel:
         self._g_factor = nn.Parameter(g_factor_raw.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._sun_dir = torch.tensor([0.0, 1.0, 0.0], device="cuda", dtype=torch.float)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -243,18 +184,11 @@ class GaussianModel:
                 # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
-        self.exposure_optimizer = torch.optim.Adam([self._exposure])
-
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
-        
-        self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
-                                                        lr_delay_steps=training_args.exposure_lr_delay_steps,
-                                                        lr_delay_mult=training_args.exposure_lr_delay_mult,
-                                                        max_steps=training_args.iterations)
-        
+
         self.scaling_scheduler_args = get_expon_lr_func(
             lr_init=training_args.scaling_lr,
             lr_final=training_args.scaling_lr * 0.1,
@@ -278,10 +212,6 @@ class GaussianModel:
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
-        if self.pretrained_exposures is None:
-            for param_group in self.exposure_optimizer.param_groups:
-                param_group['lr'] = self.exposure_scheduler_args(iteration)
-
         _sched_map = {
             "xyz": self.xyz_scheduler_args,
             "scaling": self.scaling_scheduler_args,
@@ -325,22 +255,8 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    def reset_opacity(self):
-        # Kept for training-loop compatibility; opacity is now analytic (from extinction + scale).
-        return
-
-    def load_ply(self, path, use_train_test_exp = False):
+    def load_ply(self, path):
         plydata = PlyData.read(path)
-        if use_train_test_exp:
-            exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
-            if os.path.exists(exposure_file):
-                with open(exposure_file, "r") as f:
-                    exposures = json.load(f)
-                self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
-                print(f"Pretrained exposures loaded.")
-            else:
-                print(f"No exposure to be loaded at {exposure_file}")
-                self.pretrained_exposures = None
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
@@ -370,8 +286,6 @@ class GaussianModel:
         self._g_factor = nn.Parameter(torch.tensor(g_factor, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
-        self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -424,7 +338,12 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+        # tmp_radii is only set transiently inside physical_densify_and_prune;
+        # post-densify prune paths call prune_points with tmp_radii=None (or
+        # unset before the first densify round) and don't need it downstream.
+        tmp_radii = getattr(self, "tmp_radii", None)
+        if tmp_radii is not None:
+            self.tmp_radii = tmp_radii[valid_points_mask]
         if hasattr(self, "contribution_accum") and self.contribution_accum.numel() > 0:
             self.contribution_accum = self.contribution_accum[valid_points_mask]
             self.contribution_denom = self.contribution_denom[valid_points_mask]
@@ -455,25 +374,6 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
-
-    def densification_postfix(self, tensors_dict, new_tmp_radii):
-        """
-        Append newly created tensors into the optimizer-managed tensors.
-        Expected keys match optimizer group names.
-        """
-        optimizable_tensors = self.cat_tensors_to_optimizer(tensors_dict)
-        self._xyz = optimizable_tensors["xyz"]
-        self._extinction = optimizable_tensors["extinction"]
-        self._albedo = optimizable_tensors["albedo"]
-        self._g_factor = optimizable_tensors["g_factor"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-
-        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -517,14 +417,23 @@ class GaussianModel:
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # Contribution stats reset; new children get a grace period so β_peak
-        # / position have time to adapt before being judged as low-contribution.
-        self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
-        self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        # Append zero stats for new children; preserve existing points' stats so
+        # the prune predicate (visible_enough = denom ≥ 5) keeps working inside
+        # the densify phase. Resetting wholesale here was the reason aniso /
+        # contribution prune never fired before iter 15000.
         n_new_children = N * int(selected_pts_mask.sum().item())
+        n_kept = self.get_xyz.shape[0] - n_new_children
+        self.contribution_accum = torch.cat([
+            self.contribution_accum[:n_kept],
+            torch.zeros((n_new_children,), device="cuda"),
+        ])
+        self.contribution_denom = torch.cat([
+            self.contribution_denom[:n_kept],
+            torch.zeros((n_new_children,), device="cuda"),
+        ])
         new_grace = torch.full((n_new_children,), 500, dtype=torch.int32, device="cuda")
         self.prune_grace = torch.cat([
-            torch.zeros((self.get_xyz.shape[0] - n_new_children,), dtype=torch.int32, device="cuda"),
+            self.prune_grace[:n_kept],
             new_grace,
         ])
 
@@ -569,35 +478,23 @@ class GaussianModel:
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # Contribution stats reset; clones get a grace period.
-        self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
-        self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
+        # Append zero stats for clones; preserve existing points' stats so the
+        # prune predicate stays alive across densify rounds. See densify_and_split
+        # for the rationale.
+        n_kept = self.get_xyz.shape[0] - n_added
+        self.contribution_accum = torch.cat([
+            self.contribution_accum[:n_kept],
+            torch.zeros((n_added,), device="cuda"),
+        ])
+        self.contribution_denom = torch.cat([
+            self.contribution_denom[:n_kept],
+            torch.zeros((n_added,), device="cuda"),
+        ])
         new_grace = torch.full((n_added,), 500, dtype=torch.int32, device="cuda")
         self.prune_grace = torch.cat([
-            torch.zeros((self.get_xyz.shape[0] - n_added,), dtype=torch.int32, device="cuda"),
+            self.prune_grace[:n_kept],
             new_grace,
         ])
-
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
-                        max_scale_grad=None):
-        denom = self.denom.clamp(min=1)
-        grads = self.xyz_gradient_accum / denom
-        grads[grads.isnan()] = 0.0
-
-        if max_scale_grad is not None and max_scale_grad > 0:
-            grads_scale = self.scale_gradient_accum / denom
-            grads_scale[grads_scale.isnan()] = 0.0
-            grads = torch.maximum(grads, grads_scale * (max_grad / max_scale_grad))
-
-        self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
-
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        self.prune_points(prune_mask)
-        self.tmp_radii = None
-
-        torch.cuda.empty_cache()
 
     # ---------- Physical densify / prune (cloud parameterisation) ----------
 
@@ -645,7 +542,9 @@ class GaussianModel:
         β_peak of the bottom `opt.resurrect_fraction` of Gaussians (by mean
         contribution) back toward the initialisation value, and grant them
         another grace period. This restores the predicate flow stock 3DGS
-        gets from `reset_opacity()` (which is a no-op under our parameterisation).
+        gets from `reset_opacity()` — but under our β_peak parametrisation
+        that reset is meaningless (opacity is analytic from extinction +
+        scale), so we resurrect β_peak directly instead.
         """
         # 1. Density growth (stock path, with adaptive threshold)
         denom_g = self.denom.clamp(min=1)
@@ -735,6 +634,11 @@ class GaussianModel:
         """
         if iteration <= 0:
             return
+        # Order matters: resurrect → prune → reset. The prune predicate uses
+        # `contribution_denom >= prune_min_visible_frames` as a gate, so if we
+        # zeroed the accumulator first the gate would mask every point and
+        # nothing would ever be reclaimed (silent failure observed as
+        # n_points frozen + aniso p99 unbounded after densify_until_iter).
         # 1. Resurrect schedule (independent of densify_until_iter)
         if (
             opt.resurrect_interval > 0
@@ -742,15 +646,7 @@ class GaussianModel:
         ):
             self._resurrect_low_contribution(opt.resurrect_fraction)
 
-        # 2. Accumulator reset
-        reset_iv = getattr(opt, "contribution_reset_interval", 1000)
-        if reset_iv > 0 and iteration % reset_iv == 0:
-            with torch.no_grad():
-                if self.contribution_accum.numel() > 0:
-                    self.contribution_accum.zero_()
-                    self.contribution_denom.zero_()
-
-        # 3. Aniso/contribution prune post-densify. Without this, long
+        # 2. Aniso/contribution prune post-densify. Without this, long
         # ellipsoids accumulating in the second half of training never get
         # reclaimed (densify_until_iter has stopped the regular prune path),
         # which we've seen drive viewer popping back up.
@@ -760,6 +656,14 @@ class GaussianModel:
             with torch.no_grad():
                 # Match the grace decay rhythm used inside physical_densify_and_prune
                 self.prune_grace = (self.prune_grace - prune_iv).clamp(min=0)
+
+        # 3. Accumulator reset (must come AFTER prune in this tick — see note above)
+        reset_iv = getattr(opt, "contribution_reset_interval", 1000)
+        if reset_iv > 0 and iteration % reset_iv == 0:
+            with torch.no_grad():
+                if self.contribution_accum.numel() > 0:
+                    self.contribution_accum.zero_()
+                    self.contribution_denom.zero_()
 
     def _resurrect_low_contribution(self, fraction):
         """Reset β_peak of the lowest-contribution `fraction` of Gaussians

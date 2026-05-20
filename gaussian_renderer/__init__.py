@@ -130,7 +130,7 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     T_light = torch.exp(-tau_sun)
     return T_light
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, precomputed_T_light=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, precomputed_T_light=None):
     """
     Render the scene.
 
@@ -166,7 +166,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
+        sh_degree=0,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
@@ -289,11 +289,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
-        
-    # Apply exposure to rendered image (training only)
-    if use_trained_exp:
-        exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
-        rendered_image = torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3,   None, None]
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.

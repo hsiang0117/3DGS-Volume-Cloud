@@ -38,7 +38,6 @@ from utils.general_utils import build_rotation
 # --- Pipeline stub (mirrors arguments.PipelineParams, no argparse needed) ---
 @dataclass
 class _ViewerPipe:
-    convert_SHs_python: bool = False
     compute_cov3D_python: bool = False
     debug: bool = False
     antialiasing: bool = False
@@ -252,7 +251,6 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--width", type=int, default=1024, help="Render resolution width.")
     parser.add_argument("--height", type=int, default=768, help="Render resolution height.")
-    parser.add_argument("--sh_degree", type=int, default=3)
     parser.add_argument("--bg", choices=["black", "white"], default="black")
     parser.add_argument("--cameras_json", default=None,
                         help="Optional explicit path to cameras.json (auto-located next to PLY by default).")
@@ -260,8 +258,8 @@ def main():
 
     # --- Load Gaussians -----------------------------------------------------
     print(f"[viewer] Loading {args.ply} ...")
-    gaussians = GaussianModel(sh_degree=args.sh_degree)
-    gaussians.load_ply(args.ply, use_train_test_exp=False)
+    gaussians = GaussianModel()
+    gaussians.load_ply(args.ply)
     P = gaussians.get_xyz.shape[0]
     print(f"[viewer] Loaded {P} Gaussians.")
 
@@ -670,7 +668,6 @@ def main():
                         mini, gaussians, pipe, bg_color,
                         scaling_modifier=scaling_mod,
                         override_color=override,
-                        use_trained_exp=False,
                         precomputed_T_light=current_T_light,
                     )
             except RuntimeError as e:
