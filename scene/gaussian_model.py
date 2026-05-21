@@ -586,37 +586,58 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def _prune_by_contribution_and_aniso(self, opt):
-        """Two-channel prune for the physical strategy.
+        """Three-channel prune for the physical strategy.
 
-        Channel A (contribution): a Gaussian that has been visible enough
-        frames yet projects almost zero light onto valid pixels is dead
-        weight regardless of its parameters.
+        Each channel produces its own mask, gated only by `grace_expired`
+        (so newly born / resurrected points still get a settling window),
+        and the channels are OR'd together. Crucially, `visible_enough` is
+        a gate ONLY for the contribution channel — a point that is never
+        seen has no opportunity to contribute, so the contribution
+        threshold doesn't apply to it. A separate dead-point channel
+        handles the "never visible after grace expired" case.
 
-        Channel B (aniso): a Gaussian whose s_max/s_min exceeds
-        `opt.prune_aniso_ratio` is degenerate as a volumetric primitive —
-        keeping it just feeds the depth-sort popping the k_sigma clamp is
-        trying to suppress. Reclaim its budget so resurrect can place a
-        well-shaped point elsewhere.
+        Channel A — contribution: visible enough times yet projects
+            virtually no light onto valid pixels → dead weight regardless
+            of geometry.
 
-        Both channels require `visible_enough` and `grace_expired` so we
-        don't pop newborn / resurrected points.
+        Channel B — dead point: grace has expired but the point hasn't
+            been visible to a single camera in the current accumulator
+            window. Either it sits outside every frustum, or its scale is
+            so small that the rasterizer culls it before it can deposit a
+            single pixel. Without this channel such points pile up
+            indefinitely (visible-frame-count = 0 makes the contribution
+            channel above silently bypass them).
+
+        Channel C — aniso: s_max/s_min exceeds `opt.prune_aniso_ratio`.
+            Purely geometric, independent of visibility — keeping a
+            needle-shaped Gaussian alive just feeds depth-sort popping.
         """
         if self.get_xyz.shape[0] == 0:
             return 0
-        visible_enough = self.contribution_denom >= opt.prune_min_visible_frames
         grace_expired = self.prune_grace == 0
+        visible_enough = self.contribution_denom >= opt.prune_min_visible_frames
         mean_contrib = self.get_mean_contribution()
-        below_thresh = mean_contrib < opt.contribution_threshold
 
+        # A. Contribution channel — visible-but-low.
+        contrib_mask = (
+            grace_expired
+            & visible_enough
+            & (mean_contrib < opt.contribution_threshold)
+        )
+
+        # B. Dead-point channel — never visible after settling.
+        dead_mask = grace_expired & (self.contribution_denom == 0)
+
+        # C. Aniso channel — geometric, independent of visibility.
         prune_aniso_ratio = getattr(opt, "prune_aniso_ratio", -1.0)
         if prune_aniso_ratio > 0:
             s = self.get_scaling
             ratio = s.max(dim=1).values / s.min(dim=1).values.clamp(min=1e-6)
-            aniso_bad = ratio > prune_aniso_ratio
+            aniso_mask = grace_expired & (ratio > prune_aniso_ratio)
         else:
-            aniso_bad = torch.zeros_like(below_thresh)
+            aniso_mask = torch.zeros_like(grace_expired)
 
-        prune_mask = visible_enough & grace_expired & (below_thresh | aniso_bad)
+        prune_mask = contrib_mask | dead_mask | aniso_mask
         n = int(prune_mask.sum().item())
         if n > 0:
             self.prune_points(prune_mask)
