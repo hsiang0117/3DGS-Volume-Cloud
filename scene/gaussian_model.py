@@ -383,6 +383,14 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        # Alive-only gate: a Gaussian that has never been visible to any
+        # camera in the current accumulator window has no useful gradient
+        # to propagate; cloning/splitting it just produces more dead
+        # points that pile up until the next prune. New-born points are
+        # protected by their grace counter.
+        alive_or_grace = (self.contribution_denom > 0) | (self.prune_grace > 0)
+        if alive_or_grace.numel() == n_init_points:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, alive_or_grace)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -445,6 +453,10 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        # Alive-only gate (see densify_and_split for rationale).
+        alive_or_grace = (self.contribution_denom > 0) | (self.prune_grace > 0)
+        if alive_or_grace.numel() == self.get_xyz.shape[0]:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, alive_or_grace)
 
         # β_peak is intensive: clone inherits it as-is (no halving of the parent).
         new_xyz = self._xyz[selected_pts_mask]
