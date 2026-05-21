@@ -241,7 +241,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     cos_theta = torch.clamp((v * L_dir[None, :]).sum(dim=1, keepdim=True), -1.0, 1.0)
 
     # Henyey-Greenstein phase function with 1/(4π) normalization.
-    g = pc.get_g_factor  # (P,1) in (-1,1)
+    g = pc.get_g_factor  # (P,1) in (-0.8, 0.8)
     eps = 1e-6
     inv_4pi = 1.0 / (4.0 * math.pi)
 
@@ -261,11 +261,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):
-        energy   = ms_a ** n
-        g_eff    = g * (ms_c ** n)
-        T_eff    = torch.pow(T_light.clamp(min=1e-8), ms_b ** n)
+        energy = ms_a ** n
+        g_eff = g * (ms_c ** n)
+        T_eff = torch.pow(T_light.clamp(min=1e-8), ms_b ** n)
         denom_hg = torch.pow(1.0 + g_eff * g_eff - 2.0 * g_eff * cos_theta, 1.5) + eps
-        HG_n     = inv_4pi * (1.0 - g_eff * g_eff) / denom_hg
+        HG_n = inv_4pi * (1.0 - g_eff * g_eff) / denom_hg
         scatter_sum = scatter_sum + energy * T_eff * HG_n
 
     rho = pc.get_albedo  # (P,3)
