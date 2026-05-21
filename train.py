@@ -10,22 +10,21 @@
 #
 
 import os
+import json
 import torch
 import math
-from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.system_utils import build_timestamped_model_path
+from utils.image_utils import psnr, save_periodic_render, get_lpips_fn
 from tqdm import tqdm
-from utils.image_utils import psnr
-from PIL import Image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from datetime import datetime
 from scene.dataset_readers import readCamerasFromTransforms
-from utils.camera_utils import cameraList_from_camInfos
+from utils.camera_utils import cameraList_from_camInfos, CameraPrefetcher
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,30 +42,6 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
-
-LPIPS_AVAILABLE = False
-
-def build_timestamped_model_path(base_dir="./output"):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(base_dir, timestamp)
-
-    if not os.path.exists(model_path):
-        return model_path
-
-    suffix = 1
-    while True:
-        candidate = os.path.join(base_dir, f"{timestamp}_{suffix:02d}")
-        if not os.path.exists(candidate):
-            return candidate
-        suffix += 1
-
-def save_periodic_render(model_path, iteration, image_tensor, image_name=None):
-    render_dir = os.path.join(model_path, "render_test")
-    os.makedirs(render_dir, exist_ok=True)
-    suffix = f"_{image_name}" if image_name else ""
-    render_path = os.path.join(render_dir, f"iter_{iteration:06d}{suffix}.png")
-    img8 = (torch.clamp(image_tensor, 0.0, 1.0) * 255.0).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-    Image.fromarray(img8).save(render_path)
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_from):
 
@@ -87,8 +62,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
 
-    viewpoint_stack = scene.getTrainCameras().copy()
-    viewpoint_indices = list(range(len(viewpoint_stack)))
+    prefetcher = CameraPrefetcher(scene, queue_size=2)
     ema_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -98,13 +72,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
         gaussians.update_learning_rate(iteration)
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        viewpoint_indices.pop(rand_idx)
+        # Pick a random Camera (image already prefetched by background worker)
+        viewpoint_cam = prefetcher.next()
 
         # Render
         if (iteration - 1) == debug_from:
@@ -238,10 +207,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                          (gaussians.contribution_denom >= getattr(opt, "prune_min_visible_frames", 5)) &
                          (gaussians.prune_grace == 0)).sum().item()
                     )
+                    n_dead = int(
+                        ((gaussians.contribution_denom == 0) &
+                         (gaussians.prune_grace == 0)).sum().item()
+                    )
                     contrib_str = (
                         f" | contrib mean/median: {mean_contrib.mean().item():.4f}/{mean_contrib.median().item():.4f} | "
                         f"visible frames p50: {gaussians.contribution_denom.median().item():.0f} | "
-                        f"n_below_contrib: {n_below_contrib}"
+                        f"n_below_contrib: {n_below_contrib} | "
+                        f"n_dead: {n_dead}"
                     )
                 print(
                     f"  densify diag: n_points={n_points} | "
@@ -328,7 +302,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     if test_cams and len(test_cams) > 0:
                         ssims = []
                         psnrs = []
-                        # LPIPS intentionally disabled (user request): avoid large backbone downloads.
+                        lpips_vals = []
+                        lpips_fn = get_lpips_fn()  # None if package missing
                         for cam in tqdm(test_cams, desc="Final metric eval (test)"):
                             pkg = render(cam, gaussians, pipe, background, separate_sh=SPARSE_ADAM_AVAILABLE)
                             pred = pkg["render"].clamp(0.0, 1.0)
@@ -336,13 +311,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
                             ssims.append(ssim(pred, gt).item())
                             psnrs.append(psnr(pred, gt).mean().item())
+                            if lpips_fn is not None:
+                                lpips_vals.append(lpips_fn(pred, gt))
 
                             if hasattr(cam, "release_loaded"):
                                 cam.release_loaded()
 
                         metrics["test_psnr"] = float(sum(psnrs) / len(psnrs))
                         metrics["test_ssim"] = float(sum(ssims) / len(ssims))
-                        metrics["test_lpips"] = None
+                        metrics["test_lpips"] = (
+                            float(sum(lpips_vals) / len(lpips_vals)) if lpips_vals else None
+                        )
+
+                        # Persist final metrics and surface them on stdout so
+                        # an end-of-run grep can pick up results without
+                        # parsing tqdm output.
+                        metrics_path = os.path.join(scene.model_path, "metrics.json")
+                        with open(metrics_path, "w") as f:
+                            json.dump(metrics, f, indent=2)
+                        lpips_str = (
+                            f"{metrics['test_lpips']:.4f}"
+                            if metrics["test_lpips"] is not None else "n/a"
+                        )
+                        print(
+                            f"\n[Final] test PSNR {metrics['test_psnr']:.3f} | "
+                            f"SSIM {metrics['test_ssim']:.4f} | "
+                            f"LPIPS {lpips_str} → {metrics_path}"
+                        )
 
 # git checkout test
 def prepare_output_and_logger(args):    
@@ -375,10 +370,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        lpips_fn = get_lpips_fn()  # None if package missing
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                lpips_count = 0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -388,14 +387,29 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += float(ssim(image, gt_image).item())
+                    if lpips_fn is not None:
+                        lpips_test += lpips_fn(image, gt_image)
+                        lpips_count += 1
                     if hasattr(viewpoint, "release_loaded"):
                         viewpoint.release_loaded()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                n_cams = len(config['cameras'])
+                psnr_test /= n_cams
+                l1_test /= n_cams
+                ssim_test /= n_cams
+                lpips_str = (
+                    f" LPIPS {lpips_test / lpips_count:.4f}"
+                    if lpips_count > 0 else ""
+                )
+                print("\n[ITER {}] Evaluating {}: L1 {:.6f} PSNR {:.3f} SSIM {:.4f}{}".format(
+                    iteration, config['name'], float(l1_test), float(psnr_test), ssim_test, lpips_str))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                    if lpips_count > 0:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips',
+                                             lpips_test / lpips_count, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/beta_peak_histogram", scene.gaussians.get_extinction, iteration)
