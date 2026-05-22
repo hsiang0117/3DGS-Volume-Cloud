@@ -585,9 +585,9 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad_eff, scene_extent)
         self.densify_and_split(grads, max_grad_eff, scene_extent)
 
-        # 2. Contribution + aniso based prune (replaces opacity threshold)
-        if iteration >= opt.prune_warmup:
-            self._prune_by_contribution_and_aniso(opt)
+        # 2. Contribution + aniso based prune (replaces opacity threshold).
+        # Per-Gaussian prune_grace protects new-borns; no global warmup needed.
+        self._prune_by_contribution_and_aniso(opt)
 
         # Decay grace counter; accumulator reset is handled separately by
         # tick_post_densify_maintenance() so it stays alive post-densify.
@@ -684,7 +684,7 @@ class GaussianModel:
         # reclaimed (densify_until_iter has stopped the regular prune path),
         # which we've seen drive viewer popping back up.
         prune_iv = getattr(opt, "post_densify_prune_interval", 0)
-        if prune_iv > 0 and iteration % prune_iv == 0 and iteration >= opt.prune_warmup:
+        if prune_iv > 0 and iteration % prune_iv == 0:
             self._prune_by_contribution_and_aniso(opt)
             with torch.no_grad():
                 # Match the grace decay rhythm used inside physical_densify_and_prune
