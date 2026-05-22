@@ -97,7 +97,7 @@ class OptimizationParams(ParamGroup):
         # cloud structure (wisps, layers) genuinely benefits from elongated
         # Gaussians at current capacity. For aggressive aniso bounding, prefer
         # split-on-densify (`densify_split_aniso_max`) over loss regularisation.
-        self.lambda_aniso = 0.001
+        self.lambda_aniso = 0.005
         self.aniso_ratio_max = 5.0
         # Disable aniso reg after densify ends, so post-densify L_vol pressure
         # doesn't combine with the regularizer to uniformly shrink the cloud.
@@ -118,11 +118,6 @@ class OptimizationParams(ParamGroup):
         # — main role is to remove "ghost" Gaussians, not active ones.
         self.contribution_threshold = 1e-4
         self.prune_min_visible_frames = 5      # require at least 5 visible frames before judging
-        # Prune is gated by per-Gaussian `prune_grace` (default 500 iters
-        # for new-born / resurrected points), so a global warmup is
-        # double-protection. Keep at 0 unless an experiment specifically
-        # needs to delay all pruning.
-        self.prune_warmup = 0
         self.resurrect_interval = 3000         # every N iters, reset bottom β_peak
         self.resurrect_fraction = 0.05         # 5% of points
         # How often to clear the contribution accumulator so the running mean
