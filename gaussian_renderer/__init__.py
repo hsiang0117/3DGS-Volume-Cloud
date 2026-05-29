@@ -37,7 +37,13 @@ def normalized_gaussian_line_integral(scales, dirs_local):
 def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     """
     Approximate per-Gaussian sun transmittance via voxel grid (point-scatter).
-    Fully differentiable w.r.t. tau_per_gauss (and means3D through grid_sample).
+
+    Differentiable w.r.t. tau_per_gauss (the deposited optical depth, hence
+    β_peak and scales) through the scatter_add → prefix-sum → grid_sample chain,
+    and w.r.t. means3D through the grid_sample *sampling coordinate* (step 4 is
+    kept out of no_grad for this). NOT differentiable through the deposit
+    *index* (step 2 uses a hard nearest-voxel scatter), nor through the
+    light-space basis R_lw / bbox framing, which are treated as constants.
 
     Works with an arbitrary sun direction. The grid is built in a *light-space*
     frame whose third axis is `sun_dir`, so a single 1D prefix sum along that
@@ -109,17 +115,24 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     tau_above = torch.flip(exclusive_cs, [2])
 
     # --- 4. Trilinear sample at Gaussian centres (in light-space) -----------
-    with torch.no_grad():
-        coords_norm = 2.0 * (means_L - bbox_min) / bbox_size - 1.0  # (P,3)
-        # grid_sample expects (D=light_z, H=light_y, W=light_x) order with
-        # the per-point stack [x, y, z] of *normalised* coords, but PyTorch's
-        # 5D grid_sample is documented as `grid` last-dim = (x,y,z) with x
-        # indexing the last input dim (W). To match the original code's
-        # convention we feed (z, y, x).
-        grid_pts = torch.stack([coords_norm[:, 2],
-                                coords_norm[:, 1],
-                                coords_norm[:, 0]], dim=-1)
-        grid_pts = grid_pts.view(1, 1, 1, P, 3)
+    # Recompute the light-space position OUTSIDE no_grad so the grid_sample
+    # sampling coordinate carries gradient back to means3D (experiment "B"):
+    # the optimiser can now nudge a Gaussian along the tau_above field to
+    # adjust the self-shadow it receives. R_lw (static basis) and the bbox
+    # framing (bbox_min / bbox_size, built from the detached means_L above)
+    # stay constant — only the per-Gaussian position is differentiable here.
+    # The hard scatter deposit in step 2 is unchanged (that is experiment "A").
+    means_L_grad = means3D @ R_lw.T                                  # (P,3), diff. in means3D
+    coords_norm = 2.0 * (means_L_grad - bbox_min) / bbox_size - 1.0  # (P,3)
+    # grid_sample expects (D=light_z, H=light_y, W=light_x) order with
+    # the per-point stack [x, y, z] of *normalised* coords, but PyTorch's
+    # 5D grid_sample is documented as `grid` last-dim = (x,y,z) with x
+    # indexing the last input dim (W). To match the original code's
+    # convention we feed (z, y, x).
+    grid_pts = torch.stack([coords_norm[:, 2],
+                            coords_norm[:, 1],
+                            coords_norm[:, 0]], dim=-1)
+    grid_pts = grid_pts.view(1, 1, 1, P, 3)
 
     tau_sun = F.grid_sample(
         tau_above.unsqueeze(0).unsqueeze(0),

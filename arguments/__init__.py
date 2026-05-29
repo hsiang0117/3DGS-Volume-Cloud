@@ -97,7 +97,7 @@ class OptimizationParams(ParamGroup):
         # cloud structure (wisps, layers) genuinely benefits from elongated
         # Gaussians at current capacity. For aggressive aniso bounding, prefer
         # split-on-densify (`densify_split_aniso_max`) over loss regularisation.
-        self.lambda_aniso = 0.005
+        self.lambda_aniso = 0.001
         self.aniso_ratio_max = 5.0
         # Disable aniso reg after densify ends, so post-densify L_vol pressure
         # doesn't combine with the regularizer to uniformly shrink the cloud.
