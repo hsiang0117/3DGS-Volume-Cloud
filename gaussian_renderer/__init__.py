@@ -39,10 +39,9 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     Approximate per-Gaussian sun transmittance via voxel grid (point-scatter).
 
     Differentiable w.r.t. tau_per_gauss (the deposited optical depth, hence
-    β_peak and scales) through the scatter_add → prefix-sum → grid_sample chain,
-    and w.r.t. means3D through the grid_sample *sampling coordinate* (step 4 is
-    kept out of no_grad for this). NOT differentiable through the deposit
-    *index* (step 2 uses a hard nearest-voxel scatter), nor through the
+    β_peak and scales), and w.r.t. means3D through the grid_sample sampling
+    coordinate (step 4, experiment "B"). NOT differentiable through the integer
+    deposit index (step 2 uses a hard nearest-voxel scatter), nor the
     light-space basis R_lw / bbox framing, which are treated as constants.
 
     Works with an arbitrary sun direction. The grid is built in a *light-space*
@@ -51,7 +50,8 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
 
     1. Build an orthonormal basis (e1, e2, sun_dir) and rotate Gaussian centres
        into it.
-    2. Build optical-depth field on a 3D grid in light-space (point-deposit).
+    2. Build optical-depth field on a 3D grid in light-space (hard nearest-voxel
+       scatter; trilinear soft deposit was tried as experiment "A" and reverted).
     3. Exclusive prefix sum along the +sun axis → cumulative optical depth
        between each cell and the sun.
     4. Trilinear sample at each Gaussian centre → T_light = exp(-tau_sun).
@@ -88,10 +88,15 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
         e2 = e2 / (torch.linalg.norm(e2) + 1e-8)
         R_lw = torch.stack([e1, e2, s], dim=0)              # (3,3) rows are basis
 
-    # --- 1. Light-space bbox with 3-sigma padding (detached) ---------------
-    # Project all Gaussian centres into light-space, take axis-aligned bbox there.
+    # --- 1. Light-space position (differentiable) + bbox framing (detached) -
+    # Project centres into light-space ONCE; this means_L is differentiable in
+    # means3D and is shared by the deposit index (step 2) and the sample
+    # coordinate (step 4, experiment "B").
+    means_L = means3D @ R_lw.T                              # (P,3) in light-space
+    # The bounding box is just a framing for the grid — treat it as a constant
+    # (3-sigma padding so Gaussians don't fall outside the volume). The deposit
+    # index is also non-differentiable (integer voxel), so it lives here too.
     with torch.no_grad():
-        means_L = means3D @ R_lw.T                          # (P,3) in light-space
         max_extent = scales.max(dim=1).values.max().item()
         pad = 3.0 * max_extent
         bbox_min = means_L.min(dim=0).values - pad
@@ -101,7 +106,14 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
         gi = ((means_L - bbox_min) / cell_size).long().clamp(0, grid_res - 1)
         flat_idx = gi[:, 0] * (grid_res * grid_res) + gi[:, 1] * grid_res + gi[:, 2]
 
-    # --- 2. Scatter per-Gaussian tau into voxel grid (differentiable) -------
+    # --- 2. Hard nearest-voxel scatter of per-Gaussian tau (differentiable) --
+    # Each Gaussian's full-line optical depth is deposited into its single
+    # nearest voxel. (Trilinear cloud-in-cell soft deposit was tried as
+    # experiment "A" and reverted: spreading tau across 8 voxels over-softened
+    # the already trilinear-sampled shadow field, inflating β_peak ~2x and
+    # worsening PSNR/LPIPS/g — the deposited quantity is a per-Gaussian full
+    # optical depth, not a density to be box-filtered, so softening it spreads
+    # error rather than fixing it.)
     volume = torch.zeros(grid_res * grid_res * grid_res, device=device, dtype=dtype)
     volume = volume.scatter_add(0, flat_idx, tau_per_gauss.squeeze(-1))
     # Indexed [light_x, light_y, light_z=sun_axis]
@@ -115,15 +127,11 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     tau_above = torch.flip(exclusive_cs, [2])
 
     # --- 4. Trilinear sample at Gaussian centres (in light-space) -----------
-    # Recompute the light-space position OUTSIDE no_grad so the grid_sample
-    # sampling coordinate carries gradient back to means3D (experiment "B"):
-    # the optimiser can now nudge a Gaussian along the tau_above field to
-    # adjust the self-shadow it receives. R_lw (static basis) and the bbox
-    # framing (bbox_min / bbox_size, built from the detached means_L above)
-    # stay constant — only the per-Gaussian position is differentiable here.
-    # The hard scatter deposit in step 2 is unchanged (that is experiment "A").
-    means_L_grad = means3D @ R_lw.T                                  # (P,3), diff. in means3D
-    coords_norm = 2.0 * (means_L_grad - bbox_min) / bbox_size - 1.0  # (P,3)
+    # Sample tau_above at each centre using the same differentiable means_L
+    # built in step 1 (experiment "B"): the grid_sample coordinate carries
+    # gradient to means3D, so the optimiser can nudge a Gaussian along the
+    # shadow field. R_lw and the bbox framing stay constant.
+    coords_norm = 2.0 * (means_L - bbox_min) / bbox_size - 1.0       # (P,3)
     # grid_sample expects (D=light_z, H=light_y, W=light_x) order with
     # the per-point stack [x, y, z] of *normalised* coords, but PyTorch's
     # 5D grid_sample is documented as `grid` last-dim = (x,y,z) with x
