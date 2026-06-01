@@ -66,9 +66,15 @@ class PipelineParams(ParamGroup):
         self.antialiasing = False
         # Per-tile max-response sort: how far t* may deviate from centre depth,
         # in units of σ along the view ray. ≤0 reverts to stock 3DGS centre
-        # sort. 1.5 = current default (no tile artefacts, long-axis popping
-        # fixed).
-        self.k_sigma = 1.5
+        # depth sort (the kernel skips the t* shift entirely).
+        #
+        # Disabled (0.0). The per-tile max-response sort was introduced to fix
+        # long-axis popping, but in practice it produced blocky tile-boundary
+        # artefacts, while pruning/penalising elongated Gaussians (the aniso
+        # channel) controls popping effectively on its own. So we keep the
+        # aniso machinery and revert sorting to stock 3DGS. The CUDA path is
+        # retained but dead at k_sigma=0; set >0 to re-enable without a rebuild.
+        self.k_sigma = 0.0
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
