@@ -163,13 +163,11 @@ class GaussianRasterizationSettings(NamedTuple):
     antialiasing : bool
     # k_sigma controls how far the per-tile max-response depth t* may shift
     # from the centre depth, in units of σ along the view ray. ≤0 disables
-    # the shift (stock 3DGS centre-depth sort). 1.5 is the recommended default:
-    # it kills tile-boundary popping for near-isotropic Gaussians while still
-    # letting elongated ellipsoids shift correctly. Larger values approach the
-    # un-clamped per-tile sort (cleaner long-axis order but tile-edge artefacts
-    # may appear). Marked Optional so callers that don't set it get the kernel
-    # default via the C++ binding's default arg.
-    k_sigma : float = 1.5
+    # the shift (stock 3DGS centre-depth sort), which is the current default:
+    # the per-tile sort produced blocky tile-boundary artefacts, and the aniso
+    # prune/penalty controls popping on its own. Set >0 to re-enable the
+    # per-tile shift (no rebuild needed; the CUDA path is retained).
+    k_sigma : float = 0.0
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

@@ -192,7 +192,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         prefiltered=False,
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
-        k_sigma=getattr(pipe, "k_sigma", 1.5),
+        k_sigma=getattr(pipe, "k_sigma", 0.0),
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
