@@ -258,8 +258,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tau_precomp = tau_view
     opacity = 1.0 - torch.exp(-tau_view)
 
-    # cos(theta) between view dir and light dir
-    cos_theta = torch.clamp((v * L_dir[None, :]).sum(dim=1, keepdim=True), -1.0, 1.0)
+    # HG scattering angle cosine, in the standard convention: the phase
+    # function is defined on the angle between the photon's INCOMING
+    # propagation direction ω_in and its OUTGOING (scattered) direction ω_out,
+    # cosθ = ω_in·ω_out, forward lobe (g>0) peaking at cosθ=+1.
+    #   • L_dir points TOWARD the sun (dataset convention), so the sunlight
+    #     PROPAGATES along the incoming direction l_in = −L_dir.
+    #   • v points from the Gaussian toward the camera = scattered direction ω_out.
+    # So cosθ = l_in·v. Build l_in explicitly and use the textbook form rather
+    # than a bare sign flip on v·L_dir — same value, clearer intent. (Note
+    # compute_T_light still consumes L_dir = "toward sun" directly; only the
+    # phase function needs the propagation direction.)
+    l_in = -L_dir
+    cos_theta = torch.clamp((v * l_in[None, :]).sum(dim=1, keepdim=True), -1.0, 1.0)
 
     # Henyey-Greenstein phase function with 1/(4π) normalization.
     g = pc.get_g_factor  # (P,1) in (-0.8, 0.8)
