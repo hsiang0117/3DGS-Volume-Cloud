@@ -279,11 +279,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Multi-octave scattering approximation (Frostbite / Wrenninge 2015).
     # Simulates multiple scattering bounces using the same physical parameters.
-    # Higher octaves: less energy (a^n), less attenuation (T^(b^n)), more isotropic (g·c^n).
-    ms_a = 0.5    # energy attenuation per bounce
-    ms_b = 0.5    # transmittance power decay
-    ms_c = 0.5    # phase isotropization rate
+    # Higher octaves: less energy, less attenuation (T^(b^n)), more isotropic (g·c^n).
+    #
+    # The per-octave ENERGY weight is now a learnable per-Gaussian parameter
+    # `octave_w[:, n]` (softplus, >=0) instead of the fixed a^n=0.5^n schedule.
+    # It only rescales each physical basis term (HG·T_eff), so chroma stays
+    # locked in albedo ρ and lighting still flows through every octave — the
+    # weight cannot bypass the physical model. Initialised so iter-0 weights
+    # equal 0.5^n, reproducing the fixed schedule exactly at the start.
+    ms_b = 0.5    # transmittance power decay (still fixed)
+    ms_c = 0.5    # phase isotropization rate (still fixed)
     num_octaves = 6
+    octave_w = pc.get_octave_weights  # (P,6), >=0
 
     tau_sun_per_gauss = mass * line_int_sun
     if precomputed_T_light is not None:
@@ -293,7 +300,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):
-        energy = ms_a ** n
+        energy = octave_w[:, n:n+1]                      # (P,1) learnable per-Gaussian
         g_eff = g * (ms_c ** n)
         T_eff = torch.pow(T_light.clamp(min=1e-8), ms_b ** n)
         denom_hg = torch.pow(1.0 + g_eff * g_eff - 2.0 * g_eff * cos_theta, 1.5) + eps
