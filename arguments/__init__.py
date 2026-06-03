@@ -87,6 +87,9 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.extiction_lr = 0.025
         self.g_factor_lr = 0.0025
+        # LR for per-Gaussian multiple-scattering octave weights (softplus, >=0).
+        # Same order as g_factor; tune down if the weights overfit per-view.
+        self.octave_weights_lr = 0.0025
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
