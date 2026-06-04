@@ -442,11 +442,11 @@ def main():
         hint="Multiplies all Gaussian scales at render time (visual only, does not modify stored model).",
     )
     gui_ksigma = server.gui.add_slider(
-        "Sort k·σ clamp", min=0.0, max=3.0, step=0.1, initial_value=1.5,
+        "Sort k·σ clamp", min=0.0, max=3.0, step=0.1, initial_value=0.0,
         hint="Per-tile max-response sort: how far t* may deviate from centre depth, "
-             "in units of σ along the view ray. 0 = stock 3DGS centre sort. "
-             "1.5 = recommended (no tile artefacts, long-axis popping fixed). "
-             "3.0 ≈ unclamped (cleanest long-axis order, may show tile-edge artefacts).",
+             "in units of σ along the view ray. 0 = stock 3DGS centre sort (default; "
+             "popping is controlled by the aniso prune/penalty instead). "
+             ">0 re-enables the per-tile shift but can show blocky tile-edge artefacts.",
     )
     gui_sun_alt = server.gui.add_slider(
         "Sun altitude (°)", min=-90.0, max=90.0, step=1.0, initial_value=90.0,
