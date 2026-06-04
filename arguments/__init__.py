@@ -66,9 +66,15 @@ class PipelineParams(ParamGroup):
         self.antialiasing = False
         # Per-tile max-response sort: how far t* may deviate from centre depth,
         # in units of σ along the view ray. ≤0 reverts to stock 3DGS centre
-        # sort. 1.5 = current default (no tile artefacts, long-axis popping
-        # fixed).
-        self.k_sigma = 1.5
+        # depth sort (the kernel skips the t* shift entirely).
+        #
+        # Disabled (0.0). The per-tile max-response sort was introduced to fix
+        # long-axis popping, but in practice it produced blocky tile-boundary
+        # artefacts, while pruning/penalising elongated Gaussians (the aniso
+        # channel) controls popping effectively on its own. So we keep the
+        # aniso machinery and revert sorting to stock 3DGS. The CUDA path is
+        # retained but dead at k_sigma=0; set >0 to re-enable without a rebuild.
+        self.k_sigma = 0.0
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -81,6 +87,9 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.extiction_lr = 0.025
         self.g_factor_lr = 0.0025
+        # LR for per-Gaussian multiple-scattering octave weights (softplus, >=0).
+        # Same order as g_factor; tune down if the weights overfit per-view.
+        self.octave_weights_lr = 0.0025
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
@@ -118,7 +127,6 @@ class OptimizationParams(ParamGroup):
         # — main role is to remove "ghost" Gaussians, not active ones.
         self.contribution_threshold = 1e-4
         self.prune_min_visible_frames = 5      # require at least 5 visible frames before judging
-        self.prune_warmup = 3000               # before this iter, no prune at all
         self.resurrect_interval = 3000         # every N iters, reset bottom β_peak
         self.resurrect_fraction = 0.05         # 5% of points
         # How often to clear the contribution accumulator so the running mean
