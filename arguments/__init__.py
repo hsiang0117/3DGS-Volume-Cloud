@@ -106,11 +106,22 @@ class OptimizationParams(ParamGroup):
         # cloud structure (wisps, layers) genuinely benefits from elongated
         # Gaussians at current capacity. For aggressive aniso bounding, prefer
         # split-on-densify (`densify_split_aniso_max`) over loss regularisation.
+        #
+        # CONTINUOUS-CONSTRAINT TEST: aniso p99 was found NOT to converge — it
+        # grows monotonically whenever unconstrained. The soft regulariser was
+        # previously switched off at aniso_until_iter=15000, after which p99
+        # climbed freely (32 -> 58 by 30k, still rising). And λ=0 throughout
+        # gave p99=183. So here we keep λ=0.001 AND run the regulariser for the
+        # FULL schedule (aniso_until_iter = iterations) to test whether a
+        # persistent constraint drives p99 to a plateau instead of letting it
+        # grow in the back half. aniso_ratio_max=5 unchanged.
         self.lambda_aniso = 0.001
         self.aniso_ratio_max = 5.0
-        # Disable aniso reg after densify ends, so post-densify L_vol pressure
-        # doesn't combine with the regularizer to uniformly shrink the cloud.
-        self.aniso_until_iter = 15_000
+        # Run the aniso regulariser for the whole schedule (was 15000). The old
+        # early-off was meant to avoid L_vol+reg co-shrinking the cloud after
+        # densify; we now test persistent constraint instead. Watch for uniform
+        # shrinkage (scale mean dropping) as the side effect to rule out.
+        self.aniso_until_iter = 30_000
         self.densification_interval = 100
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
@@ -133,17 +144,6 @@ class OptimizationParams(ParamGroup):
         # tracks current model state. Independent of densify_until_iter; keeps
         # working post-densify. Set ≤0 to never reset (not recommended).
         self.contribution_reset_interval = 1000
-        # Aniso side-channel for prune: if a Gaussian's s_max/s_min exceeds
-        # this ratio it is pruned (regardless of contribution). Targets the
-        # truly degenerate needle/sheet shapes. Disabled if ≤0.
-        #
-        # Empirical sweet spot: 300. Lower (=100) reclaims too many moderately
-        # elongated Gaussians that carry real PSNR (wisps/layers); 51K
-        # one-shot prune at iter 15500 dropped train PSNR from 44 to 40 — the
-        # killed points had been training for 12K steps and the schedule
-        # didn't allow them to regrow. Ratio>300 still catches needles/sheets
-        # that cause severe popping while preserving normal cloud structure.
-        self.prune_aniso_ratio = 300.0
         # How often to run the prune pass after densify_until_iter has stopped
         # the regular path. 1000 = drop bad ellipsoids about as often as we
         # reset accumulator stats. 0 to disable.

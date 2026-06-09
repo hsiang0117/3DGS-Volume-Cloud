@@ -640,9 +640,9 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad_eff, scene_extent)
         self.densify_and_split(grads, max_grad_eff, scene_extent)
 
-        # 2. Contribution + aniso based prune (replaces opacity threshold).
+        # 2. Contribution-based prune (replaces opacity threshold).
         # Per-Gaussian prune_grace protects new-borns; no global warmup needed.
-        self._prune_by_contribution_and_aniso(opt)
+        self._prune_by_contribution(opt)
 
         # Decay grace counter; accumulator reset is handled separately by
         # tick_post_densify_maintenance() so it stays alive post-densify.
@@ -652,8 +652,8 @@ class GaussianModel:
         self.tmp_radii = None
         torch.cuda.empty_cache()
 
-    def _prune_by_contribution_and_aniso(self, opt):
-        """Three-channel prune for the physical strategy.
+    def _prune_by_contribution(self, opt):
+        """Two-channel prune for the physical strategy.
 
         Each channel produces its own mask, gated only by `grace_expired`
         (so newly born / resurrected points still get a settling window),
@@ -675,9 +675,9 @@ class GaussianModel:
             indefinitely (visible-frame-count = 0 makes the contribution
             channel above silently bypass them).
 
-        Channel C — aniso: s_max/s_min exceeds `opt.prune_aniso_ratio`.
-            Purely geometric, independent of visibility — keeping a
-            needle-shaped Gaussian alive just feeds depth-sort popping.
+        (A former aniso prune channel was removed: on aligned data the
+        full-schedule aniso *regulariser* drives p99 to a ~30 plateau, far
+        below any sane prune ratio, so the geometric prune never fired.)
         """
         if self.get_xyz.shape[0] == 0:
             return 0
@@ -695,16 +695,7 @@ class GaussianModel:
         # B. Dead-point channel — never visible after settling.
         dead_mask = grace_expired & (self.contribution_denom == 0)
 
-        # C. Aniso channel — geometric, independent of visibility.
-        prune_aniso_ratio = getattr(opt, "prune_aniso_ratio", -1.0)
-        if prune_aniso_ratio > 0:
-            s = self.get_scaling
-            ratio = s.max(dim=1).values / s.min(dim=1).values.clamp(min=1e-6)
-            aniso_mask = grace_expired & (ratio > prune_aniso_ratio)
-        else:
-            aniso_mask = torch.zeros_like(grace_expired)
-
-        prune_mask = contrib_mask | dead_mask | aniso_mask
+        prune_mask = contrib_mask | dead_mask
         n = int(prune_mask.sum().item())
         if n > 0:
             self.prune_points(prune_mask)
@@ -734,13 +725,14 @@ class GaussianModel:
         ):
             self._resurrect_low_contribution(opt.resurrect_fraction)
 
-        # 2. Aniso/contribution prune post-densify. Without this, long
-        # ellipsoids accumulating in the second half of training never get
-        # reclaimed (densify_until_iter has stopped the regular prune path),
-        # which we've seen drive viewer popping back up.
+        # 2. Contribution prune post-densify. Without this, low-contribution
+        # and dead points accumulating in the second half of training never
+        # get reclaimed (densify_until_iter has stopped the regular prune
+        # path). (Popping is now handled entirely by the full-schedule aniso
+        # regulariser, not by a geometric prune.)
         prune_iv = getattr(opt, "post_densify_prune_interval", 0)
         if prune_iv > 0 and iteration % prune_iv == 0:
-            self._prune_by_contribution_and_aniso(opt)
+            self._prune_by_contribution(opt)
             with torch.no_grad():
                 # Match the grace decay rhythm used inside physical_densify_and_prune
                 self.prune_grace = (self.prune_grace - prune_iv).clamp(min=0)
