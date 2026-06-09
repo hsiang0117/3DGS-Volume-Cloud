@@ -445,7 +445,7 @@ def main():
         "Sort k·σ clamp", min=0.0, max=3.0, step=0.1, initial_value=0.0,
         hint="Per-tile max-response sort: how far t* may deviate from centre depth, "
              "in units of σ along the view ray. 0 = stock 3DGS centre sort (default; "
-             "popping is controlled by the aniso prune/penalty instead). "
+             "popping is controlled by the aniso regulariser instead). "
              ">0 re-enables the per-tile shift but can show blocky tile-edge artefacts.",
     )
     gui_sun_alt = server.gui.add_slider(
@@ -462,6 +462,12 @@ def main():
     gui_res = server.gui.add_slider(
         "Render size", min=256, max=1920, step=32, initial_value=args.width,
         hint="Render resolution width; height is derived from client aspect.",
+    )
+    gui_bgcolor = server.gui.add_rgb(
+        "Background color",
+        initial_value=(255, 255, 255) if args.bg == "white" else (0, 0, 0),
+        hint="Rasterizer background colour. Handy for inspecting cloud edges / "
+             "discrete Gaussian ellipsoids against different backdrops.",
     )
     gui_reset = server.gui.add_button(
         "Reset camera",
@@ -512,6 +518,7 @@ def main():
     gui_scaling.on_update(_mark_dirty)
     gui_ksigma.on_update(_mark_dirty)
     gui_res.on_update(_mark_dirty)
+    gui_bgcolor.on_update(_mark_dirty)
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
@@ -652,6 +659,13 @@ def main():
             scaling_mod = float(gui_scaling.value)
             pipe.k_sigma = float(gui_ksigma.value)
             mode = gui_mode.value
+
+            # Update background colour in place (RGB 0-255 -> 0-1) so we don't
+            # allocate a new GPU tensor every frame.
+            _bg = gui_bgcolor.value
+            bg_color[0] = _bg[0] / 255.0
+            bg_color[1] = _bg[1] / 255.0
+            bg_color[2] = _bg[2] / 255.0
 
             if mode == "T_light":
                 # T_light is (P, 1); broadcast to RGB grayscale.
