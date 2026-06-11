@@ -85,6 +85,11 @@ class PipelineParams(ParamGroup):
         # Forward-only (no shadow gradients). Enable with --tlight_raster.
         self.tlight_raster = False
         self.tlight_raster_res = 512
+        # Re-enable the v3 full shadow gradient (σ_d through scales/rotation,
+        # not just β). Pre-supplement this minted ±X needles (aniso p99 446);
+        # with out-of-plane suns in the dataset it is worth re-testing.
+        # Keep OFF unless explicitly experimenting.
+        self.tlight_geom_grad = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
