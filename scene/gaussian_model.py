@@ -711,7 +711,7 @@ class GaussianModel:
             mean tracks the current model state, not stale early-training
             statistics. Reset every `opt.contribution_reset_interval` iters.
         """
-        if iteration <= 0:
+        if iteration <= 0 or iteration >= getattr(opt, "densify_until_iter", float("inf")):
             return
         # Order matters: resurrect → prune → reset. The prune predicate uses
         # `contribution_denom >= prune_min_visible_frames` as a gate, so if we
