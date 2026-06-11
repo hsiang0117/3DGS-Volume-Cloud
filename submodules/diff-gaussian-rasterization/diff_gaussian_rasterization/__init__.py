@@ -82,20 +82,21 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
             raster_settings.antialiasing,
             raster_settings.k_sigma,
+            raster_settings.record_front_tau,
             raster_settings.debug
         )
 
         # Invoke C++/CUDA rasterizer
-        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, contribution = _C.rasterize_gaussians(*args)
+        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, contribution, tau_front_sum, tau_front_wsum = _C.rasterize_gaussians(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, opacities, tau_precomp, geomBuffer, binningBuffer, imgBuffer)
-        return color, radii, invdepths, contribution
+        return color, radii, invdepths, contribution, tau_front_sum, tau_front_wsum
 
     @staticmethod
-    def backward(ctx, grad_out_color, _, grad_out_depth, _grad_contribution):
+    def backward(ctx, grad_out_color, _, grad_out_depth, _grad_contribution, _grad_tau_front_sum, _grad_tau_front_wsum):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -168,6 +169,12 @@ class GaussianRasterizationSettings(NamedTuple):
     # prune/penalty controls popping on its own. Set >0 to re-enable the
     # per-tile shift (no rebuild needed; the CUDA path is retained).
     k_sigma : float = 0.0
+    # When True (and tau_precomp is provided), the render kernel records, per
+    # Gaussian, the alpha*T-weighted mean of the analytic optical depth
+    # accumulated IN FRONT of it along this camera's rays. Used by the
+    # light-space shadow pass: T_light = exp(-tau_front_sum/tau_front_wsum).
+    # Forward-only (gradients ignored).
+    record_front_tau : bool = False
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

@@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -45,7 +45,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
     const int image_height,
     const int image_width,
@@ -55,6 +55,7 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool antialiasing,
 	const float k_sigma,
+	const bool record_front_tau,
 	const bool debug)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
@@ -81,6 +82,14 @@ RasterizeGaussiansCUDA(
   // densify/prune logic in train.py to spot Gaussians with negligible image
   // contribution (regardless of opacity).
   torch::Tensor gauss_contribution = torch::zeros({P}, float_opts);
+
+  // Light-space shadow pass buffers: per-Gaussian alpha*T-weighted sum of
+  // the optical depth accumulated in front of the Gaussian, plus the weight
+  // sum. Only allocated to size P when record_front_tau is requested
+  // (requires use_analytic_tau); consumed as T_light = exp(-sum/wsum).
+  const bool do_front_tau = record_front_tau && tau_precomp.numel() > 0;
+  torch::Tensor tau_front_sum = torch::zeros({do_front_tau ? P : 0}, float_opts);
+  torch::Tensor tau_front_wsum = torch::zeros({do_front_tau ? P : 0}, float_opts);
 
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -125,12 +134,14 @@ RasterizeGaussiansCUDA(
 		out_color.contiguous().data<float>(),
 		out_invdepthptr,
 		gauss_contribution.contiguous().data<float>(),
+		do_front_tau ? tau_front_sum.contiguous().data<float>() : nullptr,
+		do_front_tau ? tau_front_wsum.contiguous().data<float>() : nullptr,
 		antialiasing,
 		k_sigma,
 		radii.contiguous().data<int>(),
 		debug);
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution);
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution, tau_front_sum, tau_front_wsum);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

@@ -80,6 +80,11 @@ class PipelineParams(ParamGroup):
         # aniso machinery and revert sorting to stock 3DGS. The CUDA path is
         # retained but dead at k_sigma=0; set >0 to re-enable without a rebuild.
         self.k_sigma = 0.0
+        # T_light via light-space rasterization (sun-camera shadow pass,
+        # record_front_tau CUDA channel) instead of the 128^3 voxel cache.
+        # Forward-only (no shadow gradients). Enable with --tlight_raster.
+        self.tlight_raster = False
+        self.tlight_raster_res = 512
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

@@ -52,6 +52,8 @@ namespace CudaRasterizer
 			float* out_color,
 			float* depth,
 			float* gauss_contribution,
+			float* tau_front_sum,
+			float* tau_front_wsum,
 			bool antialiasing,
 			float k_sigma,
 			int* radii = nullptr,
