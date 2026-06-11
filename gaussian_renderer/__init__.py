@@ -11,7 +11,7 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer, rasterize_lightpass
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.general_utils import build_rotation
@@ -172,16 +172,32 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
     rasterizer's EWA Jacobian is perspective-only); at D = 60x cloud radius the
     parallax error is < 2%.
 
-    Forward-only: runs under no_grad, T_light is a constant in the shading
-    graph (the voxel path's means3D sampling gradient — experiment B — was
-    measured neutral, so nothing of value is lost).
+    Differentiable in tau_sun_per_gauss ONLY (hence β/scales/rotations through
+    its Python-side construction): the CUDA lightpass backward replays the
+    sorted buffers and pushes each Gaussian's dL/d(tau_front) onto the taus of
+    all occluders in front of it, with the blend weights frozen. This keeps
+    the β negative-feedback loop (β↑ → own shadow↓ → image darker → β pushed
+    back) inside the SAME shadow field the forward renders. Geometry inputs
+    (means3D/scales/rotations as splat shapes) are consumed detached: the sun
+    camera framing and footprints are treated as constants.
+
+    History: v1 detached everything → β ran away 4x (no feedback), -3.3 dB.
+    v2 borrowed the voxel path's gradient via straight-through → the voxel
+    field's needle-shadow artefacts injected wrong-sign gradients into
+    scale/rotation that the raster-valued forward could not correct, and
+    aniso exploded (p99 14 → 2100). The fix is a consistent gradient from the
+    raster pass itself.
 
     Returns:
-        T_light: (P, 1) sun transmittance per Gaussian, detached.
+        T_light: (P, 1) sun transmittance per Gaussian.
     """
     device = means3D.device
     dtype = means3D.dtype
     P = means3D.shape[0]
+
+    means3D = means3D.detach()
+    scales = scales.detach()
+    rotations = rotations.detach()
 
     with torch.no_grad():
         s_dir = L_dir.reshape(3)
@@ -243,37 +259,25 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
             k_sigma=0.0,
             record_front_tau=True,
         )
-        sun_rasterizer = GaussianRasterizer(raster_settings=sun_settings)
 
-        dummy_colors = torch.zeros(P, 3, device=device, dtype=dtype)
-        dummy_means2D = torch.zeros(P, 3, device=device, dtype=dtype)
-        # `opacities` is ignored by the kernel when tau_precomp is given, but
-        # the binding requires a tensor.
-        dummy_opacity = torch.zeros(P, 1, device=device, dtype=dtype)
+    # Outside no_grad: the lightpass autograd Function carries gradient from
+    # tau_front_sum back into tau_sun_per_gauss (and through it into β/scales/
+    # rotations via its construction in render()).
+    tau_front_sum, tau_front_wsum, sun_radii = rasterize_lightpass(
+        means3D, tau_sun_per_gauss.view(-1), scales, rotations, sun_settings)
 
-        _, sun_radii, _, _, tau_front_sum, tau_front_wsum = sun_rasterizer(
-            means3D=means3D,
-            means2D=dummy_means2D,
-            shs=None,
-            colors_precomp=dummy_colors,
-            opacities=dummy_opacity,
-            tau_precomp=tau_sun_per_gauss,
-            scales=scales,
-            rotations=rotations,
-            cov3D_precomp=None)
-
-        covered = tau_front_wsum > 1e-8
-        tau_front = tau_front_sum / tau_front_wsum.clamp(min=1e-8)
-        T_light = torch.exp(-tau_front)
-        # wsum==0 with a valid on-screen footprint means every covering pixel
-        # early-terminated (T < 1e-4) before reaching this Gaussian: it sits
-        # behind tau >= -ln(1e-4) ≈ 9.2 of medium -> fully shadowed. Without
-        # this fallback the darkest cores would read T_light=1 (inverted
-        # shadows). Truly culled Gaussians (radii==0; shouldn't happen with a
-        # correctly framed sun camera) stay unlit-neutral at T=1.
-        buried = (~covered) & (sun_radii > 0)
-        T_light = torch.where(buried, torch.full_like(T_light, 1e-4), T_light)
-        T_light = torch.where(covered | buried, T_light, torch.ones_like(T_light))
+    covered = tau_front_wsum > 1e-8
+    tau_front = tau_front_sum / tau_front_wsum.clamp(min=1e-8)
+    T_light = torch.exp(-tau_front)
+    # wsum==0 with a valid on-screen footprint means every covering pixel
+    # early-terminated (T < 1e-4) before reaching this Gaussian: it sits
+    # behind tau >= -ln(1e-4) ≈ 9.2 of medium -> fully shadowed. Without
+    # this fallback the darkest cores would read T_light=1 (inverted
+    # shadows). Truly culled Gaussians (radii==0; shouldn't happen with a
+    # correctly framed sun camera) stay unlit-neutral at T=1.
+    buried = (~covered) & (sun_radii > 0)
+    T_light = torch.where(buried, torch.full_like(T_light, 1e-4), T_light)
+    T_light = torch.where(covered | buried, T_light, torch.ones_like(T_light))
 
     return T_light.unsqueeze(-1)
 
@@ -423,26 +427,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if precomputed_T_light is not None:
         T_light = precomputed_T_light
     elif getattr(pipe, "tlight_raster", False):
-        # Light-space rasterized shadow pass for the VALUE (fixes the voxel
-        # cache's needle-shadow / chord-bias / self-leak / bbox-aliasing
-        # errors; see compute_T_light_raster docstring) ...
-        T_raster = compute_T_light_raster(
-            means3D.detach(), tau_sun_per_gauss.detach(),
-            s.detach(), pc.get_rotation.detach(),
+        # Light-space rasterized shadow pass (fixes the voxel cache's
+        # needle-shadow / chord-bias / self-leak / bbox-aliasing errors).
+        # Differentiable in tau_sun_per_gauss through the dedicated CUDA
+        # lightpass backward — the β feedback loop lives in the SAME shadow
+        # field the forward renders (see compute_T_light_raster docstring
+        # for why detach (v1) and voxel straight-through (v2) both failed).
+        T_light = compute_T_light_raster(
+            means3D, tau_sun_per_gauss, s, pc.get_rotation,
             L_dir, scaling_modifier=scaling_modifier,
             image_size=int(getattr(pipe, "tlight_raster_res", 512)))
-        if torch.is_grad_enabled():
-            # ... straight-through voxel GRADIENT. A fully detached T_light
-            # (v1) broke the β negative-feedback loop (β↑ → T↓ → image darker
-            # → gradient pushes β back): with no shadow gradient β ran away
-            # 4x, shadows went pitch black, and brightness leaked into the
-            # near-isotropic high octaves — flat, direction-less lighting and
-            # -3.3 dB. Value stays exactly T_raster; the voxel term only
-            # contributes ∂T/∂(β, scale, rotation, xyz) with the right sign.
-            T_voxel = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
-            T_light = T_raster + (T_voxel - T_voxel.detach())
-        else:
-            T_light = T_raster
     else:
         T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
 

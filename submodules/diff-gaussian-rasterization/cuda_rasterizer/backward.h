@@ -20,6 +20,21 @@
 
 namespace BACKWARD
 {
+	// Backward of the light-space front-tau recording: propagates
+	// dL/d(tau_front_sum) into dL/d(tau_precomp) of all occluders in front,
+	// with blend weights frozen.
+	void lightpass(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* means2D,
+		const float4* conic_opacity,
+		const float* final_Ts,
+		const uint32_t* n_contrib,
+		const float* grad_tau_front_sum,
+		float* dL_dtau);
+
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,

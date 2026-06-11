@@ -59,6 +59,18 @@ namespace CudaRasterizer
 			int* radii = nullptr,
 			bool debug = false);
 
+		// Backward of the record_front_tau light pass: dL/d(tau_front_sum)
+		// -> dL/d(tau_precomp) of occluders, replaying the saved buffers.
+		static void lightpassBackward(
+			const int P, const int R,
+			const int width, const int height,
+			char* geom_buffer,
+			char* binning_buffer,
+			char* image_buffer,
+			const float* grad_tau_front_sum,
+			float* dL_dtau,
+			bool debug = false);
+
 		static void backward(
 			const int P, int D, int M, int R,
 			const float* background,
