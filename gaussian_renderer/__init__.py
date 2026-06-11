@@ -429,12 +429,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     elif getattr(pipe, "tlight_raster", False):
         # Light-space rasterized shadow pass (fixes the voxel cache's
         # needle-shadow / chord-bias / self-leak / bbox-aliasing errors).
-        # Differentiable in tau_sun_per_gauss through the dedicated CUDA
-        # lightpass backward — the β feedback loop lives in the SAME shadow
-        # field the forward renders (see compute_T_light_raster docstring
-        # for why detach (v1) and voxel straight-through (v2) both failed).
+        # Differentiable through the dedicated CUDA lightpass backward, but
+        # with the tau gradient restricted to β ONLY: the geometric factor
+        # σ_d (scales+rotation via l_local/s) is detached.
+        #
+        # Why (v3 lesson): ∂τ/∂(scale,rot) only ever penalises extent ALONG
+        # the per-frame sun. All dataset suns lie in the world YZ plane, so
+        # elongation along X is invisible to the shadow gradient, and the
+        # persistent "brighten the over-shadowed interior" pressure shrinks
+        # the two sun-plane axes — both effects mint extreme needles (aniso
+        # p99 446, 34% of ratio>50 Gaussians with major axis along ±X).
+        # Detaching σ_d removes the directional exploit; the shadow VALUE
+        # still tracks geometry exactly (recomputed every iteration), and the
+        # β negative-feedback loop (v1 lesson) stays intact.
+        geom_sun = (((2.0 * math.pi) ** 1.5)
+                    * torch.prod(s, dim=1, keepdim=True) * line_int_sun).detach()
+        tau_shadow = beta_peak * geom_sun
         T_light = compute_T_light_raster(
-            means3D, tau_sun_per_gauss, s, pc.get_rotation,
+            means3D, tau_shadow, s, pc.get_rotation,
             L_dir, scaling_modifier=scaling_modifier,
             image_size=int(getattr(pipe, "tlight_raster_res", 512)))
     else:
