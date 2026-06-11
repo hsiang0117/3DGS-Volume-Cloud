@@ -51,7 +51,12 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        self.eval = False
+        # Default True: transforms_test.json now holds a real held-out split
+        # (tools/split_test_set.py). With eval=False the Blender loader merges
+        # test frames back into training, silently leaking the split and
+        # inflating final metrics. (argparse store_true means this can no
+        # longer be disabled from the CLI — flip it here if ever needed.)
+        self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
