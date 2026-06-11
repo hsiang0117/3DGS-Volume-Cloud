@@ -442,8 +442,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Detaching σ_d removes the directional exploit; the shadow VALUE
         # still tracks geometry exactly (recomputed every iteration), and the
         # β negative-feedback loop (v1 lesson) stays intact.
+        #
+        # tlight_geom_grad re-enables the v3 full gradient (β AND σ_d through
+        # scales/rotation). Only meaningful now that the dataset contains
+        # out-of-plane supplement suns (time_index >= 61, |sun_x| 0.35-0.87)
+        # closing the unsupervised-X exploit. Watch aniso p99: if it diverges
+        # from the β-only run, the sparse out-of-plane sampling (24 suns vs
+        # 61 in-plane) is not enough to hold the escape direction.
         geom_sun = (((2.0 * math.pi) ** 1.5)
-                    * torch.prod(s, dim=1, keepdim=True) * line_int_sun).detach()
+                    * torch.prod(s, dim=1, keepdim=True) * line_int_sun)
+        if not getattr(pipe, "tlight_geom_grad", False):
+            geom_sun = geom_sun.detach()
         tau_shadow = beta_peak * geom_sun
         T_light = compute_T_light_raster(
             means3D, tau_shadow, s, pc.get_rotation,
