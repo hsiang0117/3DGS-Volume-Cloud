@@ -144,6 +144,34 @@ RasterizeGaussiansCUDA(
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution, tau_front_sum, tau_front_wsum);
 }
 
+torch::Tensor
+RasterizeLightpassBackwardCUDA(
+	const torch::Tensor& tau_precomp,
+	const torch::Tensor& grad_tau_front_sum,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& geomBuffer,
+	const int R,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const bool debug)
+{
+  const int P = tau_precomp.size(0);
+  torch::Tensor dL_dtau = torch::zeros_like(tau_precomp);
+  if (P != 0 && R != 0)
+  {
+	CudaRasterizer::Rasterizer::lightpassBackward(P, R,
+	  image_width, image_height,
+	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
+	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
+	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
+	  grad_tau_front_sum.contiguous().data<float>(),
+	  dL_dtau.contiguous().data<float>(),
+	  debug);
+  }
+  return dL_dtau;
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
