@@ -21,6 +21,7 @@ Not in v1:
 import os
 import argparse
 import math
+import re
 import time
 from dataclasses import dataclass
 
@@ -30,7 +31,7 @@ import viser
 
 from scene.gaussian_model import GaussianModel
 from scene.cameras import MiniCam
-from gaussian_renderer import render, compute_T_light, normalized_gaussian_line_integral
+from gaussian_renderer import render, compute_T_light, compute_T_light_raster, normalized_gaussian_line_integral
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import build_rotation
 
@@ -87,11 +88,18 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
 
 
 @torch.no_grad()
-def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor) -> torch.Tensor:
+def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor,
+                          use_raster: bool = False, raster_res: int = 512) -> torch.Tensor:
     """Compute T_light for the given sun direction.
 
     Mirrors the per-Gaussian τ derivation used inside `render()` so the cache
     matches what render() would produce for the same sun direction.
+
+    use_raster selects the light-space rasterized shadow pass (the
+    --tlight_raster training path) instead of the 128^3 voxel cache. View a
+    model with the SAME T_light source it was trained with — β/albedo
+    calibrate against their training-time shadow field, so mixing sources
+    shows mis-lit results.
     """
     sun_dir = sun_dir.to(device="cuda", dtype=torch.float32)
     sun_dir = sun_dir / (torch.linalg.norm(sun_dir) + 1e-8)
@@ -103,6 +111,16 @@ def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor) -> to
     l_local = torch.matmul(R_t, sun_dir.view(3, 1)).squeeze(-1)             # (P,3)
     line_int_sun = normalized_gaussian_line_integral(s, l_local)
     tau_sun_per_gauss = mass * line_int_sun
+    if use_raster:
+        T = compute_T_light_raster(
+            gaussians.get_xyz,
+            tau_sun_per_gauss,
+            s,
+            gaussians.get_rotation,
+            sun_dir,
+            image_size=raster_res,
+        )
+        return T.view(-1, 1)
     return compute_T_light(
         gaussians.get_xyz,
         tau_sun_per_gauss,
@@ -254,7 +272,34 @@ def main():
     parser.add_argument("--bg", choices=["black", "white"], default="black")
     parser.add_argument("--cameras_json", default=None,
                         help="Optional explicit path to cameras.json (auto-located next to PLY by default).")
+    parser.add_argument("--tlight", choices=["auto", "voxel", "raster"], default="auto",
+                        help="T_light source. 'auto' (default) reads the training run's cfg_args "
+                             "next to the PLY and matches what the model was trained with; "
+                             "'voxel' = 128^3 grid cache, 'raster' = light-space shadow pass.")
     args = parser.parse_args()
+
+    # Resolve the T_light source. Models calibrate β/albedo against their
+    # training-time shadow field, so the viewer must use the same source.
+    use_raster_tlight = args.tlight == "raster"
+    tlight_raster_res = 512
+    if args.tlight == "auto":
+        # .../<run>/point_cloud/iteration_N/point_cloud.ply -> <run>/cfg_args
+        run_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(args.ply))))
+        cfg_path = os.path.join(run_dir, "cfg_args")
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path) as f:
+                    cfg = f.read()
+                use_raster_tlight = "tlight_raster=True" in cfg
+                m = re.search(r"tlight_raster_res=(\d+)", cfg)
+                if m:
+                    tlight_raster_res = int(m.group(1))
+            except Exception as e:
+                print(f"[viewer] cfg_args unreadable ({e}); defaulting to voxel T_light.")
+        else:
+            print("[viewer] No cfg_args found next to PLY; defaulting to voxel T_light.")
+    print(f"[viewer] T_light source: {'raster' if use_raster_tlight else 'voxel'}"
+          f"{f' ({tlight_raster_res}^2)' if use_raster_tlight else ''}")
 
     # --- Load Gaussians -----------------------------------------------------
     print(f"[viewer] Loading {args.ply} ...")
@@ -268,7 +313,8 @@ def main():
     print(f"[viewer] Precomputing T_light (sun={initial_sun.tolist()}) ...")
     t0 = time.time()
     T_light = compute_T_light_cache(
-        gaussians, torch.from_numpy(initial_sun).cuda()
+        gaussians, torch.from_numpy(initial_sun).cuda(),
+        use_raster=use_raster_tlight, raster_res=tlight_raster_res,
     ).detach()
     torch.cuda.synchronize()
     print(f"[viewer] T_light ready in {time.time() - t0:.2f}s. Shape = {tuple(T_light.shape)}")
@@ -499,7 +545,8 @@ def main():
         new_sun = _spherical_to_dir(gui_sun_alt.value, gui_sun_az.value)
         with torch.no_grad():
             new_cache = compute_T_light_cache(
-                gaussians, torch.from_numpy(new_sun).cuda()
+                gaussians, torch.from_numpy(new_sun).cuda(),
+                use_raster=use_raster_tlight, raster_res=tlight_raster_res,
             ).detach()
         torch.cuda.synchronize()
         state["sun_dir"] = new_sun
@@ -609,7 +656,8 @@ def main():
             new_sun /= max(np.linalg.norm(new_sun), 1e-8)
             with torch.no_grad():
                 new_cache = compute_T_light_cache(
-                    gaussians, torch.from_numpy(new_sun).cuda()
+                    gaussians, torch.from_numpy(new_sun).cuda(),
+                    use_raster=use_raster_tlight, raster_res=tlight_raster_res,
                 ).detach()
             state["sun_dir"] = new_sun
             state["T_light"] = new_cache
