@@ -27,6 +27,10 @@ def main():
     ap.add_argument("--data", default="data/CloudDataset")
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--phase", type=int, default=0)
+    ap.add_argument("--exempt-time-from", type=int, default=61,
+                    help="frames with time_index >= this are kept unconditionally "
+                         "(supplement suns are already a rotating 1/3 camera subset; "
+                         "lattice-thinning them again would drop 2/3 of the new suns)")
     args = ap.parse_args()
 
     train_path = os.path.join(args.data, "transforms_train.json")
@@ -44,7 +48,8 @@ def main():
         kept = frames
     else:
         kept = [fr for fr in frames
-                if (fr["camera_index"] + fr.get("time_index", 0)) % args.stride
+                if fr.get("time_index", 0) >= args.exempt_time_from
+                or (fr["camera_index"] + fr.get("time_index", 0)) % args.stride
                 == args.phase % args.stride]
 
     header = {k: v for k, v in meta.items() if k != "frames"}
