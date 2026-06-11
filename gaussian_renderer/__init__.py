@@ -15,6 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.general_utils import build_rotation
+from utils.graphics_utils import getProjectionMatrix
 
 
 def normalized_gaussian_line_integral(scales, dirs_local):
@@ -150,6 +151,132 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
 
     T_light = torch.exp(-tau_sun)
     return T_light
+
+
+def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
+                           L_dir, scaling_modifier=1.0, image_size=512):
+    """
+    Per-Gaussian sun transmittance via a light-space rasterization pass.
+
+    Renders the cloud from a distant "sun camera" looking along -L_dir with the
+    existing analytic-tau rasterizer. The CUDA kernel records, for every
+    Gaussian, the alpha*T-weighted mean of the optical depth accumulated IN
+    FRONT of it over all pixels of its light-space footprint
+    (record_front_tau). Compared with the voxel cache this fixes, in one shot:
+    lateral point-deposit ("needle" shadows), centre-only chord bias, trilinear
+    self-leakage, and bbox-quantisation aliasing — shadow resolution is set by
+    the light image, and each occluder attenuates with its true projected
+    footprint exp(-d_perp^2/2sigma^2) via the splatted 2D Gaussian.
+
+    The sun is faked with a DISTANT NARROW-FOV PERSPECTIVE camera (the
+    rasterizer's EWA Jacobian is perspective-only); at D = 60x cloud radius the
+    parallax error is < 2%.
+
+    Forward-only: runs under no_grad, T_light is a constant in the shading
+    graph (the voxel path's means3D sampling gradient — experiment B — was
+    measured neutral, so nothing of value is lost).
+
+    Returns:
+        T_light: (P, 1) sun transmittance per Gaussian, detached.
+    """
+    device = means3D.device
+    dtype = means3D.dtype
+    P = means3D.shape[0]
+
+    with torch.no_grad():
+        s_dir = L_dir.reshape(3)
+        s_dir = s_dir / (torch.linalg.norm(s_dir) + 1e-8)
+
+        # --- Sun camera: distant perspective looking along -L_dir ----------
+        centre = 0.5 * (means3D.min(dim=0).values + means3D.max(dim=0).values)
+        # Cloud bounding radius + 3-sigma pad so every splat fits the frustum.
+        radius = torch.linalg.norm(means3D - centre, dim=1).max()
+        pad = 3.0 * scales.max()
+        r_fit = (radius + pad).item()
+        D = 60.0 * max(r_fit, 1e-6)
+
+        campos = centre + s_dir * D
+        # COLMAP/3DGS camera convention: +Z is the viewing direction.
+        z_cam = -s_dir
+        helper = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype)
+        if abs(float(torch.dot(z_cam, helper).item())) > 0.95:
+            helper = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+        x_cam = torch.linalg.cross(helper, z_cam)
+        x_cam = x_cam / (torch.linalg.norm(x_cam) + 1e-8)
+        y_cam = torch.linalg.cross(z_cam, x_cam)
+
+        # World->view, already TRANSPOSED the way the rasterizer expects
+        # (Camera stores getWorld2View2(...).transpose(0,1)). Rows of R_w2c are
+        # the camera axes; transposed layout puts them in columns.
+        R_c2w = torch.stack([x_cam, y_cam, z_cam], dim=1)        # (3,3) cols
+        t_w2c = -(R_c2w.T @ campos)
+        world_view_T = torch.zeros(4, 4, device=device, dtype=dtype)
+        world_view_T[:3, :3] = R_c2w                              # = R_w2c^T
+        world_view_T[3, :3] = t_w2c
+        world_view_T[3, 3] = 1.0
+
+        # Frustum sized to the padded cloud at its nearest depth, +5% margin.
+        tanfov = 1.05 * r_fit / (D - r_fit)
+        fov = 2.0 * math.atan(tanfov)
+        znear = D - 1.5 * r_fit
+        zfar = D + 1.5 * r_fit
+        proj_T = getProjectionMatrix(znear=znear, zfar=zfar, fovX=fov, fovY=fov) \
+            .transpose(0, 1).to(device=device, dtype=dtype)
+        full_proj_T = world_view_T @ proj_T
+
+        sun_settings = GaussianRasterizationSettings(
+            image_height=image_size,
+            image_width=image_size,
+            tanfovx=tanfov,
+            tanfovy=tanfov,
+            bg=torch.zeros(3, device=device, dtype=dtype),
+            scale_modifier=scaling_modifier,
+            viewmatrix=world_view_T,
+            projmatrix=full_proj_T,
+            sh_degree=0,
+            campos=campos,
+            prefiltered=False,
+            debug=False,
+            # Keep tau unscaled (no AA convolution rescaling) and stock
+            # centre-depth sort: distance along the sun IS light-space order.
+            antialiasing=False,
+            k_sigma=0.0,
+            record_front_tau=True,
+        )
+        sun_rasterizer = GaussianRasterizer(raster_settings=sun_settings)
+
+        dummy_colors = torch.zeros(P, 3, device=device, dtype=dtype)
+        dummy_means2D = torch.zeros(P, 3, device=device, dtype=dtype)
+        # `opacities` is ignored by the kernel when tau_precomp is given, but
+        # the binding requires a tensor.
+        dummy_opacity = torch.zeros(P, 1, device=device, dtype=dtype)
+
+        _, sun_radii, _, _, tau_front_sum, tau_front_wsum = sun_rasterizer(
+            means3D=means3D,
+            means2D=dummy_means2D,
+            shs=None,
+            colors_precomp=dummy_colors,
+            opacities=dummy_opacity,
+            tau_precomp=tau_sun_per_gauss,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=None)
+
+        covered = tau_front_wsum > 1e-8
+        tau_front = tau_front_sum / tau_front_wsum.clamp(min=1e-8)
+        T_light = torch.exp(-tau_front)
+        # wsum==0 with a valid on-screen footprint means every covering pixel
+        # early-terminated (T < 1e-4) before reaching this Gaussian: it sits
+        # behind tau >= -ln(1e-4) ≈ 9.2 of medium -> fully shadowed. Without
+        # this fallback the darkest cores would read T_light=1 (inverted
+        # shadows). Truly culled Gaussians (radii==0; shouldn't happen with a
+        # correctly framed sun camera) stay unlit-neutral at T=1.
+        buried = (~covered) & (sun_radii > 0)
+        T_light = torch.where(buried, torch.full_like(T_light, 1e-4), T_light)
+        T_light = torch.where(covered | buried, T_light, torch.ones_like(T_light))
+
+    return T_light.unsqueeze(-1)
+
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, precomputed_T_light=None):
     """
@@ -295,6 +422,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tau_sun_per_gauss = mass * line_int_sun
     if precomputed_T_light is not None:
         T_light = precomputed_T_light
+    elif getattr(pipe, "tlight_raster", False):
+        # Light-space rasterized shadow pass (forward-only). Fixes the voxel
+        # cache's needle-shadow / chord-bias / self-leak / bbox-aliasing
+        # errors; see compute_T_light_raster docstring.
+        T_light = compute_T_light_raster(
+            means3D.detach(), tau_sun_per_gauss.detach(),
+            s.detach(), pc.get_rotation.detach(),
+            L_dir, scaling_modifier=scaling_modifier,
+            image_size=int(getattr(pipe, "tlight_raster_res", 512)))
     else:
         T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
 
@@ -318,7 +454,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     # Physical cloud shading is always precomputed per Gaussian before rasterization,
     # so the legacy separate SH path is intentionally bypassed here.
-    rendered_image, radii, depth_image, contribution = rasterizer(
+    rendered_image, radii, depth_image, contribution, _, _ = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = None,

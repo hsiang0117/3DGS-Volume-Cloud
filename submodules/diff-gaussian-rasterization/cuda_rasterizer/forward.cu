@@ -347,7 +347,9 @@ renderCUDA(
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
 	float* __restrict__ invdepth,
-	float* __restrict__ gauss_contribution)
+	float* __restrict__ gauss_contribution,
+	float* __restrict__ tau_front_sum,
+	float* __restrict__ tau_front_wsum)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -380,6 +382,11 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
+
+	// Running analytic optical depth along this pixel's ray (light-space
+	// shadow pass). Tracked separately from T so the recorded value is the
+	// exact sum of tau_pixel, unaffected by the 0.99 alpha clamp.
+	float tau_accum = 0.0f;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -417,9 +424,10 @@ renderCUDA(
 
 			const float G = exp(power);
 			float alpha;
+			float tau_pixel = 0.0f;
 			if (use_analytic_tau)
 			{
-				const float tau_pixel = con_o.w * G;
+				tau_pixel = con_o.w * G;
 				alpha = min(0.99f, 1.0f - exp(-tau_pixel));
 			}
 			else
@@ -451,6 +459,19 @@ renderCUDA(
 			// contribute nothing to the final image (regardless of opacity).
 			if (gauss_contribution)
 				atomicAdd(&gauss_contribution[collected_id[j]], alpha * T);
+
+			// Light-space shadow pass: record the optical depth accumulated
+			// IN FRONT of this Gaussian (before its own tau), weighted by
+			// alpha*T so pixels where the Gaussian is actually visible from
+			// the light dominate its mean. Consumed as
+			// T_light = exp(-sum/wsum) on the Python side.
+			if (tau_front_sum)
+			{
+				const float w = alpha * T;
+				atomicAdd(&tau_front_sum[collected_id[j]], w * tau_accum);
+				atomicAdd(&tau_front_wsum[collected_id[j]], w);
+			}
+			tau_accum += tau_pixel;
 
 			T = test_T;
 
@@ -489,7 +510,9 @@ void FORWARD::render(
 	float* out_color,
 	float* depths,
 	float* depth,
-	float* gauss_contribution)
+	float* gauss_contribution,
+	float* tau_front_sum,
+	float* tau_front_wsum)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -505,7 +528,9 @@ void FORWARD::render(
 		out_color,
 		depths,
 		depth,
-		gauss_contribution);
+		gauss_contribution,
+		tau_front_sum,
+		tau_front_wsum);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

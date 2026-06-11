@@ -291,6 +291,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* depth,
 	float* gauss_contribution,
+	float* tau_front_sum,
+	float* tau_front_wsum,
 	bool antialiasing,
 	float k_sigma,
 	int* radii,
@@ -424,7 +426,9 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		geomState.depths,
 		depth,
-		gauss_contribution), debug)
+		gauss_contribution,
+		tau_front_sum,
+		tau_front_wsum), debug)
 
 	return num_rendered;
 }
