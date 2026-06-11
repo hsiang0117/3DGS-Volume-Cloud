@@ -423,14 +423,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if precomputed_T_light is not None:
         T_light = precomputed_T_light
     elif getattr(pipe, "tlight_raster", False):
-        # Light-space rasterized shadow pass (forward-only). Fixes the voxel
+        # Light-space rasterized shadow pass for the VALUE (fixes the voxel
         # cache's needle-shadow / chord-bias / self-leak / bbox-aliasing
-        # errors; see compute_T_light_raster docstring.
-        T_light = compute_T_light_raster(
+        # errors; see compute_T_light_raster docstring) ...
+        T_raster = compute_T_light_raster(
             means3D.detach(), tau_sun_per_gauss.detach(),
             s.detach(), pc.get_rotation.detach(),
             L_dir, scaling_modifier=scaling_modifier,
             image_size=int(getattr(pipe, "tlight_raster_res", 512)))
+        if torch.is_grad_enabled():
+            # ... straight-through voxel GRADIENT. A fully detached T_light
+            # (v1) broke the β negative-feedback loop (β↑ → T↓ → image darker
+            # → gradient pushes β back): with no shadow gradient β ran away
+            # 4x, shadows went pitch black, and brightness leaked into the
+            # near-isotropic high octaves — flat, direction-less lighting and
+            # -3.3 dB. Value stays exactly T_raster; the voxel term only
+            # contributes ∂T/∂(β, scale, rotation, xyz) with the right sign.
+            T_voxel = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
+            T_light = T_raster + (T_voxel - T_voxel.detach())
+        else:
+            T_light = T_raster
     else:
         T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
 
