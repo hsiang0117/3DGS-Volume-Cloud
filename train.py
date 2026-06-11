@@ -49,7 +49,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, pipe)
     gaussians = GaussianModel(opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -340,15 +340,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         )
 
 # git checkout test
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args, pipe=None):
     if not args.model_path:
         args.model_path = build_timestamped_model_path()
 
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
+    # Persist pipeline params alongside model params: the viewer's
+    # --tlight auto reads tlight_raster from cfg_args to pick the matching
+    # T_light source, and ModelParams alone doesn't contain it.
+    merged = dict(vars(args))
+    if pipe is not None:
+        merged.update(vars(pipe))
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        cfg_log_f.write(str(Namespace(**merged)))
 
     # Create Tensorboard writer
     tb_writer = None
