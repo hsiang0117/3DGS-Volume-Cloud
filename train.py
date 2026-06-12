@@ -62,9 +62,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
 
-    prefetcher = CameraPrefetcher(
-        scene, queue_size=2,
-        sun_balance_weight=getattr(opt, "sun_balance_weight", 1.0))
+    prefetcher = CameraPrefetcher(scene, queue_size=2)
     ema_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")

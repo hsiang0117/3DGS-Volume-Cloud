@@ -112,19 +112,12 @@ class CameraPrefetcher:
     training-camera list. Refill happens inside the worker so the producer
     never starves.
 
-    sun_balance_weight > 1 oversamples out-of-plane sun frames (|sun_x| >
-    0.1): each refill duplicates them int(w) times plus a Bernoulli draw on
-    the fractional part, equalising the per-direction GRADIENT frequency
-    between the dense in-plane TOD arc and the sparse supplement suns.
-    Within-epoch no-replacement is preserved per copy.
-
     Multi-threaded CUDA uploads are safe under PyTorch's default stream —
     operations queue serially and synchronize correctly with the consumer.
     """
 
-    def __init__(self, scene, queue_size: int = 2, sun_balance_weight: float = 1.0):
+    def __init__(self, scene, queue_size: int = 2):
         self.scene = scene
-        self.sun_balance_weight = max(1.0, float(sun_balance_weight))
         self._refill()
         self._q = queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
@@ -133,20 +126,7 @@ class CameraPrefetcher:
         self._worker.start()
 
     def _refill(self):
-        cams = self.scene.getTrainCameras()
-        if self.sun_balance_weight <= 1.0:
-            self._stack = cams.copy()
-        else:
-            from random import random as _rand
-            w = self.sun_balance_weight
-            stack = []
-            for cam in cams:
-                stack.append(cam)
-                sd = getattr(cam, "sun_dir", None)
-                if sd is not None and abs(float(sd[0])) > 0.1:
-                    extra = int(w - 1.0) + (1 if _rand() < (w - 1.0) % 1.0 else 0)
-                    stack.extend([cam] * extra)
-            self._stack = stack
+        self._stack = self.scene.getTrainCameras().copy()
         self._indices = list(range(len(self._stack)))
 
     def _pick_one(self):
