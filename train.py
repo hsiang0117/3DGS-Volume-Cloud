@@ -49,7 +49,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, pipe)
     gaussians = GaussianModel(opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -62,7 +62,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
 
-    prefetcher = CameraPrefetcher(scene, queue_size=2)
+    prefetcher = CameraPrefetcher(
+        scene, queue_size=2,
+        sun_balance_weight=getattr(opt, "sun_balance_weight", 1.0))
     ema_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -266,6 +268,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             # from this iteration's forward pass become stale.
             gaussians.tick_post_densify_maintenance(opt, iteration)
 
+            # Needle surgery: structural hard ceiling on the aniso tail.
+            # Placed after all other structure changes in this tick so the
+            # optimizer step below sees consistent tensors. Runs through the
+            # whole schedule — needles regrow from the contrast-compression
+            # pressure, so a densify-phase-only pass would unravel by 30k.
+            needle_iv = getattr(opt, "needle_split_interval", 0)
+            if (needle_iv > 0 and iteration % needle_iv == 0
+                    and iteration <= getattr(opt, "needle_split_until_iter", opt.iterations)):
+                n_split = gaussians.split_needles(
+                    getattr(opt, "needle_split_ratio", 30.0), opt)
+                if n_split > 0:
+                    print(f"\n[ITER {iteration}] needle surgery: split {n_split} (ratio > {opt.needle_split_ratio})")
+
             # Optimizer step
             if iteration < opt.iterations:
                 if use_sparse_adam:
@@ -340,15 +355,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         )
 
 # git checkout test
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args, pipe=None):
     if not args.model_path:
         args.model_path = build_timestamped_model_path()
 
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
+    # Persist pipeline params alongside model params: the viewer's
+    # --tlight auto reads the tlight_* flags from cfg_args to pick the
+    # matching T_light source, and ModelParams alone doesn't contain them.
+    merged = dict(vars(args))
+    if pipe is not None:
+        merged.update(vars(pipe))
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        cfg_log_f.write(str(Namespace(**merged)))
 
     # Create Tensorboard writer
     tb_writer = None

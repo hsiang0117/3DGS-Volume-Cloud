@@ -51,7 +51,12 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        self.eval = False
+        # Default True: transforms_test.json now holds a real held-out split
+        # (tools/split_test_set.py). With eval=False the Blender loader merges
+        # test frames back into training, silently leaking the split and
+        # inflating final metrics. (argparse store_true means this can no
+        # longer be disabled from the CLI — flip it here if ever needed.)
+        self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -75,6 +80,24 @@ class PipelineParams(ParamGroup):
         # aniso machinery and revert sorting to stock 3DGS. The CUDA path is
         # retained but dead at k_sigma=0; set >0 to re-enable without a rebuild.
         self.k_sigma = 0.0
+        # T_light source. DEFAULT (v3, validated 2026-06-12 on the uniform-sun
+        # dataset): light-space rasterization (sun-camera shadow pass,
+        # record_front_tau CUDA channel + native lightpass backward) with the
+        # full shadow gradient (β AND σ_d through scales/rotation). Fixes the
+        # voxel cache's needle shadows / chord bias / self-leak / bbox
+        # aliasing, and with uniform sun coverage + needle surgery holds
+        # aniso p99 ~22 at no PSNR cost (held-out-sun 30.83).
+        # --tlight_voxel falls back to the legacy 128^3 voxel cache (only
+        # correct pairing for models trained pre-raster; the viewer reads
+        # cfg_args to match). store_true defaults can't be disabled from the
+        # CLI, hence a dedicated fallback flag instead of tlight_raster=True.
+        self.tlight_voxel = False
+        self.tlight_raster_res = 512
+        # Disable the σ_d part of the shadow gradient (v4 β-only mode).
+        # Pre-uniform-dataset the geometric gradient minted ±X needles
+        # (p99 446); with uniform suns it is strictly better (+0.3 dB).
+        # Kept as an ablation/debug switch.
+        self.tlight_beta_only_grad = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -148,6 +171,21 @@ class OptimizationParams(ParamGroup):
         # the regular path. 1000 = drop bad ellipsoids about as often as we
         # reset accumulator stats. 0 to disable.
         self.post_densify_prune_interval = 1000
+        # Oversampling factor for out-of-plane sun frames (|sun_x| > 0.1) in
+        # the training sampler. The TOD arc supplies 61 in-plane suns vs 24
+        # supplement suns; ~2.5 equalises per-direction gradient frequency.
+        # 1.0 = uniform (default). Diagnostic knob for the v3 needle exploit.
+        self.sun_balance_weight = 1.0
+        # Needle surgery: every `needle_split_interval` iters, split Gaussians
+        # with aniso ratio > `needle_split_ratio` into two children along the
+        # major axis (appearance-conserving, ratio halves). A structural hard
+        # ceiling on the aniso tail that the soft regulariser cannot hold —
+        # the contrast-compression pressure (missing ambient light) keeps
+        # feeding needles, and loss-side λ can only trade PSNR against them.
+        # 0 disables. Runs through the whole schedule (also post-densify).
+        self.needle_split_interval = 1000
+        self.needle_split_ratio = 30.0
+        self.needle_split_until_iter = 29_000   # stop before final settle/eval
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -1,6 +1,28 @@
 """
-UE5 体积云数据集采集脚本
-用于采集单个静态体积云在不同视角和TOD光照下的渲染图像、深度图和环境光贴图
+UE5 体积云数据集采集脚本(在 UE 编辑器内执行)。
+
+两种模式(改文件底部 MODE 或在 UE Python 控制台显式调用):
+  - "uniform": 60 个 Fibonacci 均匀半球太阳 × 轮转 1/3 相机 ≈ 1458 帧
+               → D:/CloudDatasetUniform(现行推荐,方向均匀覆盖)
+  - "tod":     61 帧 TOD 弧线太阳 × 全部 73 相机 = 4453 帧
+               → D:/CloudDataset(历史数据集的生成方式)
+
+执行方式(任选其一):
+  A. UE 底部 Output Log 命令行,左侧下拉切到 "Cmd" 模式,输入:
+         py "D:/3DGS-Volume-Cloud/tools/cloud_dataset_generator.py"
+  B. 菜单 Tools -> Execute Python Script... 选中本文件。
+  C. UE Python 控制台按需调用:
+         import sys; sys.path.insert(0, r"D:/3DGS-Volume-Cloud/tools")
+         import cloud_dataset_generator as g
+         g.main_uniform()            # 或 g.main_tod()
+
+注意事项:
+  - 脚本会自动关闭"后台 CPU 节流"(否则编辑器失焦时截图永不落盘);
+  - 采集期间编辑器可最小化但不要关闭;进度实时打印在 Output Log;
+  - 完成信号:输出目录写出 transforms.json(只在全部完成后才写);
+  - 之后用 tools/convert_transforms.py 把 transforms.json 转成 OpenGL 训练格式;
+  - 中途停止,在控制台执行:
+        py -c "import cloud_dataset_generator as g; g.ACTIVE_GENERATOR.capture_queue=[]; g.ACTIVE_GENERATOR._clear_pending_capture(); g.ACTIVE_GENERATOR.stop_capture_loop()"
 """
 
 import unreal
@@ -8,6 +30,16 @@ import math
 import json
 import time
 from pathlib import Path
+
+
+def disable_background_throttle():
+    """关闭编辑器后台 CPU 节流——失焦时截图任务会永久挂起(踩过的坑)。"""
+    try:
+        eps = unreal.load_object(None, "/Script/UnrealEd.Default__EditorPerformanceSettings")
+        eps.set_editor_property("throttle_cpu_when_not_foreground", False)
+        unreal.log("[capture] CPU throttle (not-foreground) -> OFF")
+    except Exception as e:
+        unreal.log_warning(f"[capture] 关闭 CPU 节流失败: {e} —— 采集期间请保持编辑器前台")
 
 
 class CloudDatasetGenerator:
@@ -24,7 +56,7 @@ class CloudDatasetGenerator:
         self.resolution = (1024, 1024)
 
         # 采样参数
-        self.zenith_angles = [0, 20, 40, 60, 75]  # 天顶角
+        self.zenith_angles = [0, 20, 40, 60, 80, 100, 135]  # 天顶角
         self.azimuth_interval = 30  # 方位角间隔
 
         # 创建输出目录结构
@@ -42,6 +74,10 @@ class CloudDatasetGenerator:
         # TOD 参数
         self.time_frames = 61  # 12小时分60帧
         self.time_interval = 12.0 / 60  # 每帧间隔0.2小时
+
+        # time_idx -> 指向太阳的 UE 方向向量;设置后 tick 切帧时优先于 TOD。
+        # 均匀太阳模式(generate_uniform_dataset)使用。
+        self.sun_override_by_time = {}
 
         # 存储相机位姿数据
         self.transforms_data = {
@@ -249,6 +285,34 @@ class CloudDatasetGenerator:
 
         unreal.log(f"设置 TOD: {hour:.1f} 小时, 太阳角度: {sun_angle:.1f}度")
 
+    def set_sun_direction(self, d_toward_sun):
+        """
+        直接设置太阳方向(均匀太阳模式)。
+
+        Args:
+            d_toward_sun: 指向太阳的 UE 世界系单位向量 [x, y, z]
+        光线传播方向 forward = -d。UE forward 由 (pitch, yaw) 给出:
+            forward = (cosP·cosY, cosP·sinY, sinP)
+        故 pitch = asin(-d_z), yaw = atan2(-d_y, -d_x)。roll 不影响方向光。
+        """
+        if not self.sun_light:
+            return
+
+        fx, fy, fz = -d_toward_sun[0], -d_toward_sun[1], -d_toward_sun[2]
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, fz))))
+        yaw = math.degrees(math.atan2(fy, fx))
+        self.sun_light.set_actor_rotation(unreal.Rotator(0.0, pitch, yaw), False)
+
+        if self.sky_light:
+            light_component = self.sky_light.get_component_by_class(unreal.SkyLightComponent)
+            if light_component:
+                light_component.recapture_sky()
+
+        unreal.log(
+            f"设置太阳方向: [{d_toward_sun[0]:.3f}, {d_toward_sun[1]:.3f}, {d_toward_sun[2]:.3f}] "
+            f"(pitch={pitch:.1f}°, yaw={yaw:.1f}°)"
+        )
+
     def get_sun_direction(self):
         """
         获取太阳在 UE5 世界坐标系下的归一化方向向量
@@ -443,19 +507,24 @@ class CloudDatasetGenerator:
             self.stop_capture_loop()
             unreal.log("=" * 60)
             unreal.log("数据集生成完成!")
-            unreal.log(f"总计: {self.total_camera_count} 个相机 × {self.time_frames} 帧 = {self.total_camera_count * self.time_frames} 张图像")
+            unreal.log(f"本次会话共写入 {len(self.transforms_data['frames'])} 帧位姿")
             unreal.log(f"输出目录: {self.output_dir}")
             unreal.log("=" * 60)
             return
 
         job = self.capture_queue.pop(0)
 
-        # 切换到新的时间帧时，更新 TOD
+        # 切换到新的时间帧时,更新光照:补充帧优先用显式太阳方向,否则按 TOD
         if job["time_idx"] != self.current_time_idx:
             self.current_time_idx = job["time_idx"]
-            current_hour = self.current_time_idx * self.time_interval
-            unreal.log(f"\n处理时间帧 {self.current_time_idx + 1}/{self.time_frames} (Hour: {current_hour:.2f})")
-            self.set_time_of_day(current_hour)
+            if self.current_time_idx in self.sun_override_by_time:
+                d = self.sun_override_by_time[self.current_time_idx]
+                unreal.log(f"\n处理补充太阳帧 time_idx={self.current_time_idx}")
+                self.set_sun_direction(d)
+            else:
+                current_hour = self.current_time_idx * self.time_interval
+                unreal.log(f"\n处理时间帧 {self.current_time_idx + 1}/{self.time_frames} (Hour: {current_hour:.2f})")
+                self.set_time_of_day(current_hour)
 
         # 首张截图先做一次预热，避免首帧相机绑定滞后导致的错位
         if not self.screenshot_warmed_up:
@@ -565,17 +634,98 @@ class CloudDatasetGenerator:
         self.start_capture_loop()
         unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
 
+    def generate_uniform_suns(self, n_suns, min_elevation_deg=8.0, max_elevation_deg=85.0):
+        """
+        Fibonacci 螺旋在半球上生成 n 个均匀分布的太阳方向(UE 坐标,指向太阳)。
 
-def main():
-    """主入口函数"""
-    # 配置输出目录
-    output_directory = "D:/CloudDataset"  # 可根据需要修改
-    
-    # 创建生成器并运行
+        全方位均匀覆盖,消除"某个方向几乎所有太阳都与之垂直"的 aniso
+        逃逸条件(TOD 弧线模式的太阳全在 UE XZ 平面内,缺方位角监督)。
+        """
+        z_lo = math.sin(math.radians(min_elevation_deg))
+        z_hi = math.sin(math.radians(max_elevation_deg))
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+
+        suns = []
+        for i in range(n_suns):
+            z = z_lo + (z_hi - z_lo) * (i + 0.5) / n_suns
+            r = math.sqrt(max(0.0, 1.0 - z * z))
+            phi = i * golden_angle
+            suns.append([r * math.cos(phi), r * math.sin(phi), z])
+
+        unreal.log(f"生成 {len(suns)} 个均匀半球太阳方向")
+        return suns
+
+    def generate_uniform_dataset(self, n_suns=60, camera_stride=3):
+        """
+        均匀太阳数据集:n_suns 个 Fibonacci 半球太阳 × 轮转 1/stride 相机。
+
+        独立的完整数据集(非增量补充):time_index 从 0 开始,输出目录应
+        指向一个全新位置(不要和 TOD 数据集混在一起)。transforms 写
+        transforms.json(标准名,后续直接走 convert_transforms.py)。
+        """
+        unreal.log("=" * 60)
+        unreal.log(f"开始生成均匀太阳数据集: {n_suns} 太阳 × 1/{camera_stride} 相机")
+        unreal.log("=" * 60)
+
+        self.setup_scene()
+
+        camera_positions = self.calculate_camera_positions()
+        self.total_camera_count = len(camera_positions)
+        suns = self.generate_uniform_suns(n_suns)
+
+        stride = max(1, int(camera_stride))
+        self.capture_queue = []
+        self.current_time_idx = -1
+        self.screenshot_warmed_up = False
+        self.sun_override_by_time = {}
+
+        n_frames = 0
+        for si, d in enumerate(suns):
+            self.sun_override_by_time[si] = d
+            for position, rotation, cam_idx in camera_positions:
+                if cam_idx % stride != si % stride:
+                    continue
+                self.capture_queue.append({
+                    "position": position,
+                    "rotation": rotation,
+                    "cam_idx": cam_idx,
+                    "time_idx": si,
+                    "retry": 0,
+                })
+                n_frames += 1
+
+        self.transforms_data["frames"] = []
+        unreal.log(f"均匀队列: {len(suns)} 太阳 × ~{self.total_camera_count // stride} 相机 = {n_frames} 张")
+        self.start_capture_loop()
+        unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
+
+
+def main_tod(output_directory="D:/CloudDataset"):
+    """TOD 弧线模式入口:61 帧 TOD 太阳 × 全部相机(历史数据集的生成方式)。
+
+    太阳全程在 UE XZ 平面内转动(缺方位角监督),仅为可复现历史数据集保留;
+    新数据采集请用 main_uniform。
+    """
+    disable_background_throttle()
     global ACTIVE_GENERATOR
     ACTIVE_GENERATOR = CloudDatasetGenerator(output_dir=output_directory)
     ACTIVE_GENERATOR.generate_dataset()
 
 
+def main_uniform(output_directory="D:/CloudDatasetUniform", n_suns=60, camera_stride=3):
+    """均匀太阳数据集入口:n_suns 个 Fibonacci 半球太阳 × 轮转 1/stride 相机。
+
+    默认 60 太阳 × 1/3 相机 ≈ 1458 帧 → D:/CloudDatasetUniform。
+    完成后 transforms.json 在输出目录,走 tools/convert_transforms.py 转 OpenGL。
+    """
+    disable_background_throttle()
+    global ACTIVE_GENERATOR
+    ACTIVE_GENERATOR = CloudDatasetGenerator(output_dir=output_directory)
+    ACTIVE_GENERATOR.generate_uniform_dataset(n_suns=n_suns, camera_stride=camera_stride)
+
+
+# 直接执行本文件时跑哪种模式:"uniform"(现行)或 "tod"(历史)。
+MODE = "uniform"
+
 if __name__ == "__main__":
-    main()
+    main_uniform() if MODE == "uniform" else main_tod()
