@@ -43,23 +43,8 @@ class CloudDatasetGenerator:
         self.time_frames = 61  # 12小时分60帧
         self.time_interval = 12.0 / 60  # 每帧间隔0.2小时
 
-        # --- 补充太阳方向(平面外)参数 ---------------------------------
-        # 现有 61 帧 TOD 的太阳全部在 UE XZ 平面内(yaw 恒 0,转换到
-        # OpenGL 后即 YZ 平面)。补充模式在半球上用 Fibonacci 螺旋采样
-        # 平面外的新太阳方向,为可重打光提供方位角监督。
-        #
-        # 图片量控制:新太阳不配全部相机(全笛卡尔积冗余),而是用
-        # 轮转相机子集 —— 每个太阳只拍 1/stride 的相机,相邻太阳错开
-        # 偏移,连续 stride 个太阳合起来覆盖全部相机。
-        # 24 太阳 × (73/3≈24 相机) ≈ 590 张,约 +13% 而非翻倍。
-        self.supplement_sun_count = 24
-        self.supplement_camera_stride = 3
-        self.supplement_min_elevation_deg = 10.0   # 避开地平线以下
-        self.supplement_max_elevation_deg = 80.0   # 避开天顶(方位角退化,现有弧已覆盖)
-        self.supplement_min_out_of_plane_deg = 15.0  # 与现有 XZ 平面的最小夹角
-        # 补充帧的 time_index 从现有 TOD 帧之后开始,文件名不冲突
-        self.supplement_time_base = self.time_frames
-        # time_idx -> 指向太阳的 UE 方向向量;tick 切帧时优先于 TOD
+        # time_idx -> 指向太阳的 UE 方向向量;设置后 tick 切帧时优先于 TOD。
+        # 均匀太阳模式(generate_uniform_dataset)使用。
         self.sun_override_by_time = {}
 
         # 存储相机位姿数据
@@ -270,7 +255,7 @@ class CloudDatasetGenerator:
 
     def set_sun_direction(self, d_toward_sun):
         """
-        直接设置太阳方向(补充模式)。
+        直接设置太阳方向(均匀太阳模式)。
 
         Args:
             d_toward_sun: 指向太阳的 UE 世界系单位向量 [x, y, z]
@@ -295,44 +280,6 @@ class CloudDatasetGenerator:
             f"设置太阳方向: [{d_toward_sun[0]:.3f}, {d_toward_sun[1]:.3f}, {d_toward_sun[2]:.3f}] "
             f"(pitch={pitch:.1f}°, yaw={yaw:.1f}°)"
         )
-
-    def generate_supplement_suns(self):
-        """
-        在半球上用 Fibonacci 螺旋生成平面外的补充太阳方向(UE 坐标,指向太阳)。
-
-        过滤条件:
-          - 仰角在 [min_elevation, max_elevation] 内;
-          - 与现有 TOD 弧所在的 XZ 平面夹角 ≥ min_out_of_plane(|y| 分量);
-        超采样候选后取前 supplement_sun_count 个。
-        """
-        n_target = self.supplement_sun_count
-        min_y = math.sin(math.radians(self.supplement_min_out_of_plane_deg))
-        z_lo = math.sin(math.radians(self.supplement_min_elevation_deg))
-        z_hi = math.sin(math.radians(self.supplement_max_elevation_deg))
-        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
-
-        # 先生成全部候选并过滤,再等距抽取 n_target 个 —— 直接取"前 n 个
-        # 通过者"会偏向低仰角(候选按 z 递增)。
-        candidates = []
-        n_candidates = n_target * 4  # 超采样,留足被过滤的余量
-        for i in range(n_candidates):
-            z = z_lo + (z_hi - z_lo) * (i + 0.5) / n_candidates
-            r = math.sqrt(max(0.0, 1.0 - z * z))
-            phi = i * golden_angle
-            d = [r * math.cos(phi), r * math.sin(phi), z]
-            if abs(d[1]) < min_y:
-                continue  # 太接近现有 XZ 平面,信息增量低
-            candidates.append(d)
-
-        if len(candidates) <= n_target:
-            suns = candidates
-        else:
-            step = len(candidates) / float(n_target)
-            suns = [candidates[int(k * step)] for k in range(n_target)]
-
-        unreal.log(f"生成 {len(suns)} 个平面外补充太阳方向")
-        return suns
-
 
     def get_sun_direction(self):
         """
@@ -616,14 +563,13 @@ class CloudDatasetGenerator:
         ]
 
     def save_transforms_json(self):
-        """保存 transforms json 文件(补充模式写 transforms_supplement.json)"""
-        name = getattr(self, "_supplement_json_name", None) or "transforms.json"
-        json_path = Path(self.output_dir) / name
+        """保存 transforms.json 文件"""
+        json_path = Path(self.output_dir) / "transforms.json"
 
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(self.transforms_data, f, indent=2)
 
-        unreal.log(f"已保存 {name}: {json_path}")
+        unreal.log(f"已保存 transforms.json: {json_path}")
 
     def generate_dataset(self):
         """主函数:生成完整数据集（异步串行截图）"""
@@ -660,9 +606,8 @@ class CloudDatasetGenerator:
         """
         Fibonacci 螺旋在半球上生成 n 个均匀分布的太阳方向(UE 坐标,指向太阳)。
 
-        与 generate_supplement_suns 的区别:不做平面外过滤——目标就是全方位
-        均匀覆盖(替代 TOD 弧 + 补充的两段式分布),消除"某个方向几乎所有
-        太阳都与之垂直"的 aniso 逃逸条件。
+        全方位均匀覆盖,消除"某个方向几乎所有太阳都与之垂直"的 aniso
+        逃逸条件(TOD 弧线模式的太阳全在 UE XZ 平面内,缺方位角监督)。
         """
         z_lo = math.sin(math.radians(min_elevation_deg))
         z_hi = math.sin(math.radians(max_elevation_deg))
@@ -722,63 +667,9 @@ class CloudDatasetGenerator:
         self.start_capture_loop()
         unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
 
-    def generate_supplement_dataset(self):
-        """
-        补充模式:只采集平面外太阳方向的新帧,增量追加到现有数据集。
-
-        现有 61 帧 TOD 的太阳全在一个平面内(UE yaw=0 的 XZ 平面),
-        训练侧发现这让"垂直于太阳平面的延展"得不到任何光照监督。
-        本模式补充 supplement_sun_count 个平面外太阳,每个太阳只拍
-        轮转的 1/supplement_camera_stride 相机子集控制图片量。
-
-        输出写 transforms_supplement.json(只含新帧),用合并脚本或
-        手动把 frames 追加进 transforms.json 后重跑 convert_transforms.py。
-        """
-        unreal.log("=" * 60)
-        unreal.log("开始生成补充太阳方向数据集(平面外)")
-        unreal.log("=" * 60)
-
-        self.setup_scene()
-
-        camera_positions = self.calculate_camera_positions()
-        self.total_camera_count = len(camera_positions)
-        suns = self.generate_supplement_suns()
-
-        stride = max(1, int(self.supplement_camera_stride))
-        self.capture_queue = []
-        self.current_time_idx = -1
-        self.screenshot_warmed_up = False
-        self.sun_override_by_time = {}
-
-        n_frames = 0
-        for si, d in enumerate(suns):
-            time_idx = self.supplement_time_base + si
-            self.sun_override_by_time[time_idx] = d
-            # 轮转相机子集:太阳 si 拍 cam_idx ≡ si (mod stride) 的相机,
-            # 连续 stride 个太阳合起来覆盖全部相机。
-            for position, rotation, cam_idx in camera_positions:
-                if cam_idx % stride != si % stride:
-                    continue
-                self.capture_queue.append({
-                    "position": position,
-                    "rotation": rotation,
-                    "cam_idx": cam_idx,
-                    "time_idx": time_idx,
-                    "retry": 0,
-                })
-                n_frames += 1
-
-        # 补充帧单独存盘,避免覆盖主 transforms.json
-        self.transforms_data["frames"] = []
-        self._supplement_json_name = "transforms_supplement.json"
-
-        unreal.log(f"补充队列: {len(suns)} 个太阳 × ~{self.total_camera_count // stride} 相机 = {n_frames} 张")
-        self.start_capture_loop()
-        unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
-
 
 def main():
-    """主入口函数"""
+    """主入口函数(TOD 弧线模式,历史数据集 D:/CloudDataset 用)"""
     # 配置输出目录
     output_directory = "D:/CloudDataset"  # 可根据需要修改
 
@@ -786,24 +677,6 @@ def main():
     global ACTIVE_GENERATOR
     ACTIVE_GENERATOR = CloudDatasetGenerator(output_dir=output_directory)
     ACTIVE_GENERATOR.generate_dataset()
-
-
-def main_supplement():
-    """补充模式入口:只采集平面外太阳方向的增量帧。
-
-    在 UE Python 控制台执行:
-        import cloud_dataset_generator as g
-        g.main_supplement()
-    完成后:
-      1. 把 transforms_supplement.json 的 frames 追加进 transforms.json;
-      2. 重跑 convert_transforms.py 生成训练用 json;
-      3. 重切 test split(tools/split_test_set.py 会从 full 备份重做)。
-    """
-    output_directory = "D:/CloudDataset"
-
-    global ACTIVE_GENERATOR
-    ACTIVE_GENERATOR = CloudDatasetGenerator(output_dir=output_directory)
-    ACTIVE_GENERATOR.generate_supplement_dataset()
 
 
 def main_uniform(output_directory="D:/CloudDatasetUniform", n_suns=60, camera_stride=3):
