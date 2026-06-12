@@ -291,6 +291,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* depth,
 	float* gauss_contribution,
+	float* tau_front_sum,
+	float* tau_front_wsum,
 	bool antialiasing,
 	float k_sigma,
 	int* radii,
@@ -424,9 +426,42 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		geomState.depths,
 		depth,
-		gauss_contribution), debug)
+		gauss_contribution,
+		tau_front_sum,
+		tau_front_wsum), debug)
 
 	return num_rendered;
+}
+
+void CudaRasterizer::Rasterizer::lightpassBackward(
+	const int P, const int R,
+	const int width, const int height,
+	char* geom_buffer,
+	char* binning_buffer,
+	char* image_buffer,
+	const float* grad_tau_front_sum,
+	float* dL_dtau,
+	bool debug)
+{
+	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
+	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
+	ImageState imgState = ImageState::fromChunk(image_buffer, width * height);
+
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	CHECK_CUDA(BACKWARD::lightpass(
+		tile_grid,
+		block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		geomState.means2D,
+		geomState.conic_opacity,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		grad_tau_front_sum,
+		dL_dtau), debug);
 }
 
 // Produce necessary gradients for optimization, corresponding

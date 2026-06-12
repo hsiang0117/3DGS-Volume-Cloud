@@ -7,3 +7,4 @@ data
 submodules/*/build
 submodules/*/*.egg-info
 **/__pycache__
+.mcp.json
