@@ -43,6 +43,10 @@ class _ViewerPipe:
     debug: bool = False
     antialiasing: bool = False
     k_sigma: float = 1.5
+    # T_light is supplied via precomputed_T_light (compute_T_light_cache), so
+    # render() never reaches its own T_light branch here; tlight_voxel only
+    # guards against accidental in-render computation.
+    tlight_voxel: bool = True
 
 
 def _quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -280,6 +284,9 @@ def main():
 
     # Resolve the T_light source. Models calibrate β/albedo against their
     # training-time shadow field, so the viewer must use the same source.
+    # cfg_args from current runs carries tlight_voxel (raster is the default);
+    # runs from the transition window carried tlight_raster=True; runs older
+    # than the raster pass carry neither and are voxel-trained.
     use_raster_tlight = args.tlight == "raster"
     tlight_raster_res = 512
     if args.tlight == "auto":
@@ -290,7 +297,10 @@ def main():
             try:
                 with open(cfg_path) as f:
                     cfg = f.read()
-                use_raster_tlight = "tlight_raster=True" in cfg
+                if "tlight_voxel" in cfg:
+                    use_raster_tlight = "tlight_voxel=True" not in cfg
+                else:
+                    use_raster_tlight = "tlight_raster=True" in cfg
                 m = re.search(r"tlight_raster_res=(\d+)", cfg)
                 if m:
                     tlight_raster_res = int(m.group(1))

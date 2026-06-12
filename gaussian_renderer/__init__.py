@@ -426,40 +426,31 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tau_sun_per_gauss = mass * line_int_sun
     if precomputed_T_light is not None:
         T_light = precomputed_T_light
-    elif getattr(pipe, "tlight_raster", False):
-        # Light-space rasterized shadow pass (fixes the voxel cache's
-        # needle-shadow / chord-bias / self-leak / bbox-aliasing errors).
-        # Differentiable through the dedicated CUDA lightpass backward, but
-        # with the tau gradient restricted to β ONLY: the geometric factor
-        # σ_d (scales+rotation via l_local/s) is detached.
-        #
-        # Why (v3 lesson): ∂τ/∂(scale,rot) only ever penalises extent ALONG
-        # the per-frame sun. All dataset suns lie in the world YZ plane, so
-        # elongation along X is invisible to the shadow gradient, and the
-        # persistent "brighten the over-shadowed interior" pressure shrinks
-        # the two sun-plane axes — both effects mint extreme needles (aniso
-        # p99 446, 34% of ratio>50 Gaussians with major axis along ±X).
-        # Detaching σ_d removes the directional exploit; the shadow VALUE
-        # still tracks geometry exactly (recomputed every iteration), and the
-        # β negative-feedback loop (v1 lesson) stays intact.
-        #
-        # tlight_geom_grad re-enables the v3 full gradient (β AND σ_d through
-        # scales/rotation). Only meaningful now that the dataset contains
-        # out-of-plane supplement suns (time_index >= 61, |sun_x| 0.35-0.87)
-        # closing the unsupervised-X exploit. Watch aniso p99: if it diverges
-        # from the β-only run, the sparse out-of-plane sampling (24 suns vs
-        # 61 in-plane) is not enough to hold the escape direction.
+    elif getattr(pipe, "tlight_voxel", False):
+        # Legacy 128^3 voxel cache. Kept as the correct pairing for models
+        # trained before the raster shadow pass (β/albedo calibrate against
+        # their training-time shadow field), and as a fallback.
+        T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
+    else:
+        # DEFAULT: light-space rasterized shadow pass (v3, validated on the
+        # uniform-sun dataset 2026-06-12). Fixes the voxel cache's
+        # needle-shadow / chord-bias / self-leak / bbox-aliasing errors.
+        # Differentiable through the dedicated CUDA lightpass backward; the
+        # full gradient (β AND σ_d through scales/rotation) is on by default —
+        # with uniform sun coverage it is worth +0.3 dB, and the historical
+        # ±X needle exploit (directionally-biased datasets, p99 446) is held
+        # by needle surgery + uniform suns. tlight_beta_only_grad restores
+        # the v4 β-only ablation: σ_d detached, shadow VALUE still tracks
+        # geometry every iteration, β negative-feedback loop intact.
         geom_sun = (((2.0 * math.pi) ** 1.5)
                     * torch.prod(s, dim=1, keepdim=True) * line_int_sun)
-        if not getattr(pipe, "tlight_geom_grad", False):
+        if getattr(pipe, "tlight_beta_only_grad", False):
             geom_sun = geom_sun.detach()
         tau_shadow = beta_peak * geom_sun
         T_light = compute_T_light_raster(
             means3D, tau_shadow, s, pc.get_rotation,
             L_dir, scaling_modifier=scaling_modifier,
             image_size=int(getattr(pipe, "tlight_raster_res", 512)))
-    else:
-        T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):

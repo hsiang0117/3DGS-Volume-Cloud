@@ -12,10 +12,23 @@ run = sys.argv[1]
 ply = f'{run}/point_cloud/iteration_30000/point_cloud.ply'
 
 # Evaluate with the same T_light source the model was trained with.
-# NOTE: cfg_args only persists ModelParams (not PipelineParams), so raster
-# runs cannot be auto-detected — pass 'raster' as argv[2] for those.
-use_raster = len(sys.argv) > 2 and sys.argv[2] == 'raster'
+# Current runs persist tlight_voxel in cfg_args (raster is the default);
+# transition-window runs carried tlight_raster=True; pre-raster runs carry
+# neither and are voxel-trained. argv[2] ('raster'|'voxel') overrides.
+use_raster = True
 raster_res = 512
+cfg_path = os.path.join(run, 'cfg_args')
+if len(sys.argv) > 2:
+    use_raster = sys.argv[2] == 'raster'
+elif os.path.exists(cfg_path):
+    cfg = open(cfg_path).read()
+    if 'tlight_voxel' in cfg:
+        use_raster = 'tlight_voxel=True' not in cfg
+    else:
+        use_raster = 'tlight_raster=True' in cfg
+    m = re.search(r'tlight_raster_res=(\d+)', cfg)
+    if m:
+        raster_res = int(m.group(1))
 print(f'T_light source: {"raster" if use_raster else "voxel"}')
 
 g = GaussianModel('default')
@@ -33,8 +46,8 @@ for f in test_json['frames']:
     time_by_key[(parts[0], parts[-1])] = f['time_index']
 
 pipe = Namespace(compute_cov3D_python=False, debug=False, antialiasing=False,
-                 k_sigma=0.0, tlight_raster=use_raster, tlight_raster_res=raster_res,
-                 tlight_geom_grad=False)
+                 k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
+                 tlight_beta_only_grad=False)
 bg = torch.zeros(3, device='cuda')
 
 groups = {'old_inplane': [], 'new_outplane': []}
