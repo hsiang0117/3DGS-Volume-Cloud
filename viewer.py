@@ -534,6 +534,16 @@ def main():
         initial_value=True,
         hint="When on, the camera always looks at the cloud centre — only orbit and zoom are allowed (no panning / free flight).",
     )
+    gui_record = server.gui.add_checkbox(
+        "🔴 Record video",
+        initial_value=False,
+        hint="Capture the rendered view to an MP4 (30 fps, wall-clock timing) "
+             "while checked. Untick to stop and save into ./recordings/. "
+             "Sun / view / mode changes are all captured; render size is "
+             "locked to the first recorded frame.",
+    )
+    gui_record_status = server.gui.add_text("Recording", initial_value="-")
+    gui_record_status.disabled = True
     gui_fps = server.gui.add_text("FPS", initial_value="-")
     gui_fps.disabled = True
     gui_ngauss = server.gui.add_text("# Gaussians", initial_value=f"{P:,}")
@@ -547,6 +557,83 @@ def main():
         "sun_dir": initial_sun.copy(),     # numpy (3,) — current cached sun
         "T_light": T_light,                # current cached T_light tensor
     }
+
+    # --- Video recorder ------------------------------------------------------
+    # Wall-clock-faithful capture of the FIRST client's rendered frames: the
+    # render loop is event-driven (only draws on changes), so the recorder
+    # duplicates the last frame to fill idle time. Frames are buffered in RAM
+    # (HxWx3 uint8; ~2.7 MB each at 1080p — minutes of footage are fine) and
+    # encoded once on stop, keeping the interactive loop light.
+    REC_FPS = 30
+
+    class _Recorder:
+        def __init__(self):
+            self.active = False
+            self.frames = []        # list[np.ndarray HxWx3 uint8]
+            self.size = None        # (w, h) locked at first frame
+            self.t_start = 0.0
+
+        def start(self):
+            self.active = True
+            self.frames = []
+            self.size = None
+            self.t_start = time.time()
+            print("[viewer] recording started")
+
+        def add(self, img_np):
+            if not self.active:
+                return
+            h, w = img_np.shape[:2]
+            if self.size is None:
+                # Even dimensions required by H.264/mp4v chroma subsampling.
+                self.size = (w - (w % 2), h - (h % 2))
+            tw, th = self.size
+            if (w, h) != (tw, th):
+                img_np = img_np[:th, :tw] if (w >= tw and h >= th) else None
+                if img_np is None:
+                    return  # render size shrank mid-recording; skip frame
+            # Fill wall-clock gaps so playback timing matches what you saw.
+            target_n = max(1, int(round((time.time() - self.t_start) * REC_FPS)))
+            last = img_np[:th, :tw]
+            while len(self.frames) < target_n:
+                self.frames.append(last)
+
+        def stop_and_save(self):
+            self.active = False
+            n = len(self.frames)
+            if n == 0 or self.size is None:
+                print("[viewer] recording stopped: no frames captured")
+                return None
+            import cv2
+            os.makedirs("recordings", exist_ok=True)
+            path = os.path.join(
+                "recordings", time.strftime("cloud_%Y%m%d_%H%M%S") + ".mp4")
+            writer = cv2.VideoWriter(
+                path, cv2.VideoWriter_fourcc(*"mp4v"), REC_FPS, self.size)
+            for f in self.frames:
+                writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+            writer.release()
+            dur = n / REC_FPS
+            print(f"[viewer] recording saved: {path} ({n} frames, {dur:.1f}s)")
+            self.frames = []
+            return path, n, dur
+
+    recorder = _Recorder()
+
+    def _toggle_record(_):
+        if gui_record.value:
+            recorder.start()
+            gui_record_status.value = "recording..."
+        else:
+            result = recorder.stop_and_save()
+            if result:
+                path, n, dur = result
+                gui_record_status.value = f"saved {os.path.basename(path)} ({dur:.0f}s)"
+            else:
+                gui_record_status.value = "no frames"
+        state["needs_render"] = True
+
+    gui_record.on_update(_toggle_record)
 
     def _mark_dirty(*_):
         state["needs_render"] = True
@@ -696,6 +783,14 @@ def main():
     print(f"[viewer] Serving at http://localhost:{args.port}")
     while True:
         if not state["needs_render"]:
+            if recorder.active:
+                # While recording, idle frames still advance wall-clock time;
+                # duplicate-fill happens inside recorder.add() on next render.
+                # Re-render at the capture cadence so slow changes (e.g. sun
+                # recompute) appear smoothly instead of as a single jump.
+                time.sleep(1.0 / REC_FPS)
+                state["needs_render"] = True
+                continue
             time.sleep(0.01)
             continue
         state["needs_render"] = False
@@ -706,6 +801,7 @@ def main():
             continue
 
         t_frame = time.time()
+        first_client = True
         for client in clients.values():
             cam = client.camera
             # Keep aspect consistent with client window to avoid distortion.
@@ -774,6 +870,14 @@ def main():
                 img_np = _depth_to_image(out["depth"])
             else:
                 img_np = _tensor_to_image(out["render"])
+
+            if first_client:
+                recorder.add(img_np)
+                if recorder.active:
+                    gui_record_status.value = (
+                        f"recording {time.time() - recorder.t_start:.0f}s "
+                        f"({len(recorder.frames)} frames)")
+                first_client = False
 
             client.scene.set_background_image(img_np, format="jpeg")
 
