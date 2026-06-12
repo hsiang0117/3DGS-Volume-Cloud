@@ -163,6 +163,21 @@ class OptimizationParams(ParamGroup):
         # the regular path. 1000 = drop bad ellipsoids about as often as we
         # reset accumulator stats. 0 to disable.
         self.post_densify_prune_interval = 1000
+        # Oversampling factor for out-of-plane sun frames (|sun_x| > 0.1) in
+        # the training sampler. The TOD arc supplies 61 in-plane suns vs 24
+        # supplement suns; ~2.5 equalises per-direction gradient frequency.
+        # 1.0 = uniform (default). Diagnostic knob for the v3 needle exploit.
+        self.sun_balance_weight = 1.0
+        # Needle surgery: every `needle_split_interval` iters, split Gaussians
+        # with aniso ratio > `needle_split_ratio` into two children along the
+        # major axis (appearance-conserving, ratio halves). A structural hard
+        # ceiling on the aniso tail that the soft regulariser cannot hold —
+        # the contrast-compression pressure (missing ambient light) keeps
+        # feeding needles, and loss-side λ can only trade PSNR against them.
+        # 0 disables. Runs through the whole schedule (also post-densify).
+        self.needle_split_interval = 1000
+        self.needle_split_ratio = 30.0
+        self.needle_split_until_iter = 29_000   # stop before final settle/eval
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -62,7 +62,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
 
-    prefetcher = CameraPrefetcher(scene, queue_size=2)
+    prefetcher = CameraPrefetcher(
+        scene, queue_size=2,
+        sun_balance_weight=getattr(opt, "sun_balance_weight", 1.0))
     ema_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -265,6 +267,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             # shrinks P and the per-step indices (visibility_filter / radii)
             # from this iteration's forward pass become stale.
             gaussians.tick_post_densify_maintenance(opt, iteration)
+
+            # Needle surgery: structural hard ceiling on the aniso tail.
+            # Placed after all other structure changes in this tick so the
+            # optimizer step below sees consistent tensors. Runs through the
+            # whole schedule — needles regrow from the contrast-compression
+            # pressure, so a densify-phase-only pass would unravel by 30k.
+            needle_iv = getattr(opt, "needle_split_interval", 0)
+            if (needle_iv > 0 and iteration % needle_iv == 0
+                    and iteration <= getattr(opt, "needle_split_until_iter", opt.iterations)):
+                n_split = gaussians.split_needles(
+                    getattr(opt, "needle_split_ratio", 30.0), opt)
+                if n_split > 0:
+                    print(f"\n[ITER {iteration}] needle surgery: split {n_split} (ratio > {opt.needle_split_ratio})")
 
             # Optimizer step
             if iteration < opt.iterations:
