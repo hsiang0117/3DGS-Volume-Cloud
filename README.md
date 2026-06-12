@@ -83,6 +83,103 @@ python train.py -s data/CloudDataset --tlight_voxel
 
 eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSNR/SSIM/LPIPS 并写 `metrics.json`。PipelineParams 持久化进 cfg_args,供 viewer 自动匹配 T_light 源。
 
+<details>
+<summary><b>训练命令行参数完整说明</b>(点击展开)</summary>
+
+#### 数据与输出(ModelParams)
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-s, --source_path` | (必填) | 数据集目录(含 transforms_train/test.json + points3d.ply) |
+| `-m, --model_path` | 自动时间戳 | 输出目录(checkpoint / cfg_args / metrics.json) |
+| `-r, --resolution` | -1 | 训练分辨率;-1 = 原始(宽 >1.6K 时自动缩到 1.6K),1/2/4/8 = 对应降采样 |
+| `-w, --white_background` | False | 白色训练背景(默认黑) |
+| `--data_device` | cuda | 图像缓存设备;显存紧张可设 cpu |
+| `--eval` | **True** | test split 不并入训练。store_true 无法从命令行关闭,如需全量训练改源码 |
+
+#### 渲染管线(PipelineParams)
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化 + 完整几何梯度);与 raster 之前训练的模型配套 |
+| `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
+| `--k_sigma` | 0.0 | per-tile max-response 深度排序偏移(σ 单位);0 = stock 中心深度排序。曾用于治 popping,因块状伪影弃用,CUDA 路径保留 |
+| `--compute_cov3D_python` | False | 在 Python 端算 3D 协方差(调试用) |
+| `--antialiasing` | False | 抗锯齿卷积。**勿在光照 pass 相关实验中开启**(会缩放 τ) |
+| `--debug` | False | 光栅化器 debug 模式 |
+
+#### 调度与学习率(OptimizationParams)
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--iterations` | 30000 | 总迭代数 |
+| `--position_lr_init / _final` | 1.6e-4 / 1.6e-6 | 位置学习率退火起止(×spatial_lr_scale) |
+| `--position_lr_max_steps` | 30000 | 位置退火长度。**应与 iterations 同步**——拉长会延缓主阶段退火,实测 aniso 失控、-0.6 dB |
+| `--position_lr_delay_mult` | 0.01 | 位置 LR 预热系数 |
+| `--extiction_lr` | 0.025 | β_peak 学习率 |
+| `--feature_lr` | 0.0025 | 反照率 ρ 学习率 |
+| `--g_factor_lr` | 0.0025 | HG g 学习率 |
+| `--octave_weights_lr` | 0.0025 | 多次散射八度权重学习率 |
+| `--scaling_lr` | 0.005 | 尺度学习率 |
+| `--rotation_lr` | 0.001 | 旋转学习率 |
+| `--optimizer_type` | default | `default`(Adam)或 `sparse_adam`(需 3dgs_accel 版光栅化器) |
+
+物理参数(β/ρ/g/octave)的 LR 全程指数退火到 1/10。
+
+#### 损失与正则
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--lambda_dssim` | 0.2 | DSSIM 损失权重(L = 0.8·L1 + 0.2·DSSIM) |
+| `--lambda_scale` | 0.1 | 体积正则(∏s 均值),抑制高斯无界膨胀 |
+| `--lambda_aniso` | 0.001 | 软各向异性正则(log-ratio 二次,超过 aniso_ratio_max 才罚)。调大伤 PSNR(0.05 → PSNR 崩到 ~25);硬约束交给针手术 |
+| `--aniso_ratio_max` | 5.0 | 软正则的免罚阈值 |
+| `--aniso_until_iter` | 30000 | 软正则作用区间。**必须全程**——aniso 不自收敛,提前关闭后 p99 单调上涨 |
+
+#### 致密化(densify)
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--densify_from_iter / _until_iter` | 500 / 15000 | 致密化区间。**15k 后留 settle 抛光期是实测最优**(densify 拉满 30k 反而 -0.2 dB 且 aniso 翻倍) |
+| `--densification_interval` | 100 | 致密化周期 |
+| `--densify_grad_threshold` | 1e-4 | 位置梯度阈值(densify_adaptive=False 时生效) |
+| `--densify_adaptive` | True | 自适应阈值:每轮取梯度 top `densify_top_frac`,梯度后期衰减也不停摆 |
+| `--densify_top_frac` | 0.005 | 自适应模式的 top 分位(0.5%) |
+| `--densify_grad_min` | 5e-5 | 自适应阈值的绝对下限 |
+| `--densify_scale_grad_threshold` | 1e-6 | 尺度梯度并入致密化判据的换算阈值 |
+| `--percent_dense` | 0.01 | clone/split 的尺寸分界(×场景半径) |
+
+#### 剪枝与维护
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--contribution_threshold` | 1e-4 | 贡献度剪枝阈值:mean Σ(α·T) 低于此值剪除(替代 stock 的 opacity 阈值) |
+| `--prune_min_visible_frames` | 5 | 至少在 N 帧可见才参与剪枝判定 |
+| `--contribution_reset_interval` | 1000 | 贡献度累计器清零周期(保持统计反映当前模型) |
+| `--resurrect_interval` | 3000 | 每 N 迭代把贡献度最低的一批 β_peak 重置回 0.1(替代 stock reset_opacity)。**仅 densify 期间生效**——settle 期运行会与剪枝形成净销毁回路(实测 -17% 点数、-0.7 dB) |
+| `--resurrect_fraction` | 0.05 | 每次 resurrect 的点数占比 |
+| `--post_densify_prune_interval` | 1000 | settle 期的剪枝周期;0 关闭 |
+
+#### 针手术(结构性 aniso 硬上限)
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--needle_split_interval` | 1000 | 手术周期;**0 = 关闭** |
+| `--needle_split_ratio` | 30.0 | 触发阈值(max/min 轴比)。每刀 ratio 减半,等效硬上限;想逼近体素量级(p99~12)可降到 15 |
+| `--needle_split_until_iter` | 29000 | 最后一次手术的截止迭代(留收尾期让子高斯安定) |
+
+#### 调试与日志(train.py)
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--test_iterations` | 7000 30000 | 在这些迭代做 test/train 评估(PSNR/SSIM/LPIPS) |
+| `--save_iterations` | 7000 30000 | 保存 checkpoint 的迭代(末迭代总会保存) |
+| `--debug_from` | -1 | 从第 N 迭代起开启光栅化器 debug |
+| `--detect_anomaly` | False | torch autograd 异常检测(很慢) |
+| `--quiet` | False | 静默模式 |
+
+</details>
+
 ### 评估
 
 ```shell
