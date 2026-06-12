@@ -93,6 +93,14 @@ class PipelineParams(ParamGroup):
         # CLI, hence a dedicated fallback flag instead of tlight_raster=True.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
+        # Render-space matching experiment: UE's HighResScreenshot GT is
+        # filmic-tonemapped LDR, while our physical shading lives in linear
+        # space — fitting a nonlinear target with a linear model shows up as
+        # dynamic-range compression (dark resid +0.05 / bright -0.04).
+        # When on, render() lifts the per-Gaussian radiance clamp (HDR) and
+        # applies the ACES approximation to the final image, so the loss and
+        # all metrics compare in the GT's own space.
+        self.tonemap_aces = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
