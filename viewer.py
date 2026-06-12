@@ -608,13 +608,27 @@ def main():
             os.makedirs("recordings", exist_ok=True)
             path = os.path.join(
                 "recordings", time.strftime("cloud_%Y%m%d_%H%M%S") + ".mp4")
-            writer = cv2.VideoWriter(
-                path, cv2.VideoWriter_fourcc(*"mp4v"), REC_FPS, self.size)
-            for f in self.frames:
-                writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-            writer.release()
+            # Prefer H.264 (browser/IM-playable); mp4v (MPEG-4 Part 2) only
+            # plays in desktop players. avc1 needs an H.264 encoder on the
+            # system (verified present here via openh264); fall back if a
+            # different machine lacks it. A writer can "open" yet silently
+            # produce a header-only file, so verify bytes after encoding.
+            for codec in ("avc1", "mp4v"):
+                writer = cv2.VideoWriter(
+                    path, cv2.VideoWriter_fourcc(*codec), REC_FPS, self.size)
+                if not writer.isOpened():
+                    writer.release()
+                    continue
+                for f in self.frames:
+                    writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+                writer.release()
+                if os.path.getsize(path) > 1000:
+                    break
+            else:
+                print("[viewer] recording failed: no working mp4 encoder")
+                return None
             dur = n / REC_FPS
-            print(f"[viewer] recording saved: {path} ({n} frames, {dur:.1f}s)")
+            print(f"[viewer] recording saved: {path} ({n} frames, {dur:.1f}s, {codec})")
             self.frames = []
             return path, n, dur
 
