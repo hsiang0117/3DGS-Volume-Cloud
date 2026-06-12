@@ -80,16 +80,24 @@ class PipelineParams(ParamGroup):
         # aniso machinery and revert sorting to stock 3DGS. The CUDA path is
         # retained but dead at k_sigma=0; set >0 to re-enable without a rebuild.
         self.k_sigma = 0.0
-        # T_light via light-space rasterization (sun-camera shadow pass,
-        # record_front_tau CUDA channel) instead of the 128^3 voxel cache.
-        # Forward-only (no shadow gradients). Enable with --tlight_raster.
-        self.tlight_raster = False
+        # T_light source. DEFAULT (v3, validated 2026-06-12 on the uniform-sun
+        # dataset): light-space rasterization (sun-camera shadow pass,
+        # record_front_tau CUDA channel + native lightpass backward) with the
+        # full shadow gradient (β AND σ_d through scales/rotation). Fixes the
+        # voxel cache's needle shadows / chord bias / self-leak / bbox
+        # aliasing, and with uniform sun coverage + needle surgery holds
+        # aniso p99 ~22 at no PSNR cost (held-out-sun 30.83).
+        # --tlight_voxel falls back to the legacy 128^3 voxel cache (only
+        # correct pairing for models trained pre-raster; the viewer reads
+        # cfg_args to match). store_true defaults can't be disabled from the
+        # CLI, hence a dedicated fallback flag instead of tlight_raster=True.
+        self.tlight_voxel = False
         self.tlight_raster_res = 512
-        # Re-enable the v3 full shadow gradient (σ_d through scales/rotation,
-        # not just β). Pre-supplement this minted ±X needles (aniso p99 446);
-        # with out-of-plane suns in the dataset it is worth re-testing.
-        # Keep OFF unless explicitly experimenting.
-        self.tlight_geom_grad = False
+        # Disable the σ_d part of the shadow gradient (v4 β-only mode).
+        # Pre-uniform-dataset the geometric gradient minted ±X needles
+        # (p99 446); with uniform suns it is strictly better (+0.3 dB).
+        # Kept as an ablation/debug switch.
+        self.tlight_beta_only_grad = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

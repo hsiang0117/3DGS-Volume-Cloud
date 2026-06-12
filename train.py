@@ -363,8 +363,8 @@ def prepare_output_and_logger(args, pipe=None):
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     # Persist pipeline params alongside model params: the viewer's
-    # --tlight auto reads tlight_raster from cfg_args to pick the matching
-    # T_light source, and ModelParams alone doesn't contain it.
+    # --tlight auto reads the tlight_* flags from cfg_args to pick the
+    # matching T_light source, and ModelParams alone doesn't contain them.
     merged = dict(vars(args))
     if pipe is not None:
         merged.update(vars(pipe))

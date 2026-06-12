@@ -1,6 +1,28 @@
 """
-UE5 体积云数据集采集脚本
-用于采集单个静态体积云在不同视角和TOD光照下的渲染图像、深度图和环境光贴图
+UE5 体积云数据集采集脚本(在 UE 编辑器内执行)。
+
+两种模式(改文件底部 MODE 或在 UE Python 控制台显式调用):
+  - "uniform": 60 个 Fibonacci 均匀半球太阳 × 轮转 1/3 相机 ≈ 1458 帧
+               → D:/CloudDatasetUniform(现行推荐,方向均匀覆盖)
+  - "tod":     61 帧 TOD 弧线太阳 × 全部 73 相机 = 4453 帧
+               → D:/CloudDataset(历史数据集的生成方式)
+
+执行方式(任选其一):
+  A. UE 底部 Output Log 命令行,左侧下拉切到 "Cmd" 模式,输入:
+         py "D:/3DGS-Volume-Cloud/tools/cloud_dataset_generator.py"
+  B. 菜单 Tools -> Execute Python Script... 选中本文件。
+  C. UE Python 控制台按需调用:
+         import sys; sys.path.insert(0, r"D:/3DGS-Volume-Cloud/tools")
+         import cloud_dataset_generator as g
+         g.main_uniform()            # 或 g.main_tod()
+
+注意事项:
+  - 脚本会自动关闭"后台 CPU 节流"(否则编辑器失焦时截图永不落盘);
+  - 采集期间编辑器可最小化但不要关闭;进度实时打印在 Output Log;
+  - 完成信号:输出目录写出 transforms.json(只在全部完成后才写);
+  - 之后用 tools/convert_transforms.py 把 transforms.json 转成 OpenGL 训练格式;
+  - 中途停止,在控制台执行:
+        py -c "import cloud_dataset_generator as g; g.ACTIVE_GENERATOR.capture_queue=[]; g.ACTIVE_GENERATOR._clear_pending_capture(); g.ACTIVE_GENERATOR.stop_capture_loop()"
 """
 
 import unreal
@@ -8,6 +30,16 @@ import math
 import json
 import time
 from pathlib import Path
+
+
+def disable_background_throttle():
+    """关闭编辑器后台 CPU 节流——失焦时截图任务会永久挂起(踩过的坑)。"""
+    try:
+        eps = unreal.load_object(None, "/Script/UnrealEd.Default__EditorPerformanceSettings")
+        eps.set_editor_property("throttle_cpu_when_not_foreground", False)
+        unreal.log("[capture] CPU throttle (not-foreground) -> OFF")
+    except Exception as e:
+        unreal.log_warning(f"[capture] 关闭 CPU 节流失败: {e} —— 采集期间请保持编辑器前台")
 
 
 class CloudDatasetGenerator:
@@ -668,30 +700,32 @@ class CloudDatasetGenerator:
         unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
 
 
-def main():
-    """主入口函数(TOD 弧线模式,历史数据集 D:/CloudDataset 用)"""
-    # 配置输出目录
-    output_directory = "D:/CloudDataset"  # 可根据需要修改
+def main_tod(output_directory="D:/CloudDataset"):
+    """TOD 弧线模式入口:61 帧 TOD 太阳 × 全部相机(历史数据集的生成方式)。
 
-    # 创建生成器并运行
+    太阳全程在 UE XZ 平面内转动(缺方位角监督),仅为可复现历史数据集保留;
+    新数据采集请用 main_uniform。
+    """
+    disable_background_throttle()
     global ACTIVE_GENERATOR
     ACTIVE_GENERATOR = CloudDatasetGenerator(output_dir=output_directory)
     ACTIVE_GENERATOR.generate_dataset()
 
 
 def main_uniform(output_directory="D:/CloudDatasetUniform", n_suns=60, camera_stride=3):
-    """均匀太阳数据集入口:60 个 Fibonacci 半球太阳 × 轮转 1/3 相机 ≈ 1460 帧。
+    """均匀太阳数据集入口:n_suns 个 Fibonacci 半球太阳 × 轮转 1/stride 相机。
 
-    输出到独立目录(默认 D:/CloudDatasetUniform),不触碰原 D:/CloudDataset。
-    在 UE Python 控制台执行:
-        import cloud_dataset_generator as g
-        g.main_uniform()
-    完成后 transforms.json 在输出目录,走 convert_transforms.py 转 OpenGL。
+    默认 60 太阳 × 1/3 相机 ≈ 1458 帧 → D:/CloudDatasetUniform。
+    完成后 transforms.json 在输出目录,走 tools/convert_transforms.py 转 OpenGL。
     """
+    disable_background_throttle()
     global ACTIVE_GENERATOR
     ACTIVE_GENERATOR = CloudDatasetGenerator(output_dir=output_directory)
     ACTIVE_GENERATOR.generate_uniform_dataset(n_suns=n_suns, camera_stride=camera_stride)
 
 
+# 直接执行本文件时跑哪种模式:"uniform"(现行)或 "tod"(历史)。
+MODE = "uniform"
+
 if __name__ == "__main__":
-    main()
+    main_uniform() if MODE == "uniform" else main_tod()
