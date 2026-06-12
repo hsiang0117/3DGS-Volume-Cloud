@@ -46,8 +46,7 @@ for f in test_json['frames']:
     time_by_key[(parts[0], parts[-1])] = f['time_index']
 
 pipe = Namespace(compute_cov3D_python=False, debug=False, antialiasing=False,
-                 k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
-                 tlight_beta_only_grad=False)
+                 k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res)
 bg = torch.zeros(3, device='cuda')
 
 groups = {'old_inplane': [], 'new_outplane': []}

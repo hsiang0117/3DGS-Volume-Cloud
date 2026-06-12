@@ -435,17 +435,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # DEFAULT: light-space rasterized shadow pass (v3, validated on the
         # uniform-sun dataset 2026-06-12). Fixes the voxel cache's
         # needle-shadow / chord-bias / self-leak / bbox-aliasing errors.
-        # Differentiable through the dedicated CUDA lightpass backward; the
-        # full gradient (β AND σ_d through scales/rotation) is on by default —
-        # with uniform sun coverage it is worth +0.3 dB, and the historical
-        # ±X needle exploit (directionally-biased datasets, p99 446) is held
-        # by needle surgery + uniform suns. tlight_beta_only_grad restores
-        # the v4 β-only ablation: σ_d detached, shadow VALUE still tracks
-        # geometry every iteration, β negative-feedback loop intact.
+        # Differentiable through the dedicated CUDA lightpass backward, full
+        # gradient: β AND σ_d through scales/rotation (+0.3 dB with uniform
+        # sun coverage; the historical ±X needle exploit on directionally
+        # biased datasets is held by needle surgery + uniform suns).
         geom_sun = (((2.0 * math.pi) ** 1.5)
                     * torch.prod(s, dim=1, keepdim=True) * line_int_sun)
-        if getattr(pipe, "tlight_beta_only_grad", False):
-            geom_sun = geom_sun.detach()
         tau_shadow = beta_peak * geom_sun
         T_light = compute_T_light_raster(
             means3D, tau_shadow, s, pc.get_rotation,

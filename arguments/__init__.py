@@ -93,11 +93,6 @@ class PipelineParams(ParamGroup):
         # CLI, hence a dedicated fallback flag instead of tlight_raster=True.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
-        # Disable the σ_d part of the shadow gradient (v4 β-only mode).
-        # Pre-uniform-dataset the geometric gradient minted ±X needles
-        # (p99 446); with uniform suns it is strictly better (+0.3 dB).
-        # Kept as an ablation/debug switch.
-        self.tlight_beta_only_grad = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
