@@ -47,6 +47,13 @@ class _ViewerPipe:
     # render() never reaches its own T_light branch here; tlight_voxel only
     # guards against accidental in-render computation.
     tlight_voxel: bool = True
+    # When True, render() shades in HDR linear and applies a tonemap curve to
+    # the final RGB image. tonemap_aces = fixed Narkowicz; tonemap_learnable =
+    # the per-model learned coeffs restored by load_ply (pc.apply_tonemap). Set
+    # from the run's cfg_args / the "Tonemap" checkbox; mutated per frame in the
+    # render loop. Neither affects diagnostic channels (override_color set).
+    tonemap_aces: bool = False
+    tonemap_learnable: bool = False
 
 
 def _quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -280,6 +287,12 @@ def main():
                         help="T_light source. 'auto' (default) reads the training run's cfg_args "
                              "next to the PLY and matches what the model was trained with; "
                              "'voxel' = 128^3 grid cache, 'raster' = light-space shadow pass.")
+    parser.add_argument("--tonemap", choices=["auto", "on", "off"], default="auto",
+                        help="Output tonemap. 'auto' (default) reads tonemap_aces / tonemap_learnable "
+                             "from the run's cfg_args and uses the curve the model was trained with "
+                             "(learnable coeffs from tonemap.json if present, else fixed Narkowicz "
+                             "ACES); 'on'/'off' force tonemap on/off. Tonemapped models look too "
+                             "bright / low-contrast without it.")
     args = parser.parse_args()
 
     # Resolve the T_light source. Models calibrate β/albedo against their
@@ -289,7 +302,16 @@ def main():
     # than the raster pass carry neither and are voxel-trained.
     use_raster_tlight = args.tlight == "raster"
     tlight_raster_res = 512
-    if args.tlight == "auto":
+    # Tonemap is resolved in two stages: the cfg flags say whether the model was
+    # trained with a curve and which kind; whether learnable coeffs actually
+    # exist is confirmed after load_ply (the tonemap.json sidecar). `forced` is
+    # set by --tonemap on/off; None means auto.
+    forced_tonemap = {"on": True, "off": False}.get(args.tonemap, None)
+    cfg_tonemap_aces = False
+    cfg_tonemap_learnable = False
+    # Read cfg_args once if EITHER setting wants to auto-detect from the run.
+    cfg = None
+    if args.tlight == "auto" or args.tonemap == "auto":
         # .../<run>/point_cloud/iteration_N/point_cloud.ply -> <run>/cfg_args
         run_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(args.ply))))
         cfg_path = os.path.join(run_dir, "cfg_args")
@@ -297,17 +319,26 @@ def main():
             try:
                 with open(cfg_path) as f:
                     cfg = f.read()
-                if "tlight_voxel" in cfg:
-                    use_raster_tlight = "tlight_voxel=True" not in cfg
-                else:
-                    use_raster_tlight = "tlight_raster=True" in cfg
-                m = re.search(r"tlight_raster_res=(\d+)", cfg)
-                if m:
-                    tlight_raster_res = int(m.group(1))
             except Exception as e:
-                print(f"[viewer] cfg_args unreadable ({e}); defaulting to voxel T_light.")
+                print(f"[viewer] cfg_args unreadable ({e}); using defaults.")
         else:
-            print("[viewer] No cfg_args found next to PLY; defaulting to voxel T_light.")
+            print("[viewer] No cfg_args found next to PLY; using defaults.")
+    if args.tlight == "auto":
+        if cfg is not None:
+            if "tlight_voxel" in cfg:
+                use_raster_tlight = "tlight_voxel=True" not in cfg
+            else:
+                use_raster_tlight = "tlight_raster=True" in cfg
+            m = re.search(r"tlight_raster_res=(\d+)", cfg)
+            if m:
+                tlight_raster_res = int(m.group(1))
+        else:
+            use_raster_tlight = False  # no cfg → legacy voxel default
+    if cfg is not None:
+        # These flags only appear in cfg_args from the tonemap-match branch on;
+        # absence means a linear-space model.
+        cfg_tonemap_aces = "tonemap_aces=True" in cfg
+        cfg_tonemap_learnable = "tonemap_learnable=True" in cfg
     print(f"[viewer] T_light source: {'raster' if use_raster_tlight else 'voxel'}"
           f"{f' ({tlight_raster_res}^2)' if use_raster_tlight else ''}")
 
@@ -317,6 +348,26 @@ def main():
     gaussians.load_ply(args.ply)
     P = gaussians.get_xyz.shape[0]
     print(f"[viewer] Loaded {P} Gaussians.")
+
+    # Resolve the final tonemap state now that load_ply has (or hasn't) restored
+    # the learnable coeffs. A learnable model is only usable if its tonemap.json
+    # was found; otherwise fall back to the fixed-ACES flag.
+    has_learnable = gaussians.get_tonemap_coeffs is not None
+    tonemap_learnable = cfg_tonemap_learnable and has_learnable
+    # "tonemap on" = forced on, or (auto and the model was trained with a curve).
+    if forced_tonemap is None:
+        tonemap_on = tonemap_learnable or cfg_tonemap_aces
+    else:
+        tonemap_on = forced_tonemap
+    # When on, prefer the learnable curve if the model carries one; else ACES.
+    tonemap_aces = tonemap_on and not (tonemap_learnable)
+    if tonemap_on and tonemap_learnable:
+        print(f"[viewer] Output tonemap: learnable "
+              f"(coeffs={[round(c, 4) for c in gaussians.get_tonemap_coeffs.tolist()]})")
+    elif tonemap_on:
+        print(f"[viewer] Output tonemap: ACES (fixed Narkowicz)")
+    else:
+        print(f"[viewer] Output tonemap: linear (clamp)")
 
     # --- Precompute T_light for the initial sun direction --------------------
     initial_sun = _spherical_to_dir(altitude_deg=90.0, azimuth_deg=0.0)  # straight up
@@ -389,6 +440,8 @@ def main():
         train_cam_names = []
 
     pipe = _ViewerPipe()
+    pipe.tonemap_aces = tonemap_aces
+    pipe.tonemap_learnable = tonemap_learnable
     bg_color = torch.tensor(
         [1.0, 1.0, 1.0] if args.bg == "white" else [0.0, 0.0, 0.0],
         dtype=torch.float32, device="cuda",
@@ -524,6 +577,16 @@ def main():
         initial_value=(255, 255, 255) if args.bg == "white" else (0, 0, 0),
         hint="Rasterizer background colour. Handy for inspecting cloud edges / "
              "discrete Gaussian ellipsoids against different backdrops.",
+    )
+    _tm_label = "Tonemap (learned)" if tonemap_learnable else "Tonemap (ACES)"
+    gui_tonemap = server.gui.add_checkbox(
+        _tm_label,
+        initial_value=tonemap_on,
+        hint="Apply the model's output tonemap to the RGB output (HDR linear shading "
+             "→ tonemapped display space). Uses the learned per-model curve if the run "
+             "has one (tonemap.json), else the fixed Narkowicz ACES curve. Auto-set from "
+             "the run's cfg_args. Toggle to A/B the model's native space; tonemapped "
+             "models look too bright / washed-out with this off.",
     )
     gui_reset = server.gui.add_button(
         "Reset camera",
@@ -677,6 +740,7 @@ def main():
     gui_ksigma.on_update(_mark_dirty)
     gui_res.on_update(_mark_dirty)
     gui_bgcolor.on_update(_mark_dirty)
+    gui_tonemap.on_update(_mark_dirty)
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
@@ -826,6 +890,11 @@ def main():
             mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far, sun_dir=current_sun)
             scaling_mod = float(gui_scaling.value)
             pipe.k_sigma = float(gui_ksigma.value)
+            # The single checkbox = "tonemap on/off". Route it to the learnable
+            # curve if the model carries one, else the fixed ACES curve.
+            _tm_on = bool(gui_tonemap.value)
+            pipe.tonemap_learnable = _tm_on and tonemap_learnable
+            pipe.tonemap_aces = _tm_on and not tonemap_learnable
             mode = gui_mode.value
 
             # Update background colour in place (RGB 0-255 -> 0-1) so we don't

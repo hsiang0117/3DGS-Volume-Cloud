@@ -53,6 +53,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
     gaussians = GaussianModel(opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    # Learnable output tonemap: a handful of global coeffs in their OWN optimizer
+    # (isolated from densify/prune). The flag lives on the pipeline params.
+    if getattr(pipe, "tonemap_learnable", False):
+        gaussians.setup_tonemap(opt)
+        print(f"[train] learnable tonemap enabled (lr={opt.tonemap_lr}, "
+              f"init coeffs={gaussians.get_tonemap_coeffs.tolist()})")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -71,6 +77,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        gaussians.update_tonemap_learning_rate(iteration)  # no-op unless learnable tonemap
 
         # Pick a random Camera (image already prefetched by background worker)
         viewpoint_cam = prefetcher.next()
@@ -116,6 +123,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             log_threshold = math.log(opt.aniso_ratio_max)
             L_aniso = (log_ratio - log_threshold).clamp(min=0).pow(2).mean()
             loss += opt.lambda_aniso * L_aniso
+
+        # Tonemap monotonicity regulariser (only with --tonemap_learnable).
+        # softplus already guarantees positivity / no poles, but does not by
+        # itself forbid a non-monotone S-curve; this hinges on any negative
+        # slope of f on [0,8] so highlights can never invert. Cheap insurance,
+        # same hinge-squared form as L_aniso.
+        if gaussians.tonemap_optimizer is not None and opt.lambda_tonemap_mono > 0:
+            xs = torch.linspace(0.0, 8.0, 32, device="cuda")
+            fs = gaussians.apply_tonemap(xs)
+            dneg = (fs[:-1] - fs[1:]).clamp(min=0)   # >0 where f decreases
+            L_mono = dneg.pow(2).mean()
+            loss += opt.lambda_tonemap_mono * L_mono
 
         loss.backward()
 
@@ -167,6 +186,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     f"aniso mean/std/p99: {m_an:.2f}/{s_an:.2f}/{p99_an:.2f} | "
                     f"sun_dir: [{sun_dir[0].item():.3f}, {sun_dir[1].item():.3f}, {sun_dir[2].item():.3f}]"
                 )
+                if gaussians.tonemap_optimizer is not None:
+                    tm = gaussians.get_tonemap_coeffs.detach().tolist()
+                    can = list(GaussianModel.TONEMAP_CANONICAL)
+                    print(f" tonemap coeffs (a,b,c,d): "
+                          f"[{tm[0]:.4f}, {tm[1]:.4f}, {tm[2]:.4f}, {tm[3]:.4f}] "
+                          f"(canonical [{can[0]:.2f}, {can[1]:.2f}, {can[2]:.2f}, {can[3]:.2f}])")
                 # Diagnostic: T_light and Lk statistics to detect collapse
                 if diag_T_light is not None:
                     m_tl, s_tl = _ms(diag_T_light)
@@ -288,6 +313,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                # Step the standalone tonemap optimizer (gradients flowed in via
+                # the shared loss.backward()). No-op unless --tonemap_learnable.
+                if gaussians.tonemap_optimizer is not None:
+                    gaussians.tonemap_optimizer.step()
+                    gaussians.tonemap_optimizer.zero_grad(set_to_none = True)
 
             # After finishing training, compute metrics on test set and write run note.
             if iteration == opt.iterations:

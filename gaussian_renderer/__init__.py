@@ -459,12 +459,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rho = pc.get_albedo  # (P,3)
 
     Lk = rho * L_sun[None, :] * scatter_sum
-    tonemap = bool(getattr(pipe, "tonemap_aces", False))
+    # Output tonemap gateway. Two mutually-compatible sources of the curve:
+    #   tonemap_learnable -> pc.apply_tonemap (4 learned coeffs, e pinned)
+    #   tonemap_aces      -> fixed Narkowicz constants
+    # Either one means "shade in HDR linear, soft-clip at the image level", so
+    # the per-Gaussian clamp is lifted to 16 (HDR) for both.
+    tonemap_learn = bool(getattr(pipe, "tonemap_learnable", False)) and pc.get_tonemap_coeffs is not None
+    tonemap_on = tonemap_learn or bool(getattr(pipe, "tonemap_aces", False))
     if override_color is not None:
         colors_precomp = override_color
-    elif tonemap:
-        # HDR mode: keep per-Gaussian radiance unclamped (ACES soft-clips at
-        # the image level instead). A loose ceiling guards against fp blowups
+    elif tonemap_on:
+        # HDR mode: keep per-Gaussian radiance unclamped (the tonemap soft-clips
+        # at the image level instead). A loose ceiling guards against fp blowups
         # without flattening highlights the way clamp-to-1 does.
         colors_precomp = torch.clamp(Lk, 0.0, 16.0)
     else:
@@ -486,12 +492,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    if tonemap and override_color is None:
-        # ACES filmic approximation (Narkowicz 2015): maps linear HDR radiance
-        # into the tonemapped space the UE screenshots live in, so the loss
-        # compares like with like. Differentiable; x>=0 keeps it monotonic.
-        x = rendered_image.clamp(min=0.0)
-        rendered_image = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+    if tonemap_on and override_color is None:
+        # Map linear HDR radiance into the tonemapped space the GT screenshots
+        # live in, so the loss compares like with like. Both branches use the
+        # Narkowicz rational form; the learnable branch carries gradient into the
+        # tonemap coeffs (its own optimizer), the fixed branch uses constants.
+        if tonemap_learn:
+            rendered_image = pc.apply_tonemap(rendered_image)
+        else:
+            # ACES filmic approximation (Narkowicz 2015). Differentiable; x>=0
+            # keeps it monotonic.
+            x = rendered_image.clamp(min=0.0)
+            rendered_image = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
     rendered_image = rendered_image.clamp(0, 1)
     out = {
         "render": rendered_image,
