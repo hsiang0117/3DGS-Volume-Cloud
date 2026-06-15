@@ -30,6 +30,17 @@ except:
 
 class GaussianModel:
 
+    # Learnable output tonemap (Narkowicz ACES rational form), shared across RGB:
+    #     f(x) = (a x^2 + b x) / (c x^2 + d x + e)
+    # We learn (a,b,c,d) via softplus(raw): positivity gives no poles for x>=0
+    # and output >= 0, so the curve stays smooth and bounded. `e` is PINNED to
+    # remove the rational form's overall-scale degeneracy (multiplying numerator
+    # and denominator by k leaves f unchanged), leaving 4 well-posed DoF.
+    # Canonical init reproduces the fixed Narkowicz curve at iteration 0, so
+    # --tonemap_learnable is a clean A/B against the fixed --tonemap_aces.
+    TONEMAP_CANONICAL = (2.51, 0.03, 2.43, 0.59)   # (a, b, c, d)
+    TONEMAP_E = 0.14                                # pinned denominator constant
+
     @staticmethod
     def _softplus_inverse(y, eps=1e-8):
         y = torch.clamp(y, min=eps)
@@ -75,6 +86,9 @@ class GaussianModel:
         self._albedo = torch.empty(0)       # (P,3) raw -> sigmoid
         self._g_factor = torch.empty(0)     # (P,1) raw -> tanh
         self._octave_weights = torch.empty(0)  # (P,6) raw -> softplus, MS octave energy
+        # Global (per-scene, NOT per-Gaussian) learnable output-tonemap coeffs:
+        # (4,) raw -> softplus -> (a,b,c,d). Lives in its own optimizer.
+        self._tonemap = torch.empty(0)
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -83,6 +97,7 @@ class GaussianModel:
         self.scale_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.tonemap_optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -115,6 +130,28 @@ class GaussianModel:
     def get_octave_weights(self):
         # (P,6) non-negative per-Gaussian multiple-scattering octave weights.
         return self.octave_weight_activation(self._octave_weights)
+
+    @property
+    def get_tonemap_coeffs(self):
+        """(a, b, c, d) positive tonemap coefficients (softplus of raw). `e` is
+        the pinned constant TONEMAP_E. Empty tensor if no tonemap param exists
+        (e.g. a model trained without --tonemap_learnable)."""
+        if self._tonemap.numel() == 0:
+            return None
+        return torch.nn.functional.softplus(self._tonemap)
+
+    def apply_tonemap(self, img):
+        """Apply the learnable Narkowicz-form rational curve to an image/tensor,
+        elementwise and shared across channels. Differentiable in both `img` and
+        the tonemap coeffs. x is clamped >=0 so the curve stays monotone-domain.
+        Returns img unchanged if no tonemap param is present."""
+        coeffs = self.get_tonemap_coeffs
+        if coeffs is None:
+            return img
+        a, b, c, d = coeffs[0], coeffs[1], coeffs[2], coeffs[3]
+        e = self.TONEMAP_E
+        x = img.clamp(min=0.0)
+        return (x * (a * x + b)) / (x * (c * x + d) + e)
 
     @property
     def get_opacity(self):
@@ -242,6 +279,40 @@ class GaussianModel:
             lr_final=_ow_lr * decay_ratio,
             max_steps=iters)
 
+    def setup_tonemap(self, training_args):
+        """Enable the learnable output tonemap (called only when
+        --tonemap_learnable). The 4 global coeffs live in their OWN Adam,
+        isolated from the main optimizer's densify/prune machinery
+        (_prune_optimizer indexes every group with a per-Gaussian mask, which
+        would crash on a global param). Gradients still flow from loss.backward()
+        since _tonemap is a leaf in the render graph."""
+        # Create the parameter at canonical init unless a checkpoint already
+        # populated it (resume / load_ply).
+        if self._tonemap.numel() == 0:
+            raw = self._softplus_inverse(
+                torch.tensor(self.TONEMAP_CANONICAL, dtype=torch.float, device="cuda"))
+            self._tonemap = nn.Parameter(raw.requires_grad_(True))
+        else:
+            self._tonemap = nn.Parameter(self._tonemap.detach().cuda().requires_grad_(True))
+
+        tm_lr = getattr(training_args, "tonemap_lr", 1e-3)
+        self.tonemap_optimizer = torch.optim.Adam(
+            [{'params': [self._tonemap], 'lr': tm_lr, "name": "tonemap"}],
+            lr=0.0, eps=1e-15)
+        self.tonemap_scheduler_args = get_expon_lr_func(
+            lr_init=tm_lr,
+            lr_final=tm_lr * 0.1,
+            max_steps=training_args.iterations)
+
+    def update_tonemap_learning_rate(self, iteration):
+        """Step the standalone tonemap optimizer's LR schedule (no-op if the
+        learnable tonemap is disabled)."""
+        if self.tonemap_optimizer is None:
+            return
+        lr = self.tonemap_scheduler_args(iteration)
+        for param_group in self.tonemap_optimizer.param_groups:
+            param_group['lr'] = lr
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         _sched_map = {
@@ -291,6 +362,23 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
+        # The global learnable tonemap coeffs are not per-vertex, so they can't
+        # ride the PLY. Mirror the metrics.json sidecar convention: write a small
+        # tonemap.json next to the PLY (only when the param exists). The viewer
+        # and load_ply read it back to reproduce the exact output curve.
+        if self._tonemap.numel() > 0:
+            raw = self._tonemap.detach().cpu().numpy().tolist()
+            coeffs = torch.nn.functional.softplus(self._tonemap).detach().cpu().numpy().tolist()
+            sidecar = {
+                "version": 1,
+                "form": "narkowicz_pinned_e",   # f=(a x^2+b x)/(c x^2+d x+e)
+                "e": self.TONEMAP_E,
+                "raw": raw,                      # pre-softplus, the actual params
+                "coeffs": coeffs,                # (a,b,c,d) = softplus(raw)
+            }
+            with open(os.path.join(os.path.dirname(path), "tonemap.json"), "w") as f:
+                json.dump(sidecar, f, indent=2)
+
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
@@ -337,6 +425,25 @@ class GaussianModel:
         self._octave_weights = nn.Parameter(torch.tensor(octave_weights, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        # Restore the learnable tonemap coeffs from the sidecar if present.
+        # Absent → linear-space / fixed-ACES model: leave _tonemap empty so
+        # get_tonemap_coeffs returns None and apply_tonemap is a no-op.
+        tm_path = os.path.join(os.path.dirname(path), "tonemap.json")
+        if os.path.exists(tm_path):
+            try:
+                with open(tm_path) as f:
+                    sidecar = json.load(f)
+                raw = torch.tensor(sidecar["raw"], dtype=torch.float, device="cuda")
+                self._tonemap = nn.Parameter(raw.requires_grad_(True))
+                print(f"[gaussian_model] loaded learnable tonemap coeffs "
+                      f"{sidecar.get('coeffs')} from {tm_path}")
+            except Exception as ex:
+                print(f"[gaussian_model] failed to read {tm_path}: {ex}; "
+                      f"tonemap disabled.")
+                self._tonemap = torch.empty(0)
+        else:
+            self._tonemap = torch.empty(0)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

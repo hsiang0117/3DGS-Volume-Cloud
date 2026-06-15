@@ -93,14 +93,35 @@ class PipelineParams(ParamGroup):
         # CLI, hence a dedicated fallback flag instead of tlight_raster=True.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
-        # Render-space matching experiment: UE's HighResScreenshot GT is
-        # filmic-tonemapped LDR, while our physical shading lives in linear
+        # Output tonemap to match the GT's display space. UE's HighResScreenshot
+        # GT is filmic-tonemapped LDR, while our physical shading lives in linear
         # space — fitting a nonlinear target with a linear model shows up as
-        # dynamic-range compression (dark resid +0.05 / bright -0.04).
-        # When on, render() lifts the per-Gaussian radiance clamp (HDR) and
-        # applies the ACES approximation to the final image, so the loss and
+        # dynamic-range compression (dark resid +0.05 / bright -0.04). When on,
+        # render() lifts the per-Gaussian radiance clamp (HDR) and applies the
+        # fixed Narkowicz ACES approximation to the final image, so the loss and
         # all metrics compare in the GT's own space.
-        self.tonemap_aces = False
+        #
+        # DEFAULT True: validated on the uniform-sun dataset (output/aces_match,
+        # 33.27 PSNR vs 30.80 linear, compression residual -67%). This is the
+        # current baseline output space. store_true means it can't be turned off
+        # from the CLI — flip here if a truly-linear GT dataset is ever used
+        # (then tonemap must be OFF; see tonemap_learnable note).
+        self.tonemap_aces = True
+        # Learnable output tonemap (opt-in alternative to fixed ACES): same
+        # Narkowicz rational form but its 4 coeffs (a,b,c,d) are optimised
+        # (e pinned), so the model fits the GT's true display curve instead of a
+        # fixed approximation. Narkowicz is only a cheap fit of UE's filmic
+        # tonemapper, so learning it absorbs any residual curve-mismatch and
+        # works for any filmic GT display space (not just UE). Implies the HDR
+        # clamp like tonemap_aces; takes precedence over it when on.
+        #
+        # Kept default OFF: validated as a clean NEGATIVE result on UE data
+        # (output/tonemap_learn, 33.13, -0.14 dB vs fixed ACES) — Narkowicz is
+        # already a good enough fit for UE filmic, so the extra DoF doesn't pay.
+        # Retained as insurance for a DIFFERENT filmic engine whose curve drifts
+        # from Narkowicz. (For a truly-linear HDR GT, the answer is tonemap OFF,
+        # NOT learnable — the Narkowicz family cannot represent identity.)
+        self.tonemap_learnable = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -116,6 +137,15 @@ class OptimizationParams(ParamGroup):
         # LR for per-Gaussian multiple-scattering octave weights (softplus, >=0).
         # Same order as g_factor; tune down if the weights overfit per-view.
         self.octave_weights_lr = 0.0025
+        # LR for the 4 global learnable tonemap coeffs (only used with
+        # --tonemap_learnable). Higher than the per-Gaussian LRs because it's a
+        # handful of scalars seen by every pixel of every frame; decays to 0.1x.
+        self.tonemap_lr = 1e-3
+        # Monotonicity penalty on the learnable tonemap (only with
+        # --tonemap_learnable). softplus already guarantees positivity / no
+        # poles; this is a cheap insurance that f stays non-decreasing on [0,8]
+        # so highlights never invert. Hinge on negative slope, like lambda_aniso.
+        self.lambda_tonemap_mono = 1e-2
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01

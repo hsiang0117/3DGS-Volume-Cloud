@@ -25,6 +25,13 @@
 
 逐高斯计算 `L = ρ · L_sun · Σₙ wₙ · T_light^(bⁿ) · HG(g·cⁿ, cosθ)`:HG 相函数(ω_in = −sun_dir 约定)+ 六阶多次散射八度 + 自阴影透射率 T_light。太阳方向逐帧来自数据集,推理时可任意替换 → relighting。
 
+### 输出 tonemap(默认匹配 GT 显示空间)
+
+UE 的 HighResScreenshot GT 是 **filmic-tonemapped LDR**,而物理着色在**线性空间**。用线性模型拟合非线性目标会表现为动态范围压缩。默认开启 **固定 Narkowicz ACES** 曲线:着色端放宽 per-高斯辐亮度 clamp 到 HDR、图像端套 ACES,使 loss 与全部指标都在 GT 自己的空间比较(均匀数据集实测 30.80→**33.27**,压缩残差 −67%)。
+
+- `--tonemap_learnable`(可选,默认关):把 ACES 的 4 个系数(a,b,c,d)变可学习(e 钉死),自适应 GT 的真实显示曲线。实测在 UE 数据上 ≈ 固定 ACES(−0.14 dB,否定结果),保留为**换其他 filmic 引擎**的保险;系数存进 PLY 同目录 `tonemap.json`,viewer/eval 自动读取。
+- **若 GT 是真·线性 HDR**(无 tonemap):应**关闭** tonemap(源码翻 `tonemap_aces=False`),而非用 learnable——Narkowicz 族无法表示 identity。物理模型本身线性、与渲染器无关;部署回 UE 实时渲染时输出**线性辐亮度**让 UE 自己 tonemap,**勿重复套 ACES**。
+
 ### 光源视角自阴影(T_light,默认路径)
 
 T_light = 每个高斯沿太阳方向的"前方遮挡透射率"。默认实现为**光照空间光栅化 pass**:
@@ -74,11 +81,14 @@ py "D:/3DGS-Volume-Cloud/tools/cloud_dataset_generator.py"
 ### 训练
 
 ```shell
-# 默认:raster T_light + 完整几何梯度 + 针手术
+# 默认:raster T_light + 完整几何梯度 + 针手术 + 固定 ACES tonemap
 python train.py -s data/CloudDatasetUniform
 
 # 旧体素 T_light 路径
 python train.py -s data/CloudDataset --tlight_voxel
+
+# 可学习 tonemap(默认关,换 filmic 引擎时的保险)
+python train.py -s data/CloudDatasetUniform --tonemap_learnable
 ```
 
 eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSNR/SSIM/LPIPS 并写 `metrics.json`。PipelineParams 持久化进 cfg_args,供 viewer 自动匹配 T_light 源。
@@ -103,6 +113,8 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 |---|---|---|
 | `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化 + 完整几何梯度);与 raster 之前训练的模型配套 |
 | `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
+| `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间(+2.5 dB)。store_true 无法从命令行关闭,真·线性 GT 数据需改源码 |
+| `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`)。UE 数据上为否定结果(−0.14 dB),保留作换 filmic 引擎的保险;开启时优先于固定 ACES |
 | `--k_sigma` | 0.0 | per-tile max-response 深度排序偏移(σ 单位);0 = stock 中心深度排序。曾用于治 popping,因块状伪影弃用,CUDA 路径保留 |
 | `--compute_cov3D_python` | False | 在 Python 端算 3D 协方差(调试用) |
 | `--antialiasing` | False | 抗锯齿卷积。**勿在光照 pass 相关实验中开启**(会缩放 τ) |
@@ -135,6 +147,8 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--lambda_aniso` | 0.001 | 软各向异性正则(log-ratio 二次,超过 aniso_ratio_max 才罚)。调大伤 PSNR(0.05 → PSNR 崩到 ~25);硬约束交给针手术 |
 | `--aniso_ratio_max` | 5.0 | 软正则的免罚阈值 |
 | `--aniso_until_iter` | 30000 | 软正则作用区间。**必须全程**——aniso 不自收敛,提前关闭后 p99 单调上涨 |
+| `--tonemap_lr` | 1e-3 | 可学习 tonemap 4 系数的学习率(仅 `--tonemap_learnable` 时生效;独立 Adam,衰到 0.1×) |
+| `--lambda_tonemap_mono` | 1e-2 | 可学习 tonemap 单调性惩罚(仅 `--tonemap_learnable` 时;hinge 平方,保证曲线在 [0,8] 不反转,高光不倒挂) |
 
 #### 致密化(densify)
 
@@ -203,13 +217,17 @@ tools/check_lightpass_grad.py      # lightpass backward 有限差分验证
 tools/analyze_octave_weights.py    # 多次散射八度权重分析
 tools/plot_phase_function.py       # 有效相函数重建
 tools/project_pointcloud.py        # 初始点云-图像对齐快检
+tools/residual_buckets.py          # 有符号残差分桶(GT 亮度 × 深度覆盖)+ held-out 太阳 PSNR
+tools/penumbra_residual.py         # 残差按逐像素 T_light(阴影深度)分桶 × GT 亮度 cross-tab
+tools/ms_contribution.py           # 多次散射贡献分解(full − 单次散射,按 T_light 分桶)
 tools/notify_lark.py               # 飞书通知(长训练挂机用)
 ```
 
 ## 当前状态与已知限制
 
-- 均匀数据集上:test PSNR ~30.8,**held-out 太阳与已见太阳零泛化差距**(物理参数化对新光照方向外推有效);aniso p99 ~22,popping 受控。
-- **缺环境光是当前主要模型偏差**:模型只有太阳单光源,实测呈系统性对比度压缩(暗部偏亮 +0.05 / 亮部偏暗 −0.05 的有符号残差)。环境光(已知天空 cubemap → 各向同性 ambient → SH)是下一步主线,预期同时缓解 aniso 压力源。
+- 均匀数据集上:test PSNR **~33.3**(固定 ACES tonemap,默认),**held-out 太阳与已见太阳零泛化差距**(物理参数化对新光照方向外推有效);aniso p99 ~22,popping 受控。
+- **数据集是刻意 env-off 的控制变量设计**:UE 场景只有云 + 单方向太阳,背景纯黑,无天空/大气环境光。注意 env-off 控制掉的是**环境光**,但 UE 体积管线仍计算**云内多次散射**——模型的六阶 octave 正确学到了它(自阴影深核 ~78% 亮度来自多次散射,与 GT 匹配)。
+- **残差诊断(tools/residual_buckets.py / penumbra_residual.py / ms_contribution.py)**:深核阴影已标定准(残差 ~0),唯一可见残差是**近受光半影偏亮 +0.013**(仅 ~11% 像素,PSNR 上限 ~0.15 dB),且主要来自单次散射项 / HG 前向散射,octave 杠杆对其结构性无效——优先级低,暂不追。
 - viewer 非黑背景下云边缘黑边:黑训练背景导致边缘透射率无监督的已知副作用,暂不修。
 
 ## 环境
