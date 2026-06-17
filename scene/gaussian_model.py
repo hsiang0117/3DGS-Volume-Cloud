@@ -32,12 +32,11 @@ class GaussianModel:
 
     # Learnable output tonemap (Narkowicz ACES rational form), shared across RGB:
     #     f(x) = (a x^2 + b x) / (c x^2 + d x + e)
-    # We learn (a,b,c,d) via softplus(raw): positivity gives no poles for x>=0
-    # and output >= 0, so the curve stays smooth and bounded. `e` is PINNED to
-    # remove the rational form's overall-scale degeneracy (multiplying numerator
-    # and denominator by k leaves f unchanged), leaving 4 well-posed DoF.
-    # Canonical init reproduces the fixed Narkowicz curve at iteration 0, so
-    # --tonemap_learnable is a clean A/B against the fixed --tonemap_aces.
+    # (a,b,c,d) learned via softplus(raw): positivity gives no poles for x>=0 and
+    # output >= 0, so the curve stays smooth and bounded. `e` is pinned to remove
+    # the rational form's overall-scale degeneracy (scaling numerator and
+    # denominator by k leaves f unchanged), leaving 4 well-posed DoF. Canonical
+    # init reproduces the fixed Narkowicz curve at iteration 0.
     TONEMAP_CANONICAL = (2.51, 0.03, 2.43, 0.59)   # (a, b, c, d)
     TONEMAP_E = 0.14                                # pinned denominator constant
 
@@ -66,13 +65,10 @@ class GaussianModel:
         self.albedo_activation = torch.sigmoid
         self.g_factor_activation = lambda x: 0.8 * torch.tanh(x)
         # Per-Gaussian multiple-scattering octave weights: softplus keeps them
-        # non-negative (scattered energy cannot be negative). Replaces the fixed
-        # a^n = 0.5^n energy schedule of the 6-octave HG approximation with a
-        # learnable per-Gaussian reweighting. Crucially a SCALAR-per-octave
-        # weight only rescales physical basis functions (HG·T·ρ), so chroma
+        # non-negative (scattered energy cannot be negative). A scalar-per-octave
+        # weight only rescales the physical basis functions (HG·T·ρ), so chroma
         # stays locked in the albedo ρ and lighting still flows through every
-        # term — it cannot bypass the physical model the way an additive RGB
-        # residual MLP did.
+        # term — it cannot bypass the physical model.
         self.octave_weight_activation = torch.nn.functional.softplus
 
 
@@ -195,8 +191,7 @@ class GaussianModel:
         albedo_raw = inverse_sigmoid(torch.full((P, 3), 0.8, dtype=torch.float, device="cuda"))
         g_factor_raw = torch.atanh(torch.full((P, 1), 0.7, dtype=torch.float, device="cuda"))
         # Octave weights initialised so softplus(raw) == 0.5^n for n=0..5, i.e.
-        # iteration 0 reproduces the fixed 6-octave a^n=0.5^n schedule exactly.
-        # This makes the learnable-weight run a clean A/B against the baseline.
+        # iteration 0 reproduces the fixed 6-octave a^n=0.5^n schedule.
         octave_target = torch.tensor([0.5 ** n for n in range(6)], dtype=torch.float, device="cuda")
         octave_weights_raw = self._softplus_inverse(octave_target).unsqueeze(0).repeat(P, 1)  # (P,6)
 
@@ -589,8 +584,8 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         # Append zero stats for new children; preserve existing points' stats so
         # the prune predicate (visible_enough = denom ≥ 5) keeps working inside
-        # the densify phase. Resetting wholesale here was the reason aniso /
-        # contribution prune never fired before iter 15000.
+        # the densify phase. Wholesale reset here stalls aniso / contribution
+        # prune.
         n_new_children = N * int(selected_pts_mask.sum().item())
         n_kept = self.get_xyz.shape[0] - n_new_children
         self.contribution_accum = torch.cat([
@@ -613,16 +608,14 @@ class GaussianModel:
     def split_needles(self, ratio_threshold, opt=None):
         """Surgical split of high-anisotropy Gaussians (ratio > threshold).
 
-        Forensics on trained clouds show the aniso tail is ~95% DISKS (two
-        long axes, one thin axis), not needles, so splitting along the major
-        axis alone halves only one long axis and can even raise the measured
-        max/min ratio — the fix must FATTEN THE THIN AXIS instead: children
+        The aniso tail is ~95% disks (two long axes, one thin axis), so this
+        fattens the thin axis rather than splitting the major axis: children
         keep the parent's orientation and long axes, the min axis is doubled,
-        and β_peak is halved to conserve total extinction mass (β·∏s). The
-        two children are offset by ±σ_major/2 along the major axis so the
-        pair approximately covers the parent's footprint. Each pass halves
-        the ratio of every offender; repeated application converges to the
-        threshold in log2(max/threshold) passes.
+        and β_peak is reduced to conserve total extinction mass (β·∏s). The two
+        children are offset by ±σ_major/2 along the major axis so the pair
+        approximately covers the parent's footprint. Each pass halves the ratio
+        of every offender; converges to the threshold in log2(max/threshold)
+        passes.
 
         Returns the number of Gaussians split.
         """
@@ -650,11 +643,9 @@ class GaussianModel:
         new_xyz = torch.cat([parent_xyz + offset, parent_xyz - offset], dim=0)
 
         # Fatten the thin axis (x2) — ratio halves. Mass bookkeeping per child:
-        # volume x2 (fattened axis), and TWO children replace one parent, so
-        # β must drop x4 for exact total-mass conservation (β·∏s · 2 children
-        # · 2 volume = 4x at unchanged β). Empirically the children's
-        # footprints overlap near the parent centre, so exact /4 slightly
-        # over-darkens; /3.2 measured mass-neutral on the trained cloud.
+        # volume x2 (fattened axis), and TWO children replace one parent, so β
+        # would drop x4 for exact total-mass conservation. Child footprints
+        # overlap near the parent centre, so /3.2 is mass-neutral in practice.
         child_scaling = sel_scaling.clone()
         child_scaling.scatter_(1, minor_idx.unsqueeze(1), sigma_minor * 2.0)
         new_scaling = self.scaling_inverse_activation(child_scaling.repeat(2, 1))
@@ -810,8 +801,7 @@ class GaussianModel:
     def physical_densify_and_prune(self, opt, iteration, radii, scene_extent):
         """Cloud-parameterisation-aware densify / prune.
 
-        Density growth: keep stock xyz/scale-grad-driven clone+split (well
-        understood, stable; not the real bottleneck).
+        Density growth: keep stock xyz/scale-grad-driven clone+split.
 
         Pruning: replace the opacity-threshold prune with image-contribution
         prune. A Gaussian is removed iff:
@@ -890,9 +880,8 @@ class GaussianModel:
             indefinitely (visible-frame-count = 0 makes the contribution
             channel above silently bypass them).
 
-        (A former aniso prune channel was removed: on aligned data the
-        full-schedule aniso *regulariser* drives p99 to a ~30 plateau, far
-        below any sane prune ratio, so the geometric prune never fired.)
+        There is no aniso prune channel: the full-schedule aniso regulariser
+        holds p99 at a ~30 plateau, far below any sane prune ratio.
         """
         if self.get_xyz.shape[0] == 0:
             return 0
@@ -929,10 +918,9 @@ class GaussianModel:
         if iteration <= 0 or iteration >= getattr(opt, "densify_until_iter", float("inf")):
             return
         # Order matters: resurrect → prune → reset. The prune predicate uses
-        # `contribution_denom >= prune_min_visible_frames` as a gate, so if we
-        # zeroed the accumulator first the gate would mask every point and
-        # nothing would ever be reclaimed (silent failure observed as
-        # n_points frozen + aniso p99 unbounded after densify_until_iter).
+        # `contribution_denom >= prune_min_visible_frames` as a gate, so zeroing
+        # the accumulator first would mask every point and nothing would ever be
+        # reclaimed (n_points freezes + aniso p99 grows unbounded).
         # 1. Resurrect schedule (independent of densify_until_iter)
         if (
             opt.resurrect_interval > 0
@@ -943,8 +931,8 @@ class GaussianModel:
         # 2. Contribution prune post-densify. Without this, low-contribution
         # and dead points accumulating in the second half of training never
         # get reclaimed (densify_until_iter has stopped the regular prune
-        # path). (Popping is now handled entirely by the full-schedule aniso
-        # regulariser, not by a geometric prune.)
+        # path). Popping is handled by the full-schedule aniso regulariser,
+        # not by a geometric prune.
         prune_iv = getattr(opt, "post_densify_prune_interval", 0)
         if prune_iv > 0 and iteration % prune_iv == 0:
             self._prune_by_contribution(opt)

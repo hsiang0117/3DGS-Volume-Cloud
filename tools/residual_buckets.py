@@ -1,17 +1,16 @@
 """
 Signed-residual-by-luminance diagnostic + held-out-sun PSNR for a trained run.
 
-Renders the full test split through the SAME render() path training/eval use
-(auto-detecting T_light source and tonemap mode from cfg_args), then reports:
+Renders the full test split through the same render() path training/eval use
+(T_light source and tonemap mode auto-detected from cfg_args), then reports:
 
-  * per-bucket signed residual  mean(pred - gt)  over CLOUD pixels
-    (GT luminance > eps; pure-black background excluded) split into
-    dark / mid / bright luminance buckets -> the "contrast-compression"
-    signature. A flat ~0 across buckets means the output space matches the GT.
-  * the compression metric (|dark| + |bright|) / 2 used to compare experiments.
-  * held-out-sun vs seen-sun PSNR (relighting generalisation gap). For the
-    uniform dataset the held-out whole suns are time_index in {7,22,37,52}.
-  * the learned tonemap coeffs, if any (tonemap.json sidecar).
+  * per-bucket signed residual mean(pred - gt) over cloud pixels (GT luminance
+    > eps; pure-black background excluded), split into luminance buckets. Flat
+    ~0 across buckets means the output space matches the GT.
+  * compression metric (|deep| + |bright|) / 2.
+  * held-out-sun vs seen-sun PSNR (relighting generalisation gap); held-out
+    whole suns are time_index in {7,22,37,52}.
+  * learned tonemap coeffs, if any.
 
 Usage:
     python tools/residual_buckets.py output/<run> [iteration]
@@ -30,7 +29,7 @@ run = sys.argv[1]
 iteration = int(sys.argv[2]) if len(sys.argv) > 2 else 30000
 ply = f'{run}/point_cloud/iteration_{iteration}/point_cloud.ply'
 
-# --- Read cfg_args: dataset path + T_light source + tonemap mode -------------
+# --- cfg_args: dataset path + T_light source + tonemap mode -------------
 cfg = open(os.path.join(run, 'cfg_args')).read()
 m = re.search(r"source_path=['\"]([^'\"]+)['\"]", cfg)
 source_path = m.group(1) if m else r'D:\3DGS-Volume-Cloud\data\CloudDatasetUniform'
@@ -71,10 +70,9 @@ for f in test_json['frames']:
     time_by_key[(parts[0], parts[-1])] = f['time_index']
 HELDOUT_SUNS = {7, 22, 37, 52}
 
-# Luminance buckets over CLOUD pixels. Cloud is identified by render coverage
-# (depth > 0) UNION GT showing cloud (gt_lum > tiny), so deep self-shadow
-# pixels (GT near-black but cloud IS present) are kept — that is exactly where
-# the octave false-floor would show up. A separate 'deep' bucket isolates them.
+# Luminance buckets over cloud pixels. Cloud = render coverage (depth > 0)
+# UNION GT showing cloud (gt_lum > tiny), so deep self-shadow pixels (GT
+# near-black but cloud present) are kept; the 'deep' bucket isolates them.
 BG_EPS = 0.004           # below this AND no coverage => pure-black background
 BUCKETS = (('deep', 0.0, 0.05), ('dark', 0.05, 0.25),
            ('mid', 0.25, 0.55), ('bright', 0.55, 1.01))

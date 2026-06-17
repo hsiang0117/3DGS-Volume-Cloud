@@ -6,16 +6,9 @@ Run:
     python viewer.py --ply <path/to/point_cloud.ply>
 then open http://localhost:8080 in a browser.
 
-Features (v1):
-    - PLY loading and free-fly camera (viser's built-in orbit / WASD).
-    - FOV and per-Gaussian scaling_modifier sliders.
-    - Visualisation modes: RGB | depth | T_light | beta_peak.
-    - Static sun direction (hardcoded [0, 1, 0]); T_light is computed once at
-      startup and reused every frame.
-
-Not in v1:
-    - Per-frame / interactive sun direction.
-    - Custom lighting UI.
+Provides PLY loading, free-fly camera (viser orbit / WASD), FOV and
+per-Gaussian scaling sliders, visualisation modes (RGB | depth | T_light |
+beta_peak), and interactive sun direction (T_light recomputed on change).
 """
 
 import os
@@ -44,14 +37,14 @@ class _ViewerPipe:
     antialiasing: bool = False
     k_sigma: float = 1.5
     # T_light is supplied via precomputed_T_light (compute_T_light_cache), so
-    # render() never reaches its own T_light branch here; tlight_voxel only
-    # guards against accidental in-render computation.
+    # render() never reaches its own T_light branch; tlight_voxel only guards
+    # against accidental in-render computation.
     tlight_voxel: bool = True
-    # When True, render() shades in HDR linear and applies a tonemap curve to
-    # the final RGB image. tonemap_aces = fixed Narkowicz; tonemap_learnable =
-    # the per-model learned coeffs restored by load_ply (pc.apply_tonemap). Set
-    # from the run's cfg_args / the "Tonemap" checkbox; mutated per frame in the
-    # render loop. Neither affects diagnostic channels (override_color set).
+    # When True, render() shades in HDR linear and applies a tonemap curve to the
+    # final RGB. tonemap_aces = fixed Narkowicz; tonemap_learnable = per-model
+    # learned coeffs restored by load_ply (pc.apply_tonemap). Set from cfg_args /
+    # the "Tonemap" checkbox; mutated per frame. Neither affects diagnostic
+    # channels (override_color set).
     tonemap_aces: bool = False
     tonemap_learnable: bool = False
 
@@ -103,14 +96,13 @@ def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor,
                           use_raster: bool = False, raster_res: int = 512) -> torch.Tensor:
     """Compute T_light for the given sun direction.
 
-    Mirrors the per-Gaussian τ derivation used inside `render()` so the cache
-    matches what render() would produce for the same sun direction.
+    Mirrors the per-Gaussian τ derivation inside render() so the cache matches
+    what render() produces for the same sun direction.
 
-    use_raster selects the light-space rasterized shadow pass (the
-    --tlight_raster training path) instead of the 128^3 voxel cache. View a
-    model with the SAME T_light source it was trained with — β/albedo
-    calibrate against their training-time shadow field, so mixing sources
-    shows mis-lit results.
+    use_raster selects the light-space rasterized shadow pass instead of the
+    128^3 voxel cache. View a model with the SAME T_light source it was trained
+    with — β/albedo calibrate against their training-time shadow field, so mixing
+    sources shows mis-lit results.
     """
     sun_dir = sun_dir.to(device="cuda", dtype=torch.float32)
     sun_dir = sun_dir / (torch.linalg.norm(sun_dir) + 1e-8)
@@ -297,9 +289,8 @@ def main():
 
     # Resolve the T_light source. Models calibrate β/albedo against their
     # training-time shadow field, so the viewer must use the same source.
-    # cfg_args from current runs carries tlight_voxel (raster is the default);
-    # runs from the transition window carried tlight_raster=True; runs older
-    # than the raster pass carry neither and are voxel-trained.
+    # Read from cfg_args: tlight_voxel=True -> voxel; else tlight_raster=True
+    # -> raster; absent both -> voxel.
     use_raster_tlight = args.tlight == "raster"
     tlight_raster_res = 512
     # Tonemap is resolved in two stages: the cfg flags say whether the model was
@@ -335,8 +326,8 @@ def main():
         else:
             use_raster_tlight = False  # no cfg → legacy voxel default
     if cfg is not None:
-        # These flags only appear in cfg_args from the tonemap-match branch on;
-        # absence means a linear-space model.
+        # These flags only appear in cfg_args of tonemapped runs; absence means
+        # a linear-space model.
         cfg_tonemap_aces = "tonemap_aces=True" in cfg
         cfg_tonemap_learnable = "tonemap_learnable=True" in cfg
     print(f"[viewer] T_light source: {'raster' if use_raster_tlight else 'voxel'}"
@@ -507,14 +498,14 @@ def main():
         options=("rgb", "T_light", "beta_peak", "depth"),
         initial_value="rgb",
     )
-    # Snap-to-training-cam controls. If transforms_train.json is available we
-    # show one dropdown of unique camera_index values + a time slider. This
-    # keeps the option list at ~49 instead of 49×61=2989 (which used to
-    # disconnect the viser websocket on connect).
+    # Snap-to-training-cam controls. With transforms_train.json, show one
+    # dropdown of unique camera_index values + a time slider. This keeps the
+    # option list at ~49 instead of 49×61=2989, which disconnects the viser
+    # websocket on connect.
     gui_train_cam = None              # legacy cameras.json dropdown
     gui_train_cam_text = None         # fallback text input
-    gui_train_cam_idx = None          # new: unique camera_index dropdown
-    gui_train_time = None             # new: time slider
+    gui_train_cam_idx = None          # unique camera_index dropdown
+    gui_train_time = None             # time slider
     if cam_frames:
         sorted_cams = sorted(cam_frames.keys())
         gui_train_cam_idx = server.gui.add_dropdown(
@@ -671,10 +662,9 @@ def main():
             os.makedirs("recordings", exist_ok=True)
             path = os.path.join(
                 "recordings", time.strftime("cloud_%Y%m%d_%H%M%S") + ".mp4")
-            # Prefer H.264 (browser/IM-playable); mp4v (MPEG-4 Part 2) only
-            # plays in desktop players. avc1 needs an H.264 encoder on the
-            # system (verified present here via openh264); fall back if a
-            # different machine lacks it. A writer can "open" yet silently
+            # Prefer H.264 (avc1, browser/IM-playable); mp4v (MPEG-4 Part 2)
+            # only plays in desktop players. avc1 needs a system H.264 encoder;
+            # fall back to mp4v if absent. A writer can "open" yet silently
             # produce a header-only file, so verify bytes after encoding.
             for codec in ("avc1", "mp4v"):
                 writer = cv2.VideoWriter(
@@ -799,7 +789,7 @@ def main():
               f"(GT: {cam['width']}x{cam['height']})")
 
     def _snap_to_cam_time():
-        """New path: snap by (camera_index, time_index) using transforms.json frames."""
+        """Snap by (camera_index, time_index) using transforms.json frames."""
         if not cam_frames or gui_train_cam_idx is None:
             return
         sel = gui_train_cam_idx.value

@@ -1,25 +1,15 @@
 """
-Experiment-2 Step A diagnostic: WHERE does the mid-tone over-brightness come from?
+Diagnostic: localize mid-tone over-brightness by binning the signed luminance
+residual (pred-gt) against per-pixel rendered T_light (sun transmittance /
+shadow depth), not GT luminance.
 
-The unified residual diagnostic (tools/residual_buckets.py) shows the dominant
-test-set error on the fixed-ACES model is mid-tone +0.0117 (pred brighter than
-GT at GT luminance 0.25-0.55), and the learnable-tonemap experiment proved it's
-a shading-side (scene-radiance) error, not a display-curve one.
+T_light bins span the penumbra axis: ~0 deep core shadow, ~0.2-0.7 penumbra
+(terminator), ~1 fully lit. Cross-tabbed with GT luminance to correlate mid-tone
+with mid-T_light. Tests whether the multiple-scattering octave approximation
+over-fills the soft lit->shadow transition.
 
-Hypothesis: the multiple-scattering octave approximation over-fills the PENUMBRA
-(terminator) — i.e. the soft lit->shadow transition — making it too bright. The
-decisive test is to bin the signed luminance residual by the per-pixel rendered
-T_light (sun transmittance / shadow depth), NOT by GT luminance:
-
-  * mid T_light (~0.2-0.7) == penumbra. If the +residual concentrates there,
-    the octave/terminator hypothesis is confirmed.
-  * low T_light (~0) == deep core shadow (octave false-floor would live here).
-  * high T_light (~1) == fully lit.
-
-Cross-tabulated with GT luminance so we can confirm mid-tone <-> mid-T_light.
-
-Read-only: no retraining, no model mutation. Renders RGB + a T_light image
-(override_color pass, same as the viewer) per test frame.
+Read-only: renders RGB + a T_light image (override_color pass) per test frame;
+no retraining or model mutation.
 
 Usage:
     python tools/penumbra_residual.py output/<run> [iteration]
@@ -70,7 +60,7 @@ def lum(img):
 # T_light buckets (penumbra axis). edges -> 6 bins.
 TL_EDGES = [0.0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.001]
 TL_NAMES = ['core<.05', '.05-.2', '.2-.5(pen)', '.5-.8(pen)', '.8-.95', 'lit>.95']
-# GT-luminance buckets (same as residual_buckets.py).
+# GT-luminance buckets.
 GL_EDGES = [0.0, 0.05, 0.25, 0.55, 1.01]
 GL_NAMES = ['deep', 'dark', 'mid', 'bright']
 
@@ -90,8 +80,8 @@ with torch.no_grad():
         pred = pkg['render'].clamp(0, 1)
         gt = c.original_image.cuda()
         depth = pkg['depth'].squeeze(0)
-        # Per-pixel T_light image: render the per-Gaussian T_light as colour
-        # (override_color skips tonemap, gives alpha-weighted shadow depth).
+        # Per-pixel T_light image: render per-Gaussian T_light as colour;
+        # override_color skips tonemap, giving alpha-weighted shadow depth.
         tl_pg = pkg['T_light']  # (P,1) detached
         tl_pkg = render(c, g, pipe, bg, override_color=tl_pg.expand(-1, 3).contiguous())
         tl_img = tl_pkg['render'][0]  # (H,W), all 3 channels identical

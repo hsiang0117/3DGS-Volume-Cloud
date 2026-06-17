@@ -67,10 +67,10 @@ __global__ void checkFrustum(int P,
 
 // Generates one key/value pair for all Gaussian / tile overlaps.
 // Run once per Gaussian (1:N mapping).
-// The depth half of the key is the *per-tile* max-response depth t* of this
-// Gaussian along the tile's centre ray, computed from precomputed Σ_v^-1 and
-// q = Σ_v^-1 μ_v. This replaces the centre depth used by stock 3DGS, which
-// flips alpha-blend order across tiles for elongated ellipsoids.
+// The depth half of the key is the per-tile max-response depth t* of this
+// Gaussian along the tile's centre ray, from precomputed Σ_v^-1 and
+// q = Σ_v^-1 μ_v. Fixes alpha-blend order flips across tiles for elongated
+// ellipsoids that stock 3DGS centre-depth sorting produces.
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
@@ -111,14 +111,13 @@ __global__ void duplicateWithKeys(
 		const float qz = q_view[idx * 3 + 2];
 		const float fallback_depth = depths[idx];
 		const float sd = sigma_d[idx];
-		// Cap how far per-tile t* may shift from the centre depth, in units of
-		// σ along the view ray. k_sigma is supplied by the caller (see
-		// GaussianRasterizationSettings.k_sigma); a value ≤0 disables the
-		// per-tile shift entirely (equivalent to stock 3DGS centre-depth sort).
-		// Small values (~1.5) keep near-isotropic Gaussians behaving like
-		// stock 3DGS so cross-tile order stays consistent (no tile-boundary
-		// popping); elongated ellipsoids can still shift several real units
-		// of depth (their σ is large), preserving the long-axis sort fix.
+		// Cap how far per-tile t* may shift from centre depth, in units of
+		// σ along the view ray. k_sigma is caller-supplied (see
+		// GaussianRasterizationSettings.k_sigma); ≤0 disables the per-tile
+		// shift (stock 3DGS centre-depth sort). Small values (~1.5) keep
+		// near-isotropic Gaussians matching stock order (no tile-boundary
+		// popping); elongated ellipsoids (large σ) still shift correctly,
+		// preserving the long-axis sort fix.
 		const float dev_max = k_sigma * sd;
 
 		const float inv_W = 1.0f / (float)W;
@@ -145,18 +144,16 @@ __global__ void duplicateWithKeys(
 				          + 2.0f * (Sxy * vx * vy + Sxz * vx + Syz * vy);
 				float t_star = vq / fmaxf(vSv, 1e-20f);
 
-				// Sort key uses float→uint32 bit-cast, which is only monotonic
-				// for non-negative floats. Clamp away near-plane / behind-camera
-				// numerics; fall back to the centre depth on degeneracy.
-				// k_sigma ≤ 0 means "stock 3DGS sort", skip the per-tile shift.
+				// Sort key uses float→uint32 bit-cast, monotonic only for
+				// non-negative floats. Clamp away near-plane / behind-camera
+				// numerics; fall back to centre depth on degeneracy.
+				// k_sigma ≤ 0 skips the per-tile shift (stock 3DGS sort).
 				float depth_for_key;
 				if (k_sigma > 0.0f && vSv > 1e-20f && t_star > 0.0f)
 				{
-					// Clamp the t* deviation from centre depth to ±k_sigma·σ.
-					// This preserves stock-3DGS order for small/isotropic
-					// Gaussians (σ tiny → t* ≈ centre depth) while still
-					// letting long ellipsoids shift their depth correctly
-					// (σ large).
+					// Clamp t* deviation from centre depth to ±k_sigma·σ:
+					// small/isotropic Gaussians stay near centre depth (stock
+					// order), long ellipsoids (large σ) shift correctly.
 					float dev = t_star - fallback_depth;
 					if (dev > dev_max) dev = dev_max;
 					else if (dev < -dev_max) dev = -dev_max;

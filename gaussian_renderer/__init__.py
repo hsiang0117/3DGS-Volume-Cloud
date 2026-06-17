@@ -39,11 +39,10 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     """
     Approximate per-Gaussian sun transmittance via voxel grid (point-scatter).
 
-    Differentiable w.r.t. tau_per_gauss (the deposited optical depth, hence
-    β_peak and scales), and w.r.t. means3D through the grid_sample sampling
-    coordinate (step 4, experiment "B"). NOT differentiable through the integer
-    deposit index (step 2 uses a hard nearest-voxel scatter), nor the
-    light-space basis R_lw / bbox framing, which are treated as constants.
+    Differentiable w.r.t. tau_per_gauss (hence β_peak and scales), and w.r.t.
+    means3D through the grid_sample sampling coordinate (step 4). NOT
+    differentiable through the integer deposit index (step 2 hard nearest-voxel
+    scatter), nor the light-space basis R_lw / bbox framing, treated as constants.
 
     Works with an arbitrary sun direction. The grid is built in a *light-space*
     frame whose third axis is `sun_dir`, so a single 1D prefix sum along that
@@ -52,7 +51,7 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     1. Build an orthonormal basis (e1, e2, sun_dir) and rotate Gaussian centres
        into it.
     2. Build optical-depth field on a 3D grid in light-space (hard nearest-voxel
-       scatter; trilinear soft deposit was tried as experiment "A" and reverted).
+       scatter).
     3. Exclusive prefix sum along the +sun axis → cumulative optical depth
        between each cell and the sun.
     4. Trilinear sample at each Gaussian centre → T_light = exp(-tau_sun).
@@ -90,11 +89,10 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
         R_lw = torch.stack([e1, e2, s], dim=0)              # (3,3) rows are basis
 
     # --- 1. Light-space position (differentiable) + bbox framing (detached) -
-    # Project centres into light-space ONCE; this means_L is differentiable in
-    # means3D and is shared by the deposit index (step 2) and the sample
-    # coordinate (step 4, experiment "B").
+    # Project centres into light-space ONCE; means_L is differentiable in means3D
+    # and is shared by the deposit index (step 2) and the sample coord (step 4).
     means_L = means3D @ R_lw.T                              # (P,3) in light-space
-    # The bounding box is just a framing for the grid — treat it as a constant
+    # The bounding box is just a framing for the grid — treated as a constant
     # (3-sigma padding so Gaussians don't fall outside the volume). The deposit
     # index is also non-differentiable (integer voxel), so it lives here too.
     with torch.no_grad():
@@ -109,12 +107,9 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
 
     # --- 2. Hard nearest-voxel scatter of per-Gaussian tau (differentiable) --
     # Each Gaussian's full-line optical depth is deposited into its single
-    # nearest voxel. (Trilinear cloud-in-cell soft deposit was tried as
-    # experiment "A" and reverted: spreading tau across 8 voxels over-softened
-    # the already trilinear-sampled shadow field, inflating β_peak ~2x and
-    # worsening PSNR/LPIPS/g — the deposited quantity is a per-Gaussian full
-    # optical depth, not a density to be box-filtered, so softening it spreads
-    # error rather than fixing it.)
+    # nearest voxel. The deposited quantity is a per-Gaussian full optical depth,
+    # not a density to be box-filtered, so a soft (trilinear) deposit would
+    # spread error rather than reduce it.
     volume = torch.zeros(grid_res * grid_res * grid_res, device=device, dtype=dtype)
     volume = volume.scatter_add(0, flat_idx, tau_per_gauss.squeeze(-1))
     # Indexed [light_x, light_y, light_z=sun_axis]
@@ -128,10 +123,10 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     tau_above = torch.flip(exclusive_cs, [2])
 
     # --- 4. Trilinear sample at Gaussian centres (in light-space) -----------
-    # Sample tau_above at each centre using the same differentiable means_L
-    # built in step 1 (experiment "B"): the grid_sample coordinate carries
-    # gradient to means3D, so the optimiser can nudge a Gaussian along the
-    # shadow field. R_lw and the bbox framing stay constant.
+    # Sample tau_above at each centre using the same differentiable means_L from
+    # step 1: the grid_sample coordinate carries gradient to means3D, so the
+    # optimiser can nudge a Gaussian along the shadow field. R_lw and the bbox
+    # framing stay constant.
     coords_norm = 2.0 * (means_L - bbox_min) / bbox_size - 1.0       # (P,3)
     # grid_sample expects (D=light_z, H=light_y, W=light_x) order with
     # the per-point stack [x, y, z] of *normalised* coords, but PyTorch's
@@ -159,18 +154,17 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
     Per-Gaussian sun transmittance via a light-space rasterization pass.
 
     Renders the cloud from a distant "sun camera" looking along -L_dir with the
-    existing analytic-tau rasterizer. The CUDA kernel records, for every
-    Gaussian, the alpha*T-weighted mean of the optical depth accumulated IN
-    FRONT of it over all pixels of its light-space footprint
-    (record_front_tau). Compared with the voxel cache this fixes, in one shot:
-    lateral point-deposit ("needle" shadows), centre-only chord bias, trilinear
-    self-leakage, and bbox-quantisation aliasing — shadow resolution is set by
-    the light image, and each occluder attenuates with its true projected
-    footprint exp(-d_perp^2/2sigma^2) via the splatted 2D Gaussian.
+    analytic-tau rasterizer. The CUDA kernel records, for every Gaussian, the
+    alpha*T-weighted mean of the optical depth accumulated IN FRONT of it over
+    all pixels of its light-space footprint (record_front_tau). Shadow
+    resolution is set by the light image, and each occluder attenuates with its
+    true projected footprint exp(-d_perp^2/2sigma^2) via the splatted 2D
+    Gaussian — avoiding the voxel cache's lateral needle shadows, centre-only
+    chord bias, trilinear self-leakage, and bbox-quantisation aliasing.
 
-    The sun is faked with a DISTANT NARROW-FOV PERSPECTIVE camera (the
-    rasterizer's EWA Jacobian is perspective-only); at D = 60x cloud radius the
-    parallax error is < 2%.
+    The sun is a DISTANT NARROW-FOV PERSPECTIVE camera (the rasterizer's EWA
+    Jacobian is perspective-only); at D = 60x cloud radius the parallax error
+    is < 2%.
 
     Differentiable in tau_sun_per_gauss ONLY (hence β/scales/rotations through
     its Python-side construction): the CUDA lightpass backward replays the
@@ -180,13 +174,6 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
     back) inside the SAME shadow field the forward renders. Geometry inputs
     (means3D/scales/rotations as splat shapes) are consumed detached: the sun
     camera framing and footprints are treated as constants.
-
-    History: v1 detached everything → β ran away 4x (no feedback), -3.3 dB.
-    v2 borrowed the voxel path's gradient via straight-through → the voxel
-    field's needle-shadow artefacts injected wrong-sign gradients into
-    scale/rotation that the raster-valued forward could not correct, and
-    aniso exploded (p99 14 → 2100). The fix is a consistent gradient from the
-    raster pass itself.
 
     Returns:
         T_light: (P, 1) sun transmittance per Gaussian.
@@ -330,8 +317,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    # Peak extinction coefficient β_peak (intensive, 1/length). Mass is derived below
-    # once we have scale with scaling_modifier applied.
+    # Peak extinction coefficient β_peak (intensive, 1/length). Mass derived below.
     beta_peak = pc.get_extinction  # (P,1)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -352,13 +338,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     sun_intensity = 4.0 * math.pi
     L_sun = torch.tensor([sun_intensity, sun_intensity, sun_intensity], device="cuda", dtype=means3D.dtype)
     # Per-frame sun direction comes from the camera (set by dataset_readers from
-    # the JSON's sun_direction field). Falls back to the model-level
-    # `pc.get_sun_dir` (currently hard-coded [0,1,0]) for legacy datasets / viewer
-    # paths that don't supply one.
+    # the JSON's sun_direction field). Falls back to model-level `pc.get_sun_dir`
+    # ([0,1,0]) for legacy datasets / viewer paths that don't supply one.
     if hasattr(viewpoint_camera, "sun_dir") and viewpoint_camera.sun_dir is not None:
         L_dir = viewpoint_camera.sun_dir.to(dtype=means3D.dtype, device=means3D.device)
-        # Re-normalise defensively; numerical drift from per-frame data is cheap
-        # to fix here and avoids surprising the T_light light-space basis below.
+        # Re-normalise defensively against per-frame numerical drift, which would
+        # otherwise perturb the T_light light-space basis below.
         L_dir = L_dir / (torch.linalg.norm(L_dir) + 1e-8)
     else:
         L_dir = pc.get_sun_dir.to(dtype=means3D.dtype)
@@ -389,17 +374,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tau_precomp = tau_view
     opacity = 1.0 - torch.exp(-tau_view)
 
-    # HG scattering angle cosine, in the standard convention: the phase
-    # function is defined on the angle between the photon's INCOMING
-    # propagation direction ω_in and its OUTGOING (scattered) direction ω_out,
-    # cosθ = ω_in·ω_out, forward lobe (g>0) peaking at cosθ=+1.
+    # HG scattering angle cosine, standard convention: the phase function is
+    # defined on the angle between the photon's INCOMING propagation direction
+    # ω_in and its OUTGOING (scattered) direction ω_out, cosθ = ω_in·ω_out,
+    # forward lobe (g>0) peaking at cosθ=+1.
     #   • L_dir points TOWARD the sun (dataset convention), so the sunlight
     #     PROPAGATES along the incoming direction l_in = −L_dir.
     #   • v points from the Gaussian toward the camera = scattered direction ω_out.
-    # So cosθ = l_in·v. Build l_in explicitly and use the textbook form rather
-    # than a bare sign flip on v·L_dir — same value, clearer intent. (Note
-    # compute_T_light still consumes L_dir = "toward sun" directly; only the
-    # phase function needs the propagation direction.)
+    # So cosθ = l_in·v. (compute_T_light consumes L_dir = "toward sun" directly;
+    # only the phase function needs the propagation direction l_in.)
     l_in = -L_dir
     cos_theta = torch.clamp((v * l_in[None, :]).sum(dim=1, keepdim=True), -1.0, 1.0)
 
@@ -409,17 +392,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     inv_4pi = 1.0 / (4.0 * math.pi)
 
     # Multi-octave scattering approximation (Frostbite / Wrenninge 2015).
-    # Simulates multiple scattering bounces using the same physical parameters.
+    # Simulates multiple scattering bounces from the same physical parameters.
     # Higher octaves: less energy, less attenuation (T^(b^n)), more isotropic (g·c^n).
     #
-    # The per-octave ENERGY weight is now a learnable per-Gaussian parameter
-    # `octave_w[:, n]` (softplus, >=0) instead of the fixed a^n=0.5^n schedule.
-    # It only rescales each physical basis term (HG·T_eff), so chroma stays
-    # locked in albedo ρ and lighting still flows through every octave — the
-    # weight cannot bypass the physical model. Initialised so iter-0 weights
-    # equal 0.5^n, reproducing the fixed schedule exactly at the start.
-    ms_b = 0.5    # transmittance power decay (still fixed)
-    ms_c = 0.5    # phase isotropization rate (still fixed)
+    # The per-octave ENERGY weight is a learnable per-Gaussian parameter
+    # `octave_w[:, n]` (softplus, >=0). It only rescales each physical basis term
+    # (HG·T_eff), so chroma stays locked in albedo ρ and lighting still flows
+    # through every octave — the weight cannot bypass the physical model.
+    # Initialised so iter-0 weights equal 0.5^n.
+    ms_b = 0.5    # transmittance power decay (fixed)
+    ms_c = 0.5    # phase isotropization rate (fixed)
     num_octaves = 6
     octave_w = pc.get_octave_weights  # (P,6), >=0
 
@@ -427,18 +409,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if precomputed_T_light is not None:
         T_light = precomputed_T_light
     elif getattr(pipe, "tlight_voxel", False):
-        # Legacy 128^3 voxel cache. Kept as the correct pairing for models
-        # trained before the raster shadow pass (β/albedo calibrate against
-        # their training-time shadow field), and as a fallback.
+        # 128^3 voxel cache. Correct pairing for models trained before the raster
+        # shadow pass (β/albedo calibrate against their training-time shadow
+        # field), and a fallback.
         T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
     else:
-        # DEFAULT: light-space rasterized shadow pass (v3, validated on the
-        # uniform-sun dataset 2026-06-12). Fixes the voxel cache's
+        # DEFAULT: light-space rasterized shadow pass. Fixes the voxel cache's
         # needle-shadow / chord-bias / self-leak / bbox-aliasing errors.
         # Differentiable through the dedicated CUDA lightpass backward, full
-        # gradient: β AND σ_d through scales/rotation (+0.3 dB with uniform
-        # sun coverage; the historical ±X needle exploit on directionally
-        # biased datasets is held by needle surgery + uniform suns).
+        # gradient: β AND σ_d through scales/rotation. The ±X needle exploit on
+        # directionally biased datasets is held by needle surgery + uniform suns.
         geom_sun = (((2.0 * math.pi) ** 1.5)
                     * torch.prod(s, dim=1, keepdim=True) * line_int_sun)
         tau_shadow = beta_peak * geom_sun

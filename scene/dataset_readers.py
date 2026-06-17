@@ -33,9 +33,8 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
-    # Per-frame sun direction in OpenGL/Blender world coordinates
-    # ("pointing toward the sun"). Defaults to [0,1,0] for legacy datasets
-    # that don't include the field — matches the previous hard-coded behaviour.
+    # Per-frame sun direction in OpenGL/Blender world coords, points toward the
+    # sun, unit length. Defaults to [0,1,0] when the dataset omits the field.
     sun_dir: np.array = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 class SceneInfo(NamedTuple):
@@ -97,11 +96,8 @@ def storePly(path, xyz, rgb):
 def _parse_one_frame(args):
     """Parse a single transforms.json frame into a CameraInfo.
 
-    Hoisted to a top-level function so a ThreadPoolExecutor can fan out the
-    per-frame PIL header read + matrix work across cores. Each frame's I/O is
-    a tiny header read (PIL doesn't decode pixels here), but with thousands
-    of frames the sequential cost becomes minutes — parallelisation drops
-    that to seconds.
+    Top-level so a ThreadPoolExecutor can fan the per-frame PIL header read +
+    matrix work across cores; thousands of frames make sequential parsing slow.
     """
     idx, frame, path, is_test = args
     cam_name = os.path.join(path, frame["file_path"])
@@ -142,10 +138,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, is_test, e
         fovx = contents["camera_angle_x"]
         frames = contents["frames"]
 
-    # Parse frames in parallel — the per-frame work is pure CPU (PIL header
-    # read + matrix invert) with no shared state, so a thread pool sized to
-    # the CPU count gives a near-linear speedup. For ~3000 frames this drops
-    # from ~5 min sequential to <30 s.
+    # Parse frames in parallel: per-frame work is pure CPU (PIL header read +
+    # matrix invert) with no shared state, so a CPU-sized thread pool scales
+    # near-linearly.
     n_workers = min(32, (os.cpu_count() or 4) * 2)
     args_iter = [(idx, frame, path, is_test) for idx, frame in enumerate(frames)]
     results = [None] * len(args_iter)

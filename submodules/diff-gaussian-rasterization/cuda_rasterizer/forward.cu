@@ -258,15 +258,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rgb[idx * C + 2] = result.z;
 	}
 
-	// Store some useful helper data for the next steps.
-	// Sort-stability fix for elongated Gaussians: instead of using the centre
-	// depth p_view.z (which is shared across every tile this Gaussian touches
-	// and flips the alpha-blend order under camera rotation), the duplicateWithKeys
-	// kernel will compute a per-tile max-response depth using Σ_v^-1 and
-	// q = Σ_v^-1 · μ_v, which we precompute here.
-	//
-	// `depths[]` retains the centre depth for the per-pixel invdepth output
-	// (used by depth supervision when enabled; currently disabled in train.py).
+	// Precompute helper data for per-tile depth sorting of elongated Gaussians:
+	// duplicateWithKeys derives a per-tile max-response depth from Σ_v^-1 and
+	// q = Σ_v^-1 · μ_v (avoids the order flips of a shared centre depth).
+	// depths[] keeps the centre depth for the per-pixel invdepth output.
 	{
 		glm::mat3 Wv = glm::mat3(
 			viewmatrix[0], viewmatrix[4], viewmatrix[8],
@@ -319,8 +314,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
-	// Inverse 2D covariance and packed scalar input neatly pack into one float4.
-	// The scalar stores either legacy opacity or a precomputed tau scale.
+	// Inverse 2D covariance and a packed scalar in one float4. The scalar is
+	// opacity, or a precomputed tau scale when tau_precomp is provided.
 	const float packed_input = (tau_precomp != nullptr) ? tau_precomp[idx] : opacities[idx];
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, packed_input * h_convolution_scaling };
 
@@ -383,9 +378,9 @@ renderCUDA(
 
 	float expected_invdepth = 0.0f;
 
-	// Running analytic optical depth along this pixel's ray (light-space
-	// shadow pass). Tracked separately from T so the recorded value is the
-	// exact sum of tau_pixel, unaffected by the 0.99 alpha clamp.
+	// Analytic optical depth accumulated along this pixel's ray (light-space
+	// shadow pass). Tracked separately from T as the exact sum of tau_pixel,
+	// unaffected by the 0.99 alpha clamp.
 	float tau_accum = 0.0f;
 
 	// Iterate over batches until all done or range is complete
@@ -454,16 +449,15 @@ renderCUDA(
 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
 
 			// Per-Gaussian image contribution: total light flux this Gaussian
-			// projects onto valid pixels. Used downstream by the physical
-			// densify/prune logic to identify Gaussians that effectively
-			// contribute nothing to the final image (regardless of opacity).
+			// projects onto valid pixels. Used by physical densify/prune to
+			// find Gaussians that contribute nothing to the image regardless
+			// of opacity.
 			if (gauss_contribution)
 				atomicAdd(&gauss_contribution[collected_id[j]], alpha * T);
 
-			// Light-space shadow pass: record the optical depth accumulated
-			// IN FRONT of this Gaussian (before its own tau), weighted by
-			// alpha*T so pixels where the Gaussian is actually visible from
-			// the light dominate its mean. Consumed as
+			// Light-space shadow pass: optical depth accumulated IN FRONT of
+			// this Gaussian (before its own tau), weighted by alpha*T so pixels
+			// where it is visible from the light dominate its mean. Consumed as
 			// T_light = exp(-sum/wsum) on the Python side.
 			if (tau_front_sum)
 			{

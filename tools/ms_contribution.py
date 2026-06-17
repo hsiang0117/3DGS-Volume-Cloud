@@ -1,25 +1,18 @@
 """
-Experiment-2 Step A disambiguation: is the penumbra over-brightness driven by
-the multiple-scattering OCTAVES specifically, or by T_light softness / HG?
+Isolates the multiple-scattering OCTAVE contribution to penumbra brightness,
+to disambiguate it from T_light softness / HG phase. Renders each test frame
+twice from the same trained model:
 
-penumbra_residual.py showed: deep core shadow is calibrated (residual ~0), but
-the lit side of the terminator (mid T_light 0.05-0.5) is rendered too bright.
-That is consistent with octave over-scatter, T_light being too soft, OR the HG
-phase. This isolates the OCTAVE contribution by re-rendering each test frame
-twice from the SAME trained model:
+  full   = all 6 octaves
+  single = octave 0 only (single scatter); octaves 1..5 zeroed by setting
+           _octave_weights[:,1:] to softplus^-1(0) in-process
 
-  full   = all 6 octaves (the trained behaviour)
-  single = octave 0 only (single scatter): higher octave energies zeroed by
-           setting _octave_weights[:,1:] to softplus^-1(0) in-process
+ms = full - single, the MS contribution in render/tonemap space, binned by
+per-pixel T_light. MS peaking in the mid-T_light penumbra implicates octaves;
+MS flat across T_light implicates T_light/HG.
 
-ms = full - single  (the multiple-scattering contribution, in render/tonemap
-space). We then bin ms by per-pixel T_light. If ms is large exactly in the
-mid-T_light penumbra where the residual is positive, the octaves are the lever
-for experiment 2; if ms is flat / lives elsewhere, the cause is T_light/HG.
-
-Read-only: parameter is restored after rendering; no file is written, no
-training. Tonemap is left as the model trained (so the comparison is in the
-space the residual was measured in).
+Read-only: _octave_weights is restored after rendering; no file written, no
+training. Tonemap is left as the model trained.
 
 Usage:
     python tools/ms_contribution.py output/<run> [iteration]
@@ -63,7 +56,7 @@ cam_infos = readCamerasFromTransforms(source_path, 'transforms_test.json', False
 args = Namespace(resolution=-1, data_device='cuda')
 cams = cameraList_from_camInfos(cam_infos, 1.0, args, True, True)
 
-# How much of the trained octave energy lives above octave 0?
+# Fraction of trained octave energy above octave 0.
 ow = g.get_octave_weights  # (P,6)
 ow_share = ow.sum(0)
 ow_share = (ow_share / ow_share.sum()).tolist()
