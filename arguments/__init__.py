@@ -51,11 +51,10 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        # Default True: transforms_test.json now holds a real held-out split
-        # (tools/split_test_set.py). With eval=False the Blender loader merges
-        # test frames back into training, silently leaking the split and
-        # inflating final metrics. (argparse store_true means this can no
-        # longer be disabled from the CLI — flip it here if ever needed.)
+        # transforms_test.json holds a real held-out split (tools/split_test_set.py).
+        # Must stay True: eval=False makes the Blender loader merge test frames back
+        # into training, leaking the split and inflating metrics. store_true can't be
+        # disabled from the CLI — flip here if needed.
         self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -69,58 +68,39 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
-        # Per-tile max-response sort: how far t* may deviate from centre depth,
-        # in units of σ along the view ray. ≤0 reverts to stock 3DGS centre
-        # depth sort (the kernel skips the t* shift entirely).
-        #
-        # Disabled (0.0). The per-tile max-response sort was introduced to fix
-        # long-axis popping, but in practice it produced blocky tile-boundary
-        # artefacts, while pruning/penalising elongated Gaussians (the aniso
-        # channel) controls popping effectively on its own. So we keep the
-        # aniso machinery and revert sorting to stock 3DGS. The CUDA path is
-        # retained but dead at k_sigma=0; set >0 to re-enable without a rebuild.
+        # Per-tile max-response sort: max deviation of t* from centre depth, in
+        # units of σ along the view ray. ≤0 reverts to stock 3DGS centre-depth sort
+        # (kernel skips the t* shift). Disabled: it produced blocky tile-boundary
+        # artefacts; aniso pruning/penalising controls popping instead. CUDA path
+        # is dead at 0.0; set >0 to re-enable without a rebuild.
         self.k_sigma = 0.0
-        # T_light source. DEFAULT (v3, validated 2026-06-12 on the uniform-sun
-        # dataset): light-space rasterization (sun-camera shadow pass,
-        # record_front_tau CUDA channel + native lightpass backward) with the
-        # full shadow gradient (β AND σ_d through scales/rotation). Fixes the
-        # voxel cache's needle shadows / chord bias / self-leak / bbox
-        # aliasing, and with uniform sun coverage + needle surgery holds
-        # aniso p99 ~22 at no PSNR cost (held-out-sun 30.83).
-        # --tlight_voxel falls back to the legacy 128^3 voxel cache (only
-        # correct pairing for models trained pre-raster; the viewer reads
-        # cfg_args to match). store_true defaults can't be disabled from the
-        # CLI, hence a dedicated fallback flag instead of tlight_raster=True.
+        # T_light source. Default: light-space rasterization (sun-camera shadow
+        # pass, record_front_tau CUDA channel + native lightpass backward) with the
+        # full shadow gradient (β AND σ_d through scales/rotation). Avoids the voxel
+        # cache's needle shadows / chord bias / self-leak / bbox aliasing.
+        # --tlight_voxel falls back to the legacy 128^3 voxel cache (correct only for
+        # models trained pre-raster; the viewer reads cfg_args to match). store_true
+        # can't be disabled from the CLI, hence a fallback flag not tlight_raster=True.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
-        # Output tonemap to match the GT's display space. UE's HighResScreenshot
-        # GT is filmic-tonemapped LDR, while our physical shading lives in linear
-        # space — fitting a nonlinear target with a linear model shows up as
-        # dynamic-range compression (dark resid +0.05 / bright -0.04). When on,
-        # render() lifts the per-Gaussian radiance clamp (HDR) and applies the
-        # fixed Narkowicz ACES approximation to the final image, so the loss and
-        # all metrics compare in the GT's own space.
-        #
-        # DEFAULT True: validated on the uniform-sun dataset (output/aces_match,
-        # 33.27 PSNR vs 30.80 linear, compression residual -67%). This is the
-        # current baseline output space. store_true means it can't be turned off
-        # from the CLI — flip here if a truly-linear GT dataset is ever used
-        # (then tonemap must be OFF; see tonemap_learnable note).
+        # Output tonemap to match the GT's display space. UE's HighResScreenshot GT
+        # is filmic-tonemapped LDR while our physical shading is linear; fitting a
+        # nonlinear target with a linear model shows up as dynamic-range compression.
+        # When on, render() lifts the per-Gaussian radiance clamp (HDR) and applies
+        # the fixed Narkowicz ACES approximation to the final image, so loss and
+        # metrics compare in the GT's own space. Default True (current baseline output
+        # space). store_true can't be turned off from the CLI — flip here for a
+        # truly-linear GT (then tonemap must be OFF; see tonemap_learnable note).
         self.tonemap_aces = True
-        # Learnable output tonemap (opt-in alternative to fixed ACES): same
-        # Narkowicz rational form but its 4 coeffs (a,b,c,d) are optimised
-        # (e pinned), so the model fits the GT's true display curve instead of a
-        # fixed approximation. Narkowicz is only a cheap fit of UE's filmic
-        # tonemapper, so learning it absorbs any residual curve-mismatch and
-        # works for any filmic GT display space (not just UE). Implies the HDR
-        # clamp like tonemap_aces; takes precedence over it when on.
-        #
-        # Kept default OFF: validated as a clean NEGATIVE result on UE data
-        # (output/tonemap_learn, 33.13, -0.14 dB vs fixed ACES) — Narkowicz is
-        # already a good enough fit for UE filmic, so the extra DoF doesn't pay.
-        # Retained as insurance for a DIFFERENT filmic engine whose curve drifts
-        # from Narkowicz. (For a truly-linear HDR GT, the answer is tonemap OFF,
-        # NOT learnable — the Narkowicz family cannot represent identity.)
+        # Learnable output tonemap (opt-in alternative to fixed ACES): same Narkowicz
+        # rational form but its 4 coeffs (a,b,c,d) are optimised (e pinned), so the
+        # model fits the GT's true display curve instead of a fixed approximation,
+        # absorbing residual curve-mismatch for any filmic GT (not just UE). Implies
+        # the HDR clamp like tonemap_aces and takes precedence over it when on.
+        # Default OFF: Narkowicz is already a good enough fit for UE filmic, so the
+        # extra DoF doesn't pay; kept as insurance for a different filmic engine whose
+        # curve drifts from Narkowicz. (For a truly-linear HDR GT use tonemap OFF, NOT
+        # learnable — the Narkowicz family cannot represent identity.)
         self.tonemap_learnable = False
         super().__init__(parser, "Pipeline Parameters")
 
@@ -155,28 +135,21 @@ class OptimizationParams(ParamGroup):
         # quadratic in log-ratio above. Cloud is an isotropic medium; long
         # ellipsoids cause depth-sort popping.
         #
-        # Keep λ small. Empirically:
-        #   λ=0.05 → PSNR collapses to ~25 (regularizer dominates fit gradient)
-        #   λ=0.001 → PSNR ~43, aniso largely unbounded
-        # Bounding aniso meaningfully and keeping PSNR high are in tension —
-        # cloud structure (wisps, layers) genuinely benefits from elongated
-        # Gaussians at current capacity. For aggressive aniso bounding, prefer
-        # split-on-densify (`densify_split_aniso_max`) over loss regularisation.
+        # Keep λ small. Bounding aniso and keeping PSNR high are in tension: λ=0.05
+        # collapses PSNR to ~25 (regularizer dominates fit), λ=0.001 gives PSNR ~43
+        # with aniso largely unbounded — cloud structure (wisps, layers) genuinely
+        # benefits from elongated Gaussians at current capacity. For aggressive aniso
+        # bounding prefer split-on-densify (`densify_split_aniso_max`) over loss reg.
         #
-        # CONTINUOUS-CONSTRAINT TEST: aniso p99 was found NOT to converge — it
-        # grows monotonically whenever unconstrained. The soft regulariser was
-        # previously switched off at aniso_until_iter=15000, after which p99
-        # climbed freely (32 -> 58 by 30k, still rising). And λ=0 throughout
-        # gave p99=183. So here we keep λ=0.001 AND run the regulariser for the
-        # FULL schedule (aniso_until_iter = iterations) to test whether a
-        # persistent constraint drives p99 to a plateau instead of letting it
-        # grow in the back half. aniso_ratio_max=5 unchanged.
+        # aniso p99 does NOT converge — it grows monotonically while unconstrained
+        # (λ=0 throughout gives p99=183). Hence λ=0.001 with the regulariser run for
+        # the FULL schedule (aniso_until_iter = iterations) so a persistent constraint
+        # drives p99 to a plateau rather than letting it grow in the back half.
         self.lambda_aniso = 0.001
         self.aniso_ratio_max = 5.0
-        # Run the aniso regulariser for the whole schedule (was 15000). The old
-        # early-off was meant to avoid L_vol+reg co-shrinking the cloud after
-        # densify; we now test persistent constraint instead. Watch for uniform
-        # shrinkage (scale mean dropping) as the side effect to rule out.
+        # Run the aniso regulariser for the whole schedule. A persistent constraint
+        # is needed because aniso p99 grows monotonically once the reg switches off.
+        # Watch for uniform shrinkage (scale mean dropping) as a side effect.
         self.aniso_until_iter = 30_000
         self.densification_interval = 100
         self.densify_from_iter = 500
@@ -204,13 +177,11 @@ class OptimizationParams(ParamGroup):
         # the regular path. 1000 = drop bad ellipsoids about as often as we
         # reset accumulator stats. 0 to disable.
         self.post_densify_prune_interval = 1000
-        # Needle surgery: every `needle_split_interval` iters, split Gaussians
-        # with aniso ratio > `needle_split_ratio` into two children along the
-        # major axis (appearance-conserving, ratio halves). A structural hard
-        # ceiling on the aniso tail that the soft regulariser cannot hold —
-        # the contrast-compression pressure (missing ambient light) keeps
-        # feeding needles, and loss-side λ can only trade PSNR against them.
-        # 0 disables. Runs through the whole schedule (also post-densify).
+        # Needle surgery: every `needle_split_interval` iters, split Gaussians with
+        # aniso ratio > `needle_split_ratio` into two children along the major axis
+        # (appearance-conserving, ratio halves). A structural hard ceiling on the
+        # aniso tail that the soft regulariser cannot hold. 0 disables. Runs through
+        # the whole schedule (also post-densify).
         self.needle_split_interval = 1000
         self.needle_split_ratio = 30.0
         self.needle_split_until_iter = 29_000   # stop before final settle/eval

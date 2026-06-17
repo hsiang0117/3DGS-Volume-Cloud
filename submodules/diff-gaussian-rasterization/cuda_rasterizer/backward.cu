@@ -726,16 +726,14 @@ void BACKWARD::preprocess(
 //     tau_front_sum[j] += w_j * tau_accum       (tau in FRONT of j)
 //     tau_accum        += tau_pixel_j,          tau_pixel_j = con_o.w_j * G_j
 //
-// With the blend weights w frozen (footprint-shape effects; zeroing them
-// cannot create wrong-sign descent directions, unlike borrowing gradients
-// from a different shadow field), the only gradient path is through
-// tau_accum:
+// Blend weights w are frozen (footprint-shape effects); the only gradient
+// path is through tau_accum:
 //     dL/d(tau_precomp_i) = sum_pixels  G_i(p) * S_i(p),
 //     S_i(p) = sum_{j behind i, recorded at p}  w_j * gsum_j,
-// where gsum_j is the incoming dL/d(tau_front_sum[j]). S accumulates
-// naturally in a single back-to-front replay, mirroring the stock backward:
-// when Gaussian i is visited, S holds exactly the sum over Gaussians behind
-// it; apply G_i * S first, then fold i's own w_i * gsum_i into S.
+// where gsum_j is the incoming dL/d(tau_front_sum[j]). S accumulates in a
+// single back-to-front replay: when Gaussian i is visited S holds the sum
+// over Gaussians behind it; apply G_i * S, then fold i's own w_i * gsum_i
+// into S.
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 lightpassBackwardCUDA(
 	const uint2* __restrict__ ranges,

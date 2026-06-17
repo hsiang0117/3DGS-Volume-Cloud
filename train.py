@@ -53,8 +53,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
     gaussians = GaussianModel(opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
-    # Learnable output tonemap: a handful of global coeffs in their OWN optimizer
-    # (isolated from densify/prune). The flag lives on the pipeline params.
+    # Learnable output tonemap: a few global coeffs in their own optimizer,
+    # isolated from densify/prune. Flag lives on the pipeline params.
     if getattr(pipe, "tonemap_learnable", False):
         gaussians.setup_tonemap(opt)
         print(f"[train] learnable tonemap enabled (lr={opt.tonemap_lr}, "
@@ -107,16 +107,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         L_vol = (scales.prod(dim=1)).mean()
         loss += opt.lambda_scale * L_vol
 
-        # Anisotropy regularizer (log-ratio form, gentle).
+        # Anisotropy regularizer (log-ratio hinge, gentle).
         #
-        # `_scaling` is in log-space (scaling_activation = exp), so
+        # `_scaling` is log-space (scaling_activation = exp), so
         # `log(s_max) − log(s_min) = raw_max − raw_min` is free.
         #
-        # Note: bounding aniso aggressively kills PSNR (cloud needs some
-        # elongation to fit wisps/layers at current capacity). λ is kept
-        # small so the regulariser only nudges the worst tail.
-        # Disabled after densify ends to avoid uniform shrinking under
-        # combined L_vol pressure.
+        # λ is kept small: aggressive aniso bounding kills PSNR (cloud needs
+        # some elongation to fit wisps/layers at this capacity), so the
+        # regulariser only nudges the worst tail. Disabled after densify ends
+        # to avoid uniform shrinking under combined L_vol pressure.
         if iteration < opt.aniso_until_iter:
             raw_scaling = gaussians._scaling
             log_ratio = raw_scaling.max(dim=1).values - raw_scaling.min(dim=1).values
@@ -125,10 +124,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             loss += opt.lambda_aniso * L_aniso
 
         # Tonemap monotonicity regulariser (only with --tonemap_learnable).
-        # softplus already guarantees positivity / no poles, but does not by
-        # itself forbid a non-monotone S-curve; this hinges on any negative
-        # slope of f on [0,8] so highlights can never invert. Cheap insurance,
-        # same hinge-squared form as L_aniso.
+        # softplus guarantees positivity but not monotonicity; this penalizes
+        # any negative slope of f on [0,8] so highlights can't invert.
+        # Same hinge-squared form as L_aniso.
         if gaussians.tonemap_optimizer is not None and opt.lambda_tonemap_mono > 0:
             xs = torch.linspace(0.0, 8.0, 32, device="cuda")
             fs = gaussians.apply_tonemap(xs)
@@ -140,10 +138,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
         iter_end.record()
 
-        # Release the just-decoded image/alpha tensors. Camera is lazy-loading
-        # under our refactor (see scene/cameras.py); without this each cam
-        # would hold ~12 MB of GPU memory until next reuse, which on
-        # 2989-frame datasets matters again.
+        # Release the just-decoded image/alpha tensors. Cameras lazy-load
+        # (see scene/cameras.py); without this each cam holds ~12 MB of GPU
+        # memory until next reuse, which matters on multi-thousand-frame sets.
         if hasattr(viewpoint_cam, "release_loaded"):
             viewpoint_cam.release_loaded()
 
@@ -154,7 +151,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 albedo = gaussians.get_albedo
                 g = gaussians.get_g_factor
                 scales = gaussians.get_scaling
-                # Prefer the *current frame's* sun_dir (per-frame, from JSON)
+                # Prefer the current frame's per-frame sun_dir (from JSON)
                 # over the model-level fallback so the diag reflects what the
                 # renderer actually used this iteration.
                 if hasattr(viewpoint_cam, "sun_dir") and viewpoint_cam.sun_dir is not None:
@@ -200,13 +197,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     m_lk, s_lk = _ms(diag_Lk)
                     print(f"  Lk mean/std: {m_lk:.4f}/{s_lk:.4f} | max: {diag_Lk.max().item():.4f}")
 
-                # Densify diagnostic: how many points actually qualify for
-                # densification, and how many are in danger of being pruned.
-                # If `n_above_grad` is consistently small (<<1% of n_points)
-                # the densify_grad_threshold is too high for the current
-                # parameterisation. If `n_below_prune` ≈ densify net gain per
-                # round, the cloud is in equilibrium (every new point is
-                # immediately pruned next round).
+                # Densify diagnostic: count points eligible for densification
+                # and at risk of pruning. Consistently small n_above_grad
+                # (<<1% of n_points) means densify_grad_threshold is too high
+                # for this parameterisation. n_below_prune ≈ densify net gain
+                # means equilibrium (new points pruned next round).
                 denom_d = gaussians.denom.clamp(min=1)
                 grads_xyz = (gaussians.xyz_gradient_accum / denom_d).squeeze()
                 grads_xyz = torch.where(torch.isnan(grads_xyz), torch.zeros_like(grads_xyz), grads_xyz)
@@ -269,9 +264,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Per-Gaussian image-contribution accumulator. Always-on (decoupled
-            # from densify_until_iter) so the diagnostic / future heuristics see
-            # current state, not a frozen snapshot from when densify ended.
+            # Per-Gaussian image-contribution accumulator. Always-on
+            # (decoupled from densify_until_iter) so diagnostics/heuristics
+            # see current state, not a frozen snapshot from densify end.
             contribution = render_pkg.get("contribution")
             if contribution is not None:
                 gaussians.add_contribution_stats(contribution)
@@ -286,16 +281,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     gaussians.physical_densify_and_prune(opt, iteration, radii, scene.cameras_extent)
 
             # Post-densify maintenance: resurrect + prune + accumulator reset.
-            # Must come AFTER the densification block — otherwise prune in tick
-            # shrinks P and the per-step indices (visibility_filter / radii)
-            # from this iteration's forward pass become stale.
+            # Must run AFTER densification: otherwise prune shrinks P and this
+            # iteration's per-step indices (visibility_filter / radii) go stale.
             gaussians.tick_post_densify_maintenance(opt, iteration)
 
             # Needle surgery: structural hard ceiling on the aniso tail.
-            # Placed after all other structure changes in this tick so the
-            # optimizer step below sees consistent tensors. Runs through the
-            # whole schedule — needles regrow from the contrast-compression
-            # pressure, so a densify-phase-only pass would unravel by 30k.
+            # Placed after all other structure changes so the optimizer step
+            # below sees consistent tensors. Runs the whole schedule: needles
+            # regrow from contrast-compression pressure, so a densify-only pass
+            # would unravel by end of training.
             needle_iv = getattr(opt, "needle_split_interval", 0)
             if (needle_iv > 0 and iteration % needle_iv == 0
                     and iteration <= getattr(opt, "needle_split_until_iter", opt.iterations)):
@@ -313,8 +307,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-                # Step the standalone tonemap optimizer (gradients flowed in via
-                # the shared loss.backward()). No-op unless --tonemap_learnable.
+                # Step the standalone tonemap optimizer (gradients flowed in
+                # via the shared loss.backward()). No-op unless --tonemap_learnable.
                 if gaussians.tonemap_optimizer is not None:
                     gaussians.tonemap_optimizer.step()
                     gaussians.tonemap_optimizer.zero_grad(set_to_none = True)
@@ -366,9 +360,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                             float(sum(lpips_vals) / len(lpips_vals)) if lpips_vals else None
                         )
 
-                        # Persist final metrics and surface them on stdout so
-                        # an end-of-run grep can pick up results without
-                        # parsing tqdm output.
+                        # Persist final metrics and print to stdout so an
+                        # end-of-run grep picks up results without parsing tqdm.
                         metrics_path = os.path.join(scene.model_path, "metrics.json")
                         with open(metrics_path, "w") as f:
                             json.dump(metrics, f, indent=2)
@@ -382,7 +375,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                             f"LPIPS {lpips_str} → {metrics_path}"
                         )
 
-# git checkout test
 def prepare_output_and_logger(args, pipe=None):
     if not args.model_path:
         args.model_path = build_timestamped_model_path()
@@ -390,9 +382,9 @@ def prepare_output_and_logger(args, pipe=None):
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
-    # Persist pipeline params alongside model params: the viewer's
-    # --tlight auto reads the tlight_* flags from cfg_args to pick the
-    # matching T_light source, and ModelParams alone doesn't contain them.
+    # Persist pipeline params alongside model params: the viewer's --tlight
+    # auto reads the tlight_* flags from cfg_args to pick the matching T_light
+    # source, and ModelParams alone doesn't contain them.
     merged = dict(vars(args))
     if pipe is not None:
         merged.update(vars(pipe))

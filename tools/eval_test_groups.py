@@ -11,10 +11,9 @@ from utils.image_utils import psnr
 run = sys.argv[1]
 ply = f'{run}/point_cloud/iteration_30000/point_cloud.ply'
 
-# Evaluate with the same T_light source the model was trained with.
-# Current runs persist tlight_voxel in cfg_args (raster is the default);
-# transition-window runs carried tlight_raster=True; pre-raster runs carry
-# neither and are voxel-trained. argv[2] ('raster'|'voxel') overrides.
+# Use the same T_light source the model was trained with (raster is default).
+# Infer from cfg_args: tlight_voxel=True -> voxel, else tlight_raster flag;
+# absent both -> voxel. argv[2] ('raster'|'voxel') overrides.
 use_raster = True
 raster_res = 512
 cfg_path = os.path.join(run, 'cfg_args')

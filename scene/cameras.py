@@ -17,17 +17,11 @@ from PIL import Image
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
-    """Camera with **lazy** image loading.
+    """Camera with lazy image loading.
 
-    Decoding 2989 × 1024² images eagerly costs ~48 GB GPU memory and
-    saturates main RAM at scene-load time. This class keeps only the path,
-    target resolution and a few flags; the actual tensor is decoded on
-    attribute access (`original_image`) and discarded by Python's GC after
-    the consumer drops the reference.
-
-    Each access pays ~5 ms (PNG decode) + ~3 ms (CPU→GPU upload) at 1024².
-    For our train loop that touches each Camera ~once per iter this is
-    well under the rasterizer cost.
+    Stores only path, target resolution and flags; the image tensor is
+    decoded on access (`original_image`) and GC'd when the consumer drops
+    it. Avoids holding all decoded images in GPU memory at scene-load time.
     """
 
     def __init__(self, resolution, R, T, FoVx, FoVy, image_path,
@@ -54,20 +48,20 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        # ---- Lazy-load metadata -------------------------------------------
+        # ---- Lazy-load metadata ----
         self.image_path = image_path
         self.resolution = resolution                # (W, H) target after rescale
         self.is_test_dataset = is_test_dataset
         self.is_test_view = is_test_view
 
-        # Width / height in *target* (post-resize) coords. These are needed
-        # by camera_to_JSON / projection setup before any pixel access.
+        # Width / height in *target* (post-resize) coords. Needed by
+        # camera_to_JSON / projection setup before any pixel access.
         self.image_width = int(resolution[0])
         self.image_height = int(resolution[1])
 
         self.is_nerf_synthetic = is_nerf_synthetic
 
-        # ---- Pose / projection (cheap, do eagerly) ------------------------
+        # ---- Pose / projection (cheap, do eagerly) ----
         self.zfar = 100.0
         self.znear = 0.01
         self.trans = trans
@@ -78,28 +72,22 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
-        # Per-frame sun direction (OpenGL world coords, "pointing toward the sun").
-        # If the dataset didn't supply one, fall back to [0,1,0] so existing
-        # static-sun datasets keep behaving exactly as before.
+        # Per-frame sun direction (OpenGL world coords, points toward the
+        # sun). Falls back to [0,1,0] when the dataset supplies none.
         if sun_dir is None:
             sun_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         self.sun_dir = torch.from_numpy(np.asarray(sun_dir, dtype=np.float32)).to(self.data_device)
 
     # ------------------------------------------------------------------
-    # Lazy-loaded tensor. Same-step accesses share a single decode via a
-    # tiny cache that the training loop is expected to release at end of
-    # iteration (`Camera.release_loaded()`). We do NOT keep the cache
-    # across iterations: that would re-introduce the OOM this whole
-    # refactor was meant to avoid.
+    # Lazy-loaded tensor. Same-step accesses share one decode via a tiny
+    # cache released per iteration (`Camera.release_loaded()`); the cache is
+    # never kept across iterations to avoid OOM.
     #
-    # Decode pipeline (chosen to minimise CPU work and PCIe bandwidth):
-    #   PIL.open + np.array(uint8) at native resolution     — CPU, ~3 ms
-    #   torch.from_numpy(uint8).to(cuda, non_blocking=True) — uint8 upload
-    #                                                         is 4× cheaper
-    #                                                         than fp32
-    #   F.interpolate on GPU to target resolution            — ~0.3 ms
-    #   uint8 → fp32 / 255 on GPU                            — fused
-    # Total ≈ 4–5 ms vs ≈ 10–12 ms for the old PIL.resize + CPU fp32 path.
+    # Decode pipeline (minimises CPU work and PCIe bandwidth):
+    #   PIL.open + np.array(uint8) at native resolution
+    #   torch.from_numpy(uint8).to(cuda)  — uint8 upload, 4× cheaper than fp32
+    #   F.interpolate on GPU to target resolution
+    #   uint8 → fp32 / 255 on GPU (fused)
     # ------------------------------------------------------------------
     def _load_image(self):
         cache = getattr(self, "_loaded_rgb", None)
