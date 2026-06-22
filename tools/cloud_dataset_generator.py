@@ -86,15 +86,21 @@ class CloudDatasetGenerator:
         }
 
         # 截图任务状态（异步串行）
-        self.capture_camera_actor = None
+        self.spawned_cameras = []          # every temp CameraActor we spawn (for final sweep)
         self.capture_task = None
         self.pending_capture_meta = None
         self.capture_queue = []
         self.current_time_idx = -1
         self.tick_handle = None
         self.total_camera_count = 0
-        self.capture_file_timeout_seconds = 6.0
-        self.screenshot_warmed_up = False
+        # Max wait for a HighResShot PNG to land before retrying. Generous so
+        # cold-start frames (shader/PSO compile, volumetric first-frame cost) are
+        # not falsely timed out.
+        self.capture_file_timeout_seconds = 20.0
+        self.max_retries = 10              # timed-out frames requeue (to tail) up to this many times
+        self.expected_frames = 0           # set when the queue is built; checked at completion
+        self.warmup_done = 0               # discarded warmup shots taken so far
+        self.warmup_target = 3             # warm the render pipeline before the first real frame
         self.warmup_image_path = str(Path(self.output_dir) / "_warmup_screenshot.png")
 
     def setup_output_directories(self):
@@ -350,12 +356,14 @@ class CloudDatasetGenerator:
             cam_idx: 相机索引
             time_idx: 时间帧索引
         """
-        # 每张图创建一个临时相机，待截图任务完成后销毁
+        # 每张图创建一个临时相机，截图任务完成后销毁；同时登记到 spawned_cameras
+        # 供结束时兜底清扫（防止超时路径销毁失败留下的残留相机）。
         camera = self.editor_level_lib.spawn_actor_from_class(
             unreal.CameraActor,
             camera_position,
             camera_rotation
         )
+        self.spawned_cameras.append(camera)
 
         camera_component = camera.get_editor_property("camera_component")
         if camera_component:
@@ -405,11 +413,33 @@ class CloudDatasetGenerator:
             0.1
         )
 
-    def cleanup_capture_camera(self):
-        """清理复用的临时相机"""
-        if self.capture_camera_actor:
-            self.editor_actor_subsystem.destroy_actor(self.capture_camera_actor)
-            self.capture_camera_actor = None
+    def _destroy_camera(self, camera):
+        """Destroy one temp camera. If destroy fails (its async screenshot task
+        may still hold it, e.g. on the timeout path), keep it tracked so the
+        final sweep retries once the task has released it."""
+        if camera is None:
+            return
+        ok = False
+        try:
+            ok = bool(self.editor_actor_subsystem.destroy_actor(camera))
+        except Exception:
+            ok = False
+        if ok and camera in self.spawned_cameras:
+            self.spawned_cameras.remove(camera)
+
+    def cleanup_all_cameras(self):
+        """Final sweep: destroy every temp camera still alive. Runs at completion
+        when no screenshot task is in flight, so destroys that failed mid-task
+        (timeout path) succeed here -> no CameraActor remnants left in the scene."""
+        survivors = list(self.spawned_cameras)
+        for cam in survivors:
+            try:
+                self.editor_actor_subsystem.destroy_actor(cam)
+            except Exception:
+                pass
+        self.spawned_cameras = []
+        if survivors:
+            unreal.log(f"[capture] 清理残留临时相机 {len(survivors)} 个")
 
     def _is_current_task_done(self):
         if not self.capture_task:
@@ -431,10 +461,7 @@ class CloudDatasetGenerator:
     def _clear_pending_capture(self):
         """清理当前待处理截图状态"""
         if self.pending_capture_meta and self.pending_capture_meta.get("camera"):
-            try:
-                self.editor_actor_subsystem.destroy_actor(self.pending_capture_meta["camera"])
-            except Exception:
-                pass
+            self._destroy_camera(self.pending_capture_meta["camera"])
 
         self.capture_task = None
         self.pending_capture_meta = None
@@ -481,12 +508,22 @@ class CloudDatasetGenerator:
                 if elapsed < self.capture_file_timeout_seconds:
                     return
 
+                if meta.get("is_warmup", False):
+                    # Warmup timed out (coldest first frame). Drop it — do NOT
+                    # requeue as a real frame (would duplicate the held job).
+                    unreal.log_warning("预热截图超时，跳过本次预热")
+                    self._clear_pending_capture()
+                    return
+
                 retry = int(meta.get("retry", 0))
-                if retry < 3:
+                if retry < self.max_retries:
+                    # Requeue at the TAIL (not the head): retry after the pipeline
+                    # is warm, instead of burning attempts while still cold. This
+                    # is what guarantees the full set is eventually captured.
                     unreal.log_warning(
-                        f"截图等待超时，重试: cam{meta['cam_idx']:02d}, frame {meta['time_idx']:04d}, retry={retry + 1}"
+                        f"截图超时，排到队尾重试: cam{meta['cam_idx']:02d}, frame {meta['time_idx']:04d}, retry={retry + 1}/{self.max_retries}"
                     )
-                    self.capture_queue.insert(0, {
+                    self.capture_queue.append({
                         "position": meta["camera_position"],
                         "rotation": meta["camera_rotation"],
                         "cam_idx": meta["cam_idx"],
@@ -495,7 +532,7 @@ class CloudDatasetGenerator:
                     })
                 else:
                     unreal.log_error(
-                        f"截图多次重试仍未落盘，跳过: cam{meta['cam_idx']:02d}, frame {meta['time_idx']:04d}"
+                        f"截图重试 {self.max_retries} 次仍未落盘，放弃: cam{meta['cam_idx']:02d}, frame {meta['time_idx']:04d}"
                     )
 
                 self._clear_pending_capture()
@@ -504,10 +541,15 @@ class CloudDatasetGenerator:
         # 队列为空：结束
         if not self.capture_queue:
             self.save_transforms_json()
+            self.cleanup_all_cameras()        # 兜底清扫所有残留临时相机
             self.stop_capture_loop()
+            n = len(self.transforms_data['frames'])
             unreal.log("=" * 60)
             unreal.log("数据集生成完成!")
-            unreal.log(f"本次会话共写入 {len(self.transforms_data['frames'])} 帧位姿")
+            unreal.log(f"本次会话共写入 {n} 帧位姿"
+                       + (f" / 目标 {self.expected_frames}" if self.expected_frames else ""))
+            if self.expected_frames and n < self.expected_frames:
+                unreal.log_error(f"⚠ 缺 {self.expected_frames - n} 帧未采到(见上方 log_error)")
             unreal.log(f"输出目录: {self.output_dir}")
             unreal.log("=" * 60)
             return
@@ -526,9 +568,10 @@ class CloudDatasetGenerator:
                 unreal.log(f"\n处理时间帧 {self.current_time_idx + 1}/{self.time_frames} (Hour: {current_hour:.2f})")
                 self.set_time_of_day(current_hour)
 
-        # 首张截图先做一次预热，避免首帧相机绑定滞后导致的错位
-        if not self.screenshot_warmed_up:
-            self.screenshot_warmed_up = True
+        # 首批截图先做几次预热（丢弃），让渲染管线热起来再采真帧——冷启动帧
+        # 渲染最慢，是超时丢帧的主因。
+        if self.warmup_done < self.warmup_target:
+            self.warmup_done += 1
             self.capture_queue.insert(0, job)
             self.capture_camera_view(
                 job["position"],
@@ -619,7 +662,8 @@ class CloudDatasetGenerator:
         # 3. 构建任务队列（按 time_idx -> cam_idx）
         self.capture_queue = []
         self.current_time_idx = -1
-        self.screenshot_warmed_up = False
+        self.warmup_done = 0
+        self.spawned_cameras = []
         for time_idx in range(self.time_frames):
             for position, rotation, cam_idx in camera_positions:
                 self.capture_queue.append({
@@ -629,6 +673,7 @@ class CloudDatasetGenerator:
                     "time_idx": time_idx,
                     "retry": 0,
                 })
+        self.expected_frames = len(self.capture_queue)
 
         # 4. 启动异步串行截图
         self.start_capture_loop()
@@ -676,7 +721,8 @@ class CloudDatasetGenerator:
         stride = max(1, int(camera_stride))
         self.capture_queue = []
         self.current_time_idx = -1
-        self.screenshot_warmed_up = False
+        self.warmup_done = 0
+        self.spawned_cameras = []
         self.sun_override_by_time = {}
 
         n_frames = 0
@@ -695,6 +741,7 @@ class CloudDatasetGenerator:
                 n_frames += 1
 
         self.transforms_data["frames"] = []
+        self.expected_frames = n_frames
         unreal.log(f"均匀队列: {len(suns)} 太阳 × ~{self.total_camera_count // stride} 相机 = {n_frames} 张")
         self.start_capture_loop()
         unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
