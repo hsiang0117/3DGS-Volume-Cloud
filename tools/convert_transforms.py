@@ -100,7 +100,9 @@ def convert_sun_direction(sun_dir_ue):
 def convert_transforms(input_path, output_path=None):
     input_path = Path(input_path)
     if output_path is None:
-        output_path = input_path.parent / "transforms_opengl.json"
+        # Default straight to the training file the loader/split read, so the
+        # pipeline is just: generator -> convert -> split (no rename step).
+        output_path = input_path.parent / "transforms_train.json"
     else:
         output_path = Path(output_path)
 
@@ -123,10 +125,25 @@ def convert_transforms(input_path, output_path=None):
     print(f"输入: {input_path}")
     print(f"输出: {output_path}")
 
+    # Writing a fresh FULL train set invalidates any prior split: remove the
+    # stale backup + test split so the next split_test_set.py re-derives from
+    # this new full set (otherwise its idempotent re-split clings to the old
+    # transforms_train_full.json and ignores this data).
+    if output_path.name == "transforms_train.json":
+        for stale in ("transforms_train_full.json", "transforms_test.json"):
+            p = output_path.parent / stale
+            if p.exists():
+                try:
+                    p.unlink()
+                    print(f"已清除过期切分: {p}")
+                except OSError as e:
+                    print(f"警告: 无法删除 {p}: {e}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("用法: python convert_transforms.py <transforms.json> [output.json]")
+        print("  缺省输出到同目录 transforms_train.json（直接供 split_test_set.py）")
         sys.exit(1)
 
     in_path = sys.argv[1]
