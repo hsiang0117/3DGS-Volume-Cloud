@@ -13,7 +13,6 @@ import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer, rasterize_lightpass
 from scene.gaussian_model import GaussianModel
-from utils.sh_utils import eval_sh
 from utils.general_utils import build_rotation
 from utils.graphics_utils import getProjectionMatrix
 

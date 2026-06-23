@@ -10,7 +10,6 @@
 #
 
 from argparse import ArgumentParser, Namespace, BooleanOptionalAction
-import sys
 import os
 
 class GroupParams:
@@ -202,25 +201,3 @@ class OptimizationParams(ParamGroup):
         self.needle_split_ratio = 30.0
         self.needle_split_until_iter = 29_000   # stop before final settle/eval
         super().__init__(parser, "Optimization Parameters")
-
-def get_combined_args(parser : ArgumentParser):
-    cmdlne_string = sys.argv[1:]
-    cfgfile_string = "Namespace()"
-    args_cmdline = parser.parse_args(cmdlne_string)
-
-    try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
-        with open(cfgfilepath) as cfg_file:
-            print("Config file found: {}".format(cfgfilepath))
-            cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
-        pass
-    args_cfgfile = eval(cfgfile_string)
-
-    merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
-            merged_dict[k] = v
-    return Namespace(**merged_dict)

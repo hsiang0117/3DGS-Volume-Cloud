@@ -68,12 +68,6 @@ GL_NAMES = ['deep', 'dark', 'mid', 'bright']
 res_by_tl = [[0.0, 0] for _ in TL_NAMES]
 xtab = [[[0.0, 0] for _ in TL_NAMES] for _ in GL_NAMES]
 
-def bucket(v, edges):
-    for i in range(len(edges) - 1):
-        if edges[i] <= v < edges[i + 1]:
-            return i
-    return len(edges) - 2
-
 with torch.no_grad():
     for c in cams:
         pkg = render(c, g, pipe, bg)

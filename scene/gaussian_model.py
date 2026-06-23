@@ -18,7 +18,6 @@ import os
 import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 
@@ -257,20 +256,6 @@ class GaussianModel:
         return (x * (a * x + b)) / (x * (c * x + d) + e)
 
     @property
-    def get_opacity(self):
-        """
-        Compatibility proxy for pruning / logging: interpret opacity as the
-        analytic center-line transmittance of a normalized Gaussian using an
-        isotropic proxy based on the geometric mean scale.
-        """
-        if self._xyz.numel() == 0:
-            return torch.empty(0, device="cuda")
-        beta_peak = self.get_extinction
-        gscale = torch.pow(torch.prod(self.get_scaling, dim=1, keepdim=True) + 1e-8, 1.0 / 3.0)
-        tau_center = beta_peak * (2.0 * math.pi) ** 0.5 * gscale
-        return 1.0 - torch.exp(-tau_center)
-
-    @property
     def get_sun_dir(self):
         return torch.tensor([0.0, 1.0, 0.0], device="cuda", dtype=self._xyz.dtype)
 
@@ -283,7 +268,6 @@ class GaussianModel:
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        actual_scales = torch.exp(scales)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
