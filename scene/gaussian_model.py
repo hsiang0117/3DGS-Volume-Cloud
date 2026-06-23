@@ -1105,14 +1105,21 @@ class GaussianModel:
         return n
 
     def tick_post_densify_maintenance(self, opt, iteration):
-        """Iteration-driven housekeeping that must keep running even after
-        densify_until_iter:
+        """Per-iteration housekeeping during the densify window (resurrect + prune +
+        accumulator reset). Despite the name, this runs ONLY while
+        iteration < densify_until_iter and is a no-op afterwards — the early return
+        below is intentional:
 
-          - β_peak resurrect of bottom `opt.resurrect_fraction` Gaussians
-            every `opt.resurrect_interval` iterations.
-          - Periodic reset of the contribution accumulators so the running
-            mean tracks the current model state, not stale early-training
-            statistics. Reset every `opt.contribution_reset_interval` iters.
+          Running resurrect/prune during the post-densify settle phase forms a net-
+          destruction loop (resurrect→prune) that cost -17% points and -0.7 dB in
+          testing, so maintenance is gated off once densify stops. Popping in the
+          settle phase is held by the full-schedule aniso regulariser + needle
+          surgery, not by a geometric prune.
+
+          - β_peak resurrect of bottom `opt.resurrect_fraction` Gaussians every
+            `opt.resurrect_interval` iterations.
+          - Periodic reset of the contribution accumulators so the running mean
+            tracks current model state, every `opt.contribution_reset_interval` iters.
         """
         if iteration <= 0 or iteration >= getattr(opt, "densify_until_iter", float("inf")):
             return
@@ -1120,18 +1127,15 @@ class GaussianModel:
         # `contribution_denom >= prune_min_visible_frames` as a gate, so zeroing
         # the accumulator first would mask every point and nothing would ever be
         # reclaimed (n_points freezes + aniso p99 grows unbounded).
-        # 1. Resurrect schedule (independent of densify_until_iter)
+        # 1. Resurrect schedule
         if (
             opt.resurrect_interval > 0
             and iteration % opt.resurrect_interval == 0
         ):
             self._resurrect_low_contribution(opt.resurrect_fraction)
 
-        # 2. Contribution prune post-densify. Without this, low-contribution
-        # and dead points accumulating in the second half of training never
-        # get reclaimed (densify_until_iter has stopped the regular prune
-        # path). Popping is handled by the full-schedule aniso regulariser,
-        # not by a geometric prune.
+        # 2. Contribution prune: reclaim low-contribution / dead points that
+        # accumulate within the densify window between the regular prune passes.
         prune_iv = getattr(opt, "post_densify_prune_interval", 0)
         if prune_iv > 0 and iteration % prune_iv == 0:
             self._prune_by_contribution(opt)

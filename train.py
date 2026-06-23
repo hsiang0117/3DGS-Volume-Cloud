@@ -39,7 +39,7 @@ except:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset, pipe)
+    tb_writer = prepare_output_and_logger(dataset, pipe, opt)
     gaussians = GaussianModel()
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -205,9 +205,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     gaussians.physical_densify_and_prune(opt, iteration, radii, scene.cameras_extent)
 
-            # Post-densify maintenance: resurrect + prune + accumulator reset.
-            # Must run AFTER densification: otherwise prune shrinks P and this
-            # iteration's per-step indices (visibility_filter / radii) go stale.
+            # Densify-window maintenance: resurrect + prune + accumulator reset.
+            # Gated to the densify phase (no-op after densify_until_iter — see the
+            # method docstring for why). Must run AFTER densification: otherwise
+            # prune shrinks P and this iteration's per-step indices
+            # (visibility_filter / radii) go stale.
             gaussians.tick_post_densify_maintenance(opt, iteration)
 
             # Needle surgery: structural hard ceiling on the aniso tail.
@@ -284,16 +286,27 @@ def _log_env_params(gaussians, tag=""):
 def _stage2_eval(scene, gaussians, pipe, background, source_path, env_on=True,
                  with_lpips=False, desc="eval"):
     """Eval the test split; split PSNR into held-out-sun vs seen-sun (relighting gap).
-    Temporarily forces pipe.env_lighting=env_on so the env-off baseline can be measured."""
-    HELDOUT = {7, 22, 37, 52}
+    Temporarily forces pipe.env_lighting=env_on so the env-off baseline can be measured.
+    Held-out suns are inferred from the split (time_index in test but absent from
+    train), falling back to {7,22,37,52} if the train json is missing."""
     time_by_key = {}
+    test_suns = set()
     tj_path = os.path.join(source_path, "transforms_test.json")
     if os.path.exists(tj_path):
         with open(tj_path) as f:
             tj = json.load(f)
         for fr in tj.get("frames", []):
             parts = fr["file_path"].replace("\\", "/").split("/")
-            time_by_key[(parts[0], os.path.splitext(parts[-1])[0])] = int(fr.get("time_index", -1))
+            ti = int(fr.get("time_index", -1))
+            time_by_key[(parts[0], os.path.splitext(parts[-1])[0])] = ti
+            test_suns.add(ti)
+    train_path = os.path.join(source_path, "transforms_train.json")
+    if os.path.exists(train_path):
+        with open(train_path) as f:
+            train_suns = {int(fr.get("time_index", -1)) for fr in json.load(f).get("frames", [])}
+        HELDOUT = test_suns - train_suns
+    else:
+        HELDOUT = {7, 22, 37, 52}
     test_cams = scene.getTestCameras()
     if not test_cams or len(test_cams) == 0:
         return None
@@ -341,7 +354,8 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
     stage1_ply = _resolve_stage1_ply(stage1_model)
     print(f"[stage2] freezing Stage-1 model: {stage1_ply}")
 
-    tb_writer = prepare_output_and_logger(dataset, pipe)
+    tb_writer = prepare_output_and_logger(dataset, pipe, opt,
+                                          extra={"stage2": True, "stage1_model": stage1_model})
 
     gaussians = GaussianModel()
     gaussians.load_ply(stage1_ply)
@@ -429,19 +443,24 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
             print(f"[stage2 Final] env-off PSNR {off['psnr']:.3f}  →  env contributes "
                   f"{contrib:+.3f} dB (env-on minus env-off; ~0 ⇒ env-on≈env-off / atmosphere effect tiny)")
 
-def prepare_output_and_logger(args, pipe=None):
+def prepare_output_and_logger(args, pipe=None, opt=None, extra=None):
     if not args.model_path:
         args.model_path = build_timestamped_model_path()
 
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
-    # Persist pipeline params alongside model params: the viewer's --tlight
-    # auto reads the tlight_* flags from cfg_args to pick the matching T_light
-    # source, and ModelParams alone doesn't contain them.
+    # Persist all params alongside the model so a run is reproducible and the
+    # viewer can auto-match settings: ModelParams + PipelineParams (viewer's
+    # --tlight/tonemap/env auto reads these) + OptimizationParams + any extras
+    # (e.g. stage2 / stage1_model).
     merged = dict(vars(args))
     if pipe is not None:
         merged.update(vars(pipe))
+    if opt is not None:
+        merged.update(vars(opt))
+    if extra is not None:
+        merged.update(extra)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**merged)))
 

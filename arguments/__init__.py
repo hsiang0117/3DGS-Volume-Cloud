@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, BooleanOptionalAction
 import sys
 import os
 
@@ -25,7 +25,7 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            value = value if not fill_none else None
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
@@ -33,7 +33,11 @@ class ParamGroup:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    # default=True bools need --no-<flag> to be disable-able from the
+                    # CLI; store_true would pin them True forever. BooleanOptionalAction
+                    # (py3.9+) generates both --<flag> and --no-<flag>.
+                    action = BooleanOptionalAction if value else "store_true"
+                    group.add_argument("--" + key, default=value, action=action)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -52,9 +56,9 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         # transforms_test.json holds a real held-out split (tools/split_test_set.py).
-        # Must stay True: eval=False makes the Blender loader merge test frames back
-        # into training, leaking the split and inflating metrics. store_true can't be
-        # disabled from the CLI — flip here if needed.
+        # Keep True normally: eval=False makes the Blender loader merge test frames
+        # back into training, leaking the split and inflating metrics. Disable from
+        # the CLI with --no-eval if you really want full-data training.
         self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -86,8 +90,8 @@ class PipelineParams(ParamGroup):
         # When on, render() lifts the per-Gaussian radiance clamp (HDR) and applies
         # the fixed Narkowicz ACES approximation to the final image, so loss and
         # metrics compare in the GT's own space. Default True (current baseline output
-        # space). store_true can't be turned off from the CLI — flip here for a
-        # truly-linear GT (then tonemap must be OFF; see tonemap_learnable note).
+        # space). Disable from the CLI with --no-tonemap_aces for a truly-linear GT
+        # (then tonemap must be OFF; see tonemap_learnable note).
         self.tonemap_aces = True
         # Learnable output tonemap (opt-in alternative to fixed ACES): same Narkowicz
         # rational form but its 4 coeffs (a,b,c,d) are optimised (e pinned), so the
