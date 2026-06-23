@@ -21,12 +21,121 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
 
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-except:
-    pass
+
+class EnvNet(nn.Module):
+    """Stage-2 global environment-lighting net: sun_dir (3,) -> (T_sun RGB<=1, E_lm SH).
+
+    GLOBAL — one sky for the whole scene, a function of sun direction ONLY. It adds
+    NO per-Gaussian colour DOF (per-Gaussian colour stays in the frozen albedo ρ),
+    so the env term cannot regress the model to vanilla 3DGS / break relighting.
+
+    T_sun is an ANALYTIC atmospheric transmittance with just 3 learnable params —
+    the per-channel zenith optical depths τ=(τ_R,τ_G,τ_B):
+
+        T_sun(sun_dir) = exp( − m(θ) · softplus(raw_tau) ),   θ = sun zenith angle
+
+    m(θ) is the Kasten-Young air mass (a fixed geometric function, not learned);
+    softplus keeps τ≥0 so T_sun∈(0,1]. Reddening (τ_B>τ_G>τ_R, Rayleigh ∝λ^-4) and
+    low-sun dimming (m grows toward the horizon) fall out automatically; azimuth
+    independence is exact (depends on θ only) — both confirmed empirically. raw_tau
+    is initialised to a near-neutral, slightly-Rayleigh τ so Stage 2 starts ≈ the
+    frozen Stage-1 sun render and learns the atmosphere on top.
+
+    E_lm (additive sky in-scatter SH) keeps a small MLP; in a sun-dominated scene it
+    learns ≈0 (sky fill negligible) and the env reduces to T_sun, but the term stays
+    for generality (sky-dominated scenes where fill matters)."""
+    # Near-neutral zenith optical depth init (R,G,B): τ_B>τ_R gives a faint Rayleigh
+    # tilt; small so T_sun(zenith)≈exp(-τ)≈[0.98,0.96,0.93], ~Stage-1 neutral.
+    TAU_INIT = (0.02, 0.04, 0.07)
+
+    @staticmethod
+    def _softplus_inverse(y, eps=1e-8):
+        y = torch.clamp(torch.as_tensor(y, dtype=torch.float), min=eps)
+        return torch.log(torch.expm1(y) + eps)
+
+    @staticmethod
+    def _air_mass(sun_dir):
+        """Kasten-Young (1989) relative air mass from a sun direction (up=+Y).
+        m(θ)=1/(cosθ + 0.50572 (96.07995-θ_deg)^-1.6364); finite at the horizon.
+        Only valid for the upper hemisphere; cosθ is clamped to ~horizon so the
+        formula never goes negative/explosive — below-horizon dimming is handled
+        separately by the horizon gate in forward()."""
+        cos_theta = torch.clamp(sun_dir.reshape(3)[1], 0.0, 1.0)    # up = +Y, upper hemi only
+        theta_deg = torch.rad2deg(torch.arccos(cos_theta))
+        denom = cos_theta + 0.50572 * torch.clamp(96.07995 - theta_deg, min=1e-3) ** (-1.6364)
+        return 1.0 / torch.clamp(denom, min=1e-3)
+
+    # Horizon softness (in cosθ units) for the below-horizon sun gate: T_sun fades to 0
+    # over roughly cosθ ∈ [0, HORIZON_SOFT] so the sun "sets" smoothly instead of
+    # snapping off. ~3° band.
+    HORIZON_SOFT = 0.05
+
+    def __init__(self, n_sh, hidden=64):
+        super().__init__()
+        self.n_sh = n_sh
+        # T_sun: 3 learnable per-channel zenith optical depths (raw -> softplus -> τ≥0).
+        self.raw_tau = nn.Parameter(self._softplus_inverse(self.TAU_INIT))
+        # E_lm: small MLP of sun_dir (additive sky in-scatter), zero-init -> neutral.
+        self.backbone = nn.Sequential(
+            nn.Linear(3, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU())
+        self.e_head = nn.Linear(hidden, n_sh * 3)   # -> E_lm (n_sh,3) sky radiance SH
+        nn.init.zeros_(self.e_head.weight); nn.init.zeros_(self.e_head.bias)
+
+    def forward(self, sun_dir):
+        tau = torch.nn.functional.softplus(self.raw_tau)            # (3,) ≥0
+        m = self._air_mass(sun_dir)                                 # scalar (upper hemi)
+        t_sun = torch.exp(-m * tau)                                 # (3,) ∈(0,1]
+        # Below-horizon gate: the sun below the horizon (cosθ≤0) means no direct
+        # sunlight (occluded by the planet / extreme atmospheric path), so T_sun
+        # fades to 0 over a soft band. Smooth (smoothstep) so relighting the sun
+        # past the horizon "sets" continuously instead of snapping to white.
+        cos_theta = sun_dir.reshape(3)[1]
+        t = torch.clamp(cos_theta / self.HORIZON_SOFT, 0.0, 1.0)
+        gate = t * t * (3.0 - 2.0 * t)                              # smoothstep(0,HORIZON_SOFT)
+        t_sun = t_sun * gate
+        h = self.backbone(sun_dir.reshape(1, 3))
+        e_lm = self.e_head(h).reshape(self.n_sh, 3)
+        return t_sun, e_lm
+
+    @property
+    def tau(self):
+        return torch.nn.functional.softplus(self.raw_tau)
+
+
+def _fibonacci_hemisphere(n):
+    """n directions ~uniform over the upper hemisphere (world up = +Y, OpenGL)."""
+    ga = math.pi * (3.0 - math.sqrt(5.0))
+    pts = []
+    for i in range(n):
+        y = (i + 0.5) / n
+        r = math.sqrt(max(0.0, 1.0 - y * y))
+        phi = i * ga
+        pts.append([r * math.cos(phi), y, r * math.sin(phi)])
+    return torch.tensor(pts, dtype=torch.float, device="cuda")
+
+
+def _sh_basis_deg2(dirs):
+    """Real orthonormal SH basis up to l=2 (9 coeffs) at unit dirs (M,3) -> (M,9).
+    Matches utils.sh_utils.eval_sh sign/constant convention so the V_lm projection
+    and any reconstruction stay consistent."""
+    from utils.sh_utils import C0, C1, C2
+    x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+    out = torch.empty((dirs.shape[0], 9), device=dirs.device, dtype=dirs.dtype)
+    out[:, 0] = C0
+    out[:, 1] = -C1 * y
+    out[:, 2] = C1 * z
+    out[:, 3] = -C1 * x
+    out[:, 4] = C2[0] * xy
+    out[:, 5] = C2[1] * yz
+    out[:, 6] = C2[2] * (2.0 * zz - xx - yy)
+    out[:, 7] = C2[3] * xz
+    out[:, 8] = C2[4] * (xx - yy)
+    return out
+
 
 class GaussianModel:
 
@@ -46,16 +155,8 @@ class GaussianModel:
         return torch.log(torch.expm1(y) + eps)
 
     def setup_functions(self):
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-            actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
-            return symm
-        
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-
-        self.covariance_activation = build_covariance_from_scaling_rotation
 
         self.rotation_activation = torch.nn.functional.normalize
         self.extinction_activation = lambda x: torch.clamp(torch.nn.functional.softplus(x), max=5.0)
@@ -72,8 +173,7 @@ class GaussianModel:
         self.octave_weight_activation = torch.nn.functional.softplus
 
 
-    def __init__(self, optimizer_type="default"):
-        self.optimizer_type = optimizer_type
+    def __init__(self):
         self._xyz = torch.empty(0)
         # Physical appearance parameters (raw, pre-activation)
         # `_extinction` stores the peak extinction coefficient β_peak (intensive, 1/length),
@@ -94,6 +194,13 @@ class GaussianModel:
         self.denom = torch.empty(0)
         self.optimizer = None
         self.tonemap_optimizer = None
+        # --- Stage 2 environment lighting (frozen geometry; see EnvNet) ---
+        # _sky_transfer: (P, n_sh) precomputed per-Gaussian sky-visibility SH transfer
+        # V_lm. A BUFFER, NOT an nn.Parameter (geometry-derived, achromatic constant).
+        self._sky_transfer = torch.empty(0)
+        self.env_net = None                 # global EnvNet: sun_dir -> (T_sun, E_lm)
+        self.env_optimizer = None
+        self.env_sh_order = 2
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -163,9 +270,6 @@ class GaussianModel:
         tau_center = beta_peak * (2.0 * math.pi) ** 0.5 * gscale
         return 1.0 - torch.exp(-tau_center)
 
-    def get_covariance(self, scaling_modifier = 1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
-
     @property
     def get_sun_dir(self):
         return torch.tensor([0.0, 1.0, 0.0], device="cuda", dtype=self._xyz.dtype)
@@ -234,14 +338,7 @@ class GaussianModel:
 
         ]
 
-        if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        elif self.optimizer_type == "sparse_adam":
-            try:
-                self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
-                # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -307,6 +404,73 @@ class GaussianModel:
         lr = self.tonemap_scheduler_args(iteration)
         for param_group in self.tonemap_optimizer.param_groups:
             param_group['lr'] = lr
+
+    # ---------------- Stage 2: environment lighting ----------------
+    def setup_env(self, training_args, sh_order=None):
+        """Build the global EnvNet + its OWN Adam (isolated from densify/prune, same
+        reason as the tonemap optimizer). Skips creation if env_net is already loaded
+        (load_ply). Per-Gaussian params are expected to be frozen by the caller."""
+        if sh_order is None:
+            sh_order = getattr(self, "env_sh_order", 2)
+        assert sh_order == 2, "only SH2 env transfer supported"
+        n_sh = (sh_order + 1) ** 2
+        self.env_sh_order = sh_order
+        if self.env_net is None:
+            self.env_net = EnvNet(n_sh).cuda()
+        env_lr = getattr(training_args, "env_lr", 1e-3)
+        self.env_optimizer = torch.optim.Adam(self.env_net.parameters(), lr=env_lr, eps=1e-15)
+        self.env_scheduler_args = get_expon_lr_func(
+            lr_init=env_lr, lr_final=env_lr * 0.1, max_steps=training_args.iterations)
+
+    def update_env_learning_rate(self, iteration):
+        if self.env_optimizer is None:
+            return
+        lr = self.env_scheduler_args(iteration)
+        for param_group in self.env_optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def precompute_sky_transfer(self, n_dirs=48, sh_order=2):
+        """Precompute the per-Gaussian sky-visibility transfer V_lm (SH2) over the
+        upper hemisphere, reusing the light-space rasterizer for per-Gaussian
+        transmittance toward each sky direction. Achromatic, geometry-only; run once
+        on the frozen Stage-1 model. Stored in _sky_transfer (P, n_sh)."""
+        from gaussian_renderer import compute_T_light_raster, normalized_gaussian_line_integral
+        assert sh_order == 2, "only SH2 env transfer supported"
+        self.env_sh_order = sh_order
+        dirs = _fibonacci_hemisphere(n_dirs)          # (N,3) world, upper hemisphere (+Y)
+        Y = _sh_basis_deg2(dirs)                      # (N,9)
+        means3D = self.get_xyz.detach()
+        s = self.get_scaling.detach()
+        beta_peak = self.get_extinction.detach()
+        rotation = self.get_rotation                  # normalized quats (compute_T_light_raster detaches)
+        R_t = build_rotation(rotation).transpose(1, 2)
+        P = means3D.shape[0]
+        w = (2.0 * math.pi) / n_dirs                  # hemisphere Monte-Carlo solid-angle weight
+        V = torch.zeros((P, (sh_order + 1) ** 2), device="cuda")
+        with torch.no_grad():
+            for j in range(n_dirs):
+                d = dirs[j]
+                l_local = torch.matmul(R_t, d.view(3, 1)).squeeze(-1)            # (P,3)
+                line_int = normalized_gaussian_line_integral(s, l_local)         # (P,1)
+                geom = ((2.0 * math.pi) ** 1.5) * torch.prod(s, dim=1, keepdim=True) * line_int
+                tau = beta_peak * geom                                           # (P,1)
+                T_sky = compute_T_light_raster(
+                    means3D, tau, s, rotation, d).squeeze(-1)                   # (P,)
+                V += (T_sky.unsqueeze(1) * Y[j].unsqueeze(0)) * w
+        self._sky_transfer = V
+        print(f"[gaussian_model] precomputed sky transfer V_lm {tuple(V.shape)} over {n_dirs} dirs")
+
+    def apply_env(self, sun_dir):
+        """Return (T_sun (3,), fill (P,3)) for the current sun direction, or (None,
+        None) if env lighting is not active. fill = ρ · (V_lm · E_lm); T_sun is the
+        global RGB sun transmittance. Differentiable in the EnvNet params only
+        (V_lm and ρ are frozen)."""
+        if self.env_net is None or self._sky_transfer.numel() == 0:
+            return None, None
+        sun_dir = sun_dir.to(self._sky_transfer.dtype)
+        t_sun, e_lm = self.env_net(sun_dir)                 # (3,), (n_sh,3)
+        fill = self.get_albedo * (self._sky_transfer @ e_lm)  # (P,n_sh)@(n_sh,3) -> (P,3)
+        return t_sun, fill
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -374,6 +538,17 @@ class GaussianModel:
             with open(os.path.join(os.path.dirname(path), "tonemap.json"), "w") as f:
                 json.dump(sidecar, f, indent=2)
 
+        # Stage-2 environment lighting: the per-Gaussian transfer V_lm and the global
+        # EnvNet weights are not per-vertex PLY attributes -> write sidecars next to
+        # the PLY (only when present). load_ply / viewer read them back.
+        if self.env_net is not None and self._sky_transfer.numel() > 0:
+            d = os.path.dirname(path)
+            np.save(os.path.join(d, "sky_transfer.npy"), self._sky_transfer.detach().cpu().numpy())
+            torch.save(self.env_net.state_dict(), os.path.join(d, "env_net.pt"))
+            with open(os.path.join(d, "env.json"), "w") as f:
+                json.dump({"version": 1, "sh_order": self.env_sh_order,
+                           "n_sh": (self.env_sh_order + 1) ** 2}, f, indent=2)
+
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
@@ -439,6 +614,30 @@ class GaussianModel:
                 self._tonemap = torch.empty(0)
         else:
             self._tonemap = torch.empty(0)
+
+        # Restore Stage-2 environment lighting (transfer V_lm + EnvNet) if present.
+        env_path = os.path.join(os.path.dirname(path), "env.json")
+        st_path = os.path.join(os.path.dirname(path), "sky_transfer.npy")
+        net_path = os.path.join(os.path.dirname(path), "env_net.pt")
+        if os.path.exists(env_path) and os.path.exists(st_path) and os.path.exists(net_path):
+            try:
+                with open(env_path) as f:
+                    meta = json.load(f)
+                self.env_sh_order = int(meta.get("sh_order", 2))
+                n_sh = (self.env_sh_order + 1) ** 2
+                st = np.load(st_path)
+                self._sky_transfer = torch.tensor(st, dtype=torch.float, device="cuda")
+                self.env_net = EnvNet(n_sh).cuda()
+                self.env_net.load_state_dict(torch.load(net_path, map_location="cuda"))
+                print(f"[gaussian_model] loaded env lighting (V_lm {tuple(self._sky_transfer.shape)}, "
+                      f"SH{self.env_sh_order}) from {os.path.dirname(path)}")
+            except Exception as ex:
+                print(f"[gaussian_model] failed to read env sidecars: {ex}; env disabled.")
+                self._sky_transfer = torch.empty(0)
+                self.env_net = None
+        else:
+            self._sky_transfer = torch.empty(0)
+            self.env_net = None
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

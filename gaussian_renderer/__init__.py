@@ -35,7 +35,7 @@ def normalized_gaussian_line_integral(scales, dirs_local):
     return 1.0 / (denom + 1e-8)
 
 
-def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
+def compute_T_light_voxel(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
     """
     Approximate per-Gaussian sun transmittance via voxel grid (point-scatter).
 
@@ -149,7 +149,7 @@ def compute_T_light(means3D, tau_per_gauss, scales, sun_dir, grid_res=128):
 
 
 def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
-                           L_dir, scaling_modifier=1.0, image_size=512):
+                           L_dir, image_size=512):
     """
     Per-Gaussian sun transmittance via a light-space rasterization pass.
 
@@ -233,7 +233,7 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
             tanfovx=tanfov,
             tanfovy=tanfov,
             bg=torch.zeros(3, device=device, dtype=dtype),
-            scale_modifier=scaling_modifier,
+            scale_modifier=1.0,
             viewmatrix=world_view_T,
             projmatrix=full_proj_T,
             sh_degree=0,
@@ -269,7 +269,7 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
     return T_light.unsqueeze(-1)
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, precomputed_T_light=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, override_color = None, precomputed_T_light=None):
     """
     Render the scene.
 
@@ -302,14 +302,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
-        scale_modifier=scaling_modifier,
+        scale_modifier=1.0,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
         sh_degree=0,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug,
-        antialiasing=pipe.antialiasing,
+        debug=False,
+        antialiasing=False,
         k_sigma=getattr(pipe, "k_sigma", 0.0),
     )
 
@@ -320,17 +320,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Peak extinction coefficient β_peak (intensive, 1/length). Mass derived below.
     beta_peak = pc.get_extinction  # (P,1)
 
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
+    # Covariance is computed from scaling / rotation by the rasterizer.
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
     cov3D_precomp = None
-
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
 
     # --- Physical cloud shading ---
     # Sun irradiance: 4π compensates the 1/(4π) in the normalized HG phase function,
@@ -361,7 +354,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     v_local = torch.bmm(R_t, v.unsqueeze(-1)).squeeze(-1)               # (P,3)
     l_local = torch.matmul(R_t, L_dir.view(3, 1)).squeeze(-1)           # (P,3)
 
-    s = pc.get_scaling * scaling_modifier  # (P,3)
+    s = pc.get_scaling  # (P,3)
     mass = beta_peak * ((2.0 * math.pi) ** 1.5) * torch.prod(s, dim=1, keepdim=True)
 
     # Exact full-line 1D Gaussian integral for a normalized 3D Gaussian, evaluated
@@ -412,7 +405,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # 128^3 voxel cache. Correct pairing for models trained before the raster
         # shadow pass (β/albedo calibrate against their training-time shadow
         # field), and a fallback.
-        T_light = compute_T_light(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
+        T_light = compute_T_light_voxel(means3D, tau_sun_per_gauss, s, L_dir, grid_res=128)
     else:
         # DEFAULT: light-space rasterized shadow pass. Fixes the voxel cache's
         # needle-shadow / chord-bias / self-leak / bbox-aliasing errors.
@@ -424,8 +417,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         tau_shadow = beta_peak * geom_sun
         T_light = compute_T_light_raster(
             means3D, tau_shadow, s, pc.get_rotation,
-            L_dir, scaling_modifier=scaling_modifier,
-            image_size=int(getattr(pipe, "tlight_raster_res", 512)))
+            L_dir, image_size=int(getattr(pipe, "tlight_raster_res", 512)))
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):
@@ -439,6 +431,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rho = pc.get_albedo  # (P,3)
 
     Lk = rho * L_sun[None, :] * scatter_sum
+    # --- Stage 2 environment lighting (frozen geometry) ---
+    # Modulate the sun term by the atmospheric transmittance T_sun(sun_dir) (RGB ≤1,
+    # expresses low-sun dimming/reddening — a purely additive term cannot dim) and add
+    # the sky in-scatter fill ρ·Σ E_lm(sun_dir)·V_lm. T_sun/E_lm are GLOBAL functions of
+    # sun_dir (EnvNet); no per-Gaussian colour DOF. Linear space, before the output
+    # tonemap. No-op unless env lighting is set up (Stage 2 / --stage2).
+    if getattr(pipe, "env_lighting", False) and override_color is None:
+        t_sun, fill = pc.apply_env(L_dir)
+        if t_sun is not None:
+            Lk = t_sun[None, :] * Lk + fill
     # Output tonemap gateway. Two mutually-compatible sources of the curve:
     #   tonemap_learnable -> pc.apply_tonemap (4 learned coeffs, e pinned)
     #   tonemap_aces      -> fixed Narkowicz constants

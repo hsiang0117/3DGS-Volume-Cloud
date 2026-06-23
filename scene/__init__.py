@@ -22,9 +22,11 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], init_gaussians=True):
         """
         :param args: dataset / training parameters; `source_path` should point at a Blender-style scene root containing transforms_train.json.
+        :param init_gaussians: if False, the caller has already populated `gaussians`
+            (e.g. a frozen Stage-1 model in Stage 2) — skip create_from_pcd / load_ply.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
@@ -72,7 +74,10 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
-        if self.loaded_iter:
+        if not init_gaussians:
+            # Caller pre-loaded the gaussians (frozen Stage-1 for Stage 2); leave them.
+            pass
+        elif self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),

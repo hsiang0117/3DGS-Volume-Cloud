@@ -64,7 +64,7 @@ UE5 渲染的体积云(WDAS cloud VDB),73 个半球相机 × 多太阳方向,NeR
 采集管线(`tools/`):
 
 ```
-tools/cloud_dataset_generator.py   # UE 编辑器内执行;MODE="uniform"(现行)/"tod"(历史弧线)
+tools/cloud_dataset_generator.py   # UE 编辑器内执行;均匀太阳数据集(输出目录见文件底部 OUTPUT_DIR)
 tools/convert_transforms.py        # UE 左手系 → OpenGL 右手系(含 sun_direction)
 tools/split_test_set.py            # test split(幂等):--held-out-suns 整太阳 / --per-cam 逐相机
 ```
@@ -137,9 +137,6 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间(+2.5 dB)。store_true 无法从命令行关闭,真·线性 GT 数据需改源码 |
 | `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`)。UE 数据上为否定结果(−0.14 dB),保留作换 filmic 引擎的保险;开启时优先于固定 ACES |
 | `--k_sigma` | 0.0 | per-tile max-response 深度排序偏移(σ 单位);0 = stock 中心深度排序。曾用于治 popping,因块状伪影弃用,CUDA 路径保留 |
-| `--compute_cov3D_python` | False | 在 Python 端算 3D 协方差(调试用) |
-| `--antialiasing` | False | 抗锯齿卷积。**勿在光照 pass 相关实验中开启**(会缩放 τ) |
-| `--debug` | False | 光栅化器 debug 模式 |
 
 #### 调度与学习率(OptimizationParams)
 
@@ -155,7 +152,6 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--octave_weights_lr` | 0.0025 | 多次散射八度权重学习率 |
 | `--scaling_lr` | 0.005 | 尺度学习率 |
 | `--rotation_lr` | 0.001 | 旋转学习率 |
-| `--optimizer_type` | default | `default`(Adam)或 `sparse_adam`(需 3dgs_accel 版光栅化器) |
 
 物理参数(β/ρ/g/octave)的 LR 全程指数退火到 1/10。
 
@@ -209,7 +205,6 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 |---|---|---|
 | `--test_iterations` | 7000 30000 | 在这些迭代做 test/train 评估(PSNR/SSIM/LPIPS) |
 | `--save_iterations` | 7000 30000 | 保存 checkpoint 的迭代(末迭代总会保存) |
-| `--debug_from` | -1 | 从第 N 迭代起开启光栅化器 debug |
 | `--detect_anomaly` | False | torch autograd 异常检测(很慢) |
 | `--quiet` | False | 静默模式 |
 
@@ -238,7 +233,6 @@ tools/plot_phase_function.py       # 有效相函数重建
 tools/project_pointcloud.py        # 初始点云-图像对齐快检
 tools/residual_buckets.py          # 有符号残差分桶(GT 亮度 × 深度覆盖)+ held-out 太阳 PSNR
 tools/penumbra_residual.py         # 残差按逐像素 T_light(阴影深度)分桶 × GT 亮度 cross-tab
-tools/notify_lark.py               # 飞书通知(长训练挂机用)
 ```
 
 ## 当前状态与已知限制

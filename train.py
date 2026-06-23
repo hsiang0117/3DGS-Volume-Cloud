@@ -23,8 +23,7 @@ from utils.image_utils import psnr, save_periodic_render, get_lpips_fn
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from scene.dataset_readers import readCamerasFromTransforms
-from utils.camera_utils import cameraList_from_camInfos, CameraPrefetcher
+from utils.camera_utils import CameraPrefetcher
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -37,20 +36,11 @@ try:
 except:
     FUSED_SSIM_AVAILABLE = False
 
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
-except:
-    SPARSE_ADAM_AVAILABLE = False
-
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_from):
-
-    if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, pipe)
-    gaussians = GaussianModel(opt.optimizer_type)
+    gaussians = GaussianModel()
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     # Learnable output tonemap: a few global coeffs in their own optimizer,
@@ -66,8 +56,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
-
     prefetcher = CameraPrefetcher(scene, queue_size=2)
     ema_loss_for_log = 0.0
 
@@ -82,15 +70,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         # Pick a random Camera (image already prefetched by background worker)
         viewpoint_cam = prefetcher.next()
 
-        # Render
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
-
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        # Grab diagnostic tensors injected by render()
-        diag_T_light = render_pkg.get("T_light")
-        diag_Lk = render_pkg.get("Lk")
 
         image_for_loss = image
         gt_for_loss = viewpoint_cam.original_image.cuda()
@@ -189,62 +170,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     print(f" tonemap coeffs (a,b,c,d): "
                           f"[{tm[0]:.4f}, {tm[1]:.4f}, {tm[2]:.4f}, {tm[3]:.4f}] "
                           f"(canonical [{can[0]:.2f}, {can[1]:.2f}, {can[2]:.2f}, {can[3]:.2f}])")
-                # Diagnostic: T_light and Lk statistics to detect collapse
-                if diag_T_light is not None:
-                    m_tl, s_tl = _ms(diag_T_light)
-                    print(f"  T_light mean/std: {m_tl:.4f}/{s_tl:.4f} | min: {diag_T_light.min().item():.6f}")
-                if diag_Lk is not None:
-                    m_lk, s_lk = _ms(diag_Lk)
-                    print(f"  Lk mean/std: {m_lk:.4f}/{s_lk:.4f} | max: {diag_Lk.max().item():.4f}")
-
-                # Densify diagnostic: count points eligible for densification
-                # and at risk of pruning. Consistently small n_above_grad
-                # (<<1% of n_points) means densify_grad_threshold is too high
-                # for this parameterisation. n_below_prune ≈ densify net gain
-                # means equilibrium (new points pruned next round).
-                denom_d = gaussians.denom.clamp(min=1)
-                grads_xyz = (gaussians.xyz_gradient_accum / denom_d).squeeze()
-                grads_xyz = torch.where(torch.isnan(grads_xyz), torch.zeros_like(grads_xyz), grads_xyz)
-                n_points = gaussians.get_xyz.shape[0]
-                n_above = int((grads_xyz >= opt.densify_grad_threshold).sum().item())
-                op = gaussians.get_opacity.squeeze()
-                # Split path: needs scale_max > percent_dense * scene_extent
-                # Clone path: needs scale_max <= percent_dense * scene_extent
-                scale_max = scales.max(dim=1).values
-                scene_extent = scene.cameras_extent
-                clone_gate = scale_max <= opt.percent_dense * scene_extent
-                split_gate = scale_max > opt.percent_dense * scene_extent
-                grad_pass = grads_xyz >= opt.densify_grad_threshold
-                n_clone_eligible = int((grad_pass & clone_gate).sum().item())
-                n_split_eligible = int((grad_pass & split_gate).sum().item())
-                # Contribution-based prune signal (active under physical strategy)
-                contrib_str = ""
-                if hasattr(gaussians, "contribution_accum") and gaussians.contribution_accum.numel() == n_points:
-                    mean_contrib = gaussians.get_mean_contribution()
-                    n_visible = int((gaussians.contribution_denom >= getattr(opt, "prune_min_visible_frames", 5)).sum().item())
-                    n_below_contrib = int(
-                        ((mean_contrib < getattr(opt, "contribution_threshold", 1e-4)) &
-                         (gaussians.contribution_denom >= getattr(opt, "prune_min_visible_frames", 5)) &
-                         (gaussians.prune_grace == 0)).sum().item()
-                    )
-                    n_dead = int(
-                        ((gaussians.contribution_denom == 0) &
-                         (gaussians.prune_grace == 0)).sum().item()
-                    )
-                    contrib_str = (
-                        f" | contrib mean/median: {mean_contrib.mean().item():.4f}/{mean_contrib.median().item():.4f} | "
-                        f"visible frames p50: {gaussians.contribution_denom.median().item():.0f} | "
-                        f"n_below_contrib: {n_below_contrib} | "
-                        f"n_dead: {n_dead}"
-                    )
-                print(
-                    f"  densify diag: n_points={n_points} | "
-                    f"grad max/mean: {grads_xyz.max().item():.6f}/{grads_xyz.mean().item():.6f} | "
-                    f"n_above_thresh: {n_above} ({100.0*n_above/max(n_points,1):.2f}%) | "
-                    f"clone-eligible: {n_clone_eligible} | split-eligible: {n_split_eligible} | "
-                    f"opacity min/median: {op.min().item():.6f}/{op.median().item():.6f}"
-                    f"{contrib_str}"
-                )
 
             if iteration % 1000 == 0:
                 save_periodic_render(scene.model_path, iteration, image_for_loss, viewpoint_cam.image_name)
@@ -259,7 +184,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., None), final_iteration=opt.iterations)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -300,80 +225,209 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
             # Optimizer step
             if iteration < opt.iterations:
-                if use_sparse_adam:
-                    visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
-                    gaussians.optimizer.zero_grad(set_to_none = True)
-                else:
-                    gaussians.optimizer.step()
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
                 # Step the standalone tonemap optimizer (gradients flowed in
                 # via the shared loss.backward()). No-op unless --tonemap_learnable.
                 if gaussians.tonemap_optimizer is not None:
                     gaussians.tonemap_optimizer.step()
                     gaussians.tonemap_optimizer.zero_grad(set_to_none = True)
 
-            # After finishing training, compute metrics on test set and write run note.
-            if iteration == opt.iterations:
-                metrics = {}
-                with torch.no_grad():
-                    test_cams = scene.getTestCameras()
-                    # Blender datasets merge test into train when eval=False. If so, explicitly load transforms_test.json.
-                    if (test_cams is None) or (len(test_cams) == 0):
-                        try:
-                            test_cam_infos = readCamerasFromTransforms(
-                                dataset.source_path,
-                                "transforms_test.json",
-                                dataset.white_background,
-                                True,
-                            )
-                            test_cams = cameraList_from_camInfos(
-                                test_cam_infos,
-                                resolution_scale=1.0,
-                                args=dataset,
-                                is_nerf_synthetic=True,
-                                is_test_dataset=True,
-                            )
-                        except Exception:
-                            test_cams = []
-                    if test_cams and len(test_cams) > 0:
-                        ssims = []
-                        psnrs = []
-                        lpips_vals = []
-                        lpips_fn = get_lpips_fn()  # None if package missing
-                        for cam in tqdm(test_cams, desc="Final metric eval (test)"):
-                            pkg = render(cam, gaussians, pipe, background, separate_sh=SPARSE_ADAM_AVAILABLE)
-                            pred = pkg["render"].clamp(0.0, 1.0)
-                            gt = cam.original_image.cuda()
+def _resolve_stage1_ply(stage1_model):
+    """Resolve a Stage-1 model path (output dir, iteration dir, or .ply) to a point_cloud.ply."""
+    from utils.system_utils import searchForMaxIteration
+    if not stage1_model:
+        sys.exit("--stage2 requires --stage1_model (Stage-1 output dir or point_cloud.ply).")
+    if stage1_model.endswith(".ply"):
+        return stage1_model
+    pc_dir = os.path.join(stage1_model, "point_cloud")
+    if os.path.isdir(pc_dir):
+        it = searchForMaxIteration(pc_dir)
+        cand = os.path.join(pc_dir, f"iteration_{it}", "point_cloud.ply")
+        if os.path.exists(cand):
+            return cand
+    cand = os.path.join(stage1_model, "point_cloud.ply")
+    if os.path.exists(cand):
+        return cand
+    sys.exit(f"Could not find a point_cloud.ply under {stage1_model}")
 
-                            ssims.append(ssim(pred, gt).item())
-                            psnrs.append(psnr(pred, gt).mean().item())
-                            if lpips_fn is not None:
-                                lpips_vals.append(lpips_fn(pred, gt))
 
-                            if hasattr(cam, "release_loaded"):
-                                cam.release_loaded()
+def _stage2_env_ref_dirs():
+    """Reference sun directions (OpenGL world, up=+Y) for env diagnostics."""
+    out = []
+    for name, el, az in [("zen~80", 80, 0), ("low~15/0", 15, 0), ("low~15/120", 15, 120)]:
+        e, a = math.radians(el), math.radians(az)
+        out.append((name, torch.tensor([math.cos(e) * math.cos(a), math.sin(e),
+                                        math.cos(e) * math.sin(a)], device="cuda")))
+    return out
 
-                        metrics["test_psnr"] = float(sum(psnrs) / len(psnrs))
-                        metrics["test_ssim"] = float(sum(ssims) / len(ssims))
-                        metrics["test_lpips"] = (
-                            float(sum(lpips_vals) / len(lpips_vals)) if lpips_vals else None
-                        )
 
-                        # Persist final metrics and print to stdout so an
-                        # end-of-run grep picks up results without parsing tqdm.
-                        metrics_path = os.path.join(scene.model_path, "metrics.json")
-                        with open(metrics_path, "w") as f:
-                            json.dump(metrics, f, indent=2)
-                        lpips_str = (
-                            f"{metrics['test_lpips']:.4f}"
-                            if metrics["test_lpips"] is not None else "n/a"
-                        )
-                        print(
-                            f"\n[Final] test PSNR {metrics['test_psnr']:.3f} | "
-                            f"SSIM {metrics['test_ssim']:.4f} | "
-                            f"LPIPS {lpips_str} → {metrics_path}"
-                        )
+def _log_env_params(gaussians, tag=""):
+    """Print the learned per-channel zenith optical depth τ (the 3 T_sun params) and
+    T_sun / sky-DC at a high and two low sun elevations — so one can watch the analytic
+    atmosphere: τ_B>τ_R (Rayleigh reddening) and T_sun dipping toward low sun."""
+    if gaussians.env_net is None:
+        return
+    with torch.no_grad():
+        tau = gaussians.env_net.tau
+        print(f"[stage2 env{(' ' + tag) if tag else ''}] "
+              f"tau(R,G,B)=[{tau[0]:.4f},{tau[1]:.4f},{tau[2]:.4f}]")
+        parts = []
+        for name, d in _stage2_env_ref_dirs():
+            t_sun, e_lm = gaussians.env_net(d)
+            dc = e_lm[0]
+            parts.append(f"{name} T_sun=[{t_sun[0]:.3f},{t_sun[1]:.3f},{t_sun[2]:.3f}] "
+                         f"E00=[{dc[0]:.2f},{dc[1]:.2f},{dc[2]:.2f}]")
+        print(f"[stage2 env{(' ' + tag) if tag else ''}] " + " || ".join(parts))
+
+
+def _stage2_eval(scene, gaussians, pipe, background, source_path, env_on=True,
+                 with_lpips=False, desc="eval"):
+    """Eval the test split; split PSNR into held-out-sun vs seen-sun (relighting gap).
+    Temporarily forces pipe.env_lighting=env_on so the env-off baseline can be measured."""
+    HELDOUT = {7, 22, 37, 52}
+    time_by_key = {}
+    tj_path = os.path.join(source_path, "transforms_test.json")
+    if os.path.exists(tj_path):
+        with open(tj_path) as f:
+            tj = json.load(f)
+        for fr in tj.get("frames", []):
+            parts = fr["file_path"].replace("\\", "/").split("/")
+            time_by_key[(parts[0], os.path.splitext(parts[-1])[0])] = int(fr.get("time_index", -1))
+    test_cams = scene.getTestCameras()
+    if not test_cams or len(test_cams) == 0:
+        return None
+    prev = pipe.env_lighting
+    pipe.env_lighting = env_on
+    lpips_fn = get_lpips_fn() if with_lpips else None
+    psnrs, ssims, lps = [], [], []
+    grp = {"heldout": [], "seen": []}
+    with torch.no_grad():
+        for cam in tqdm(test_cams, desc=desc, leave=False):
+            pred = render(cam, gaussians, pipe, background)["render"].clamp(0.0, 1.0)
+            gt = cam.original_image.cuda()
+            psnrs.append(psnr(pred, gt).mean().item())
+            ssims.append(ssim(pred, gt).item())
+            if lpips_fn is not None:
+                lps.append(lpips_fn(pred, gt))
+            ip = cam.image_path.replace("\\", "/").split("/")
+            ti = time_by_key.get((ip[-3], os.path.splitext(ip[-1])[0]), -1)
+            grp["heldout" if ti in HELDOUT else "seen"].append(psnrs[-1])
+            if hasattr(cam, "release_loaded"):
+                cam.release_loaded()
+    pipe.env_lighting = prev
+    avg = lambda xs: (sum(xs) / len(xs)) if xs else None
+    return {"psnr": avg(psnrs), "ssim": avg(ssims), "lpips": avg(lps),
+            "heldout_sun_psnr": avg(grp["heldout"]), "seen_sun_psnr": avg(grp["seen"]),
+            "n_heldout": len(grp["heldout"]), "n_seen": len(grp["seen"])}
+
+
+def _fmt_eval(r):
+    ho, se = r["heldout_sun_psnr"], r["seen_sun_psnr"]
+    gap = f"{ho - se:+.3f}" if (ho is not None and se is not None) else "n/a"
+    lp = f"{r['lpips']:.4f}" if r["lpips"] is not None else "n/a"
+    ho_s = f"{ho:.3f}" if ho is not None else "n/a"
+    se_s = f"{se:.3f}" if se is not None else "n/a"
+    return (f"PSNR {r['psnr']:.3f} | SSIM {r['ssim']:.4f} | LPIPS {lp} | "
+            f"held-out sun {ho_s} ({r['n_heldout']}) vs seen {se_s} ({r['n_seen']}) gap {gap}")
+
+
+def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, stage1_model):
+    """Stage 2: load & FREEZE a Stage-1 model and train ONLY the global environment-
+    lighting net (T_sun + E_lm of sun_dir) on the env-on dataset (-s). Pure-black
+    background, full-image supervision (no mask: bg is 0 in both GT and render).
+    The Stage-1 output is left untouched; results go to this run's -m / model_path."""
+    pipe.env_lighting = True
+    stage1_ply = _resolve_stage1_ply(stage1_model)
+    print(f"[stage2] freezing Stage-1 model: {stage1_ply}")
+
+    tb_writer = prepare_output_and_logger(dataset, pipe)
+
+    gaussians = GaussianModel()
+    gaussians.load_ply(stage1_ply)
+    # Freeze ALL per-Gaussian params — Stage 2 optimises only the global EnvNet.
+    for p in (gaussians._xyz, gaussians._extinction, gaussians._albedo,
+              gaussians._g_factor, gaussians._octave_weights,
+              gaussians._scaling, gaussians._rotation):
+        p.requires_grad_(False)
+
+    # env-on cameras + GT; keep the frozen gaussians (don't re-init from points3d).
+    scene = Scene(dataset, gaussians, init_gaussians=False)
+
+    # Precompute per-Gaussian sky-visibility transfer once, then build the env net.
+    gaussians.precompute_sky_transfer(n_dirs=getattr(pipe, "env_transfer_dirs", 48),
+                                      sh_order=getattr(pipe, "env_sh_order", 2))
+    gaussians.setup_env(opt, sh_order=getattr(pipe, "env_sh_order", 2))
+    print(f"[stage2] env net params: {sum(p.numel() for p in gaussians.env_net.parameters())} "
+          f"(env_lr={opt.env_lr}); pure-black bg, full-image supervision (no mask)")
+
+    background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")  # pure black
+    prefetcher = CameraPrefetcher(scene, queue_size=2)
+    ema_loss_for_log = 0.0
+
+    progress_bar = tqdm(range(1, opt.iterations + 1), desc="Stage2 (env) progress")
+    for iteration in range(1, opt.iterations + 1):
+        gaussians.update_env_learning_rate(iteration)
+        viewpoint_cam = prefetcher.next()
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        image = render_pkg["render"]
+        gt = viewpoint_cam.original_image.cuda()
+
+        Ll1 = l1_loss(image, gt)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_value = fused_ssim(image.unsqueeze(0), gt.unsqueeze(0))
+        else:
+            ssim_value = ssim(image, gt)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        loss.backward()
+        gaussians.env_optimizer.step()
+        gaussians.env_optimizer.zero_grad(set_to_none=True)
+
+        with torch.no_grad():
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.5f}"})
+                progress_bar.update(10)
+            if tb_writer:
+                tb_writer.add_scalar("stage2/total_loss", loss.item(), iteration)
+            if iteration in saving_iterations:
+                print(f"\n[stage2 ITER {iteration}] Saving (PLY + env sidecar)")
+                scene.save(iteration)
+            if (iteration in testing_iterations) and (iteration != opt.iterations):
+                r = _stage2_eval(scene, gaussians, pipe, background, dataset.source_path,
+                                 env_on=True, with_lpips=False, desc=f"eval@{iteration}")
+                if r:
+                    print(f"\n[stage2 ITER {iteration}] {_fmt_eval(r)}")
+                _log_env_params(gaussians, tag=f"@{iteration}")
+        if hasattr(viewpoint_cam, "release_loaded"):
+            viewpoint_cam.release_loaded()
+    progress_bar.close()
+
+    # Final eval: env-on (held-out vs seen split) + env-off baseline (env contribution).
+    _log_env_params(gaussians, tag="final")
+    on = _stage2_eval(scene, gaussians, pipe, background, dataset.source_path,
+                      env_on=True, with_lpips=True, desc="Stage2 final eval (env-on)")
+    off = _stage2_eval(scene, gaussians, pipe, background, dataset.source_path,
+                       env_on=False, with_lpips=False, desc="Stage2 final eval (env-off)")
+    if on is not None:
+        gap = (on["heldout_sun_psnr"] - on["seen_sun_psnr"]) \
+            if (on["heldout_sun_psnr"] is not None and on["seen_sun_psnr"] is not None) else None
+        contrib = (on["psnr"] - off["psnr"]) if off else None
+        metrics = {
+            "test_psnr": on["psnr"], "test_ssim": on["ssim"], "test_lpips": on["lpips"],
+            "heldout_sun_psnr": on["heldout_sun_psnr"], "seen_sun_psnr": on["seen_sun_psnr"],
+            "relighting_gap_db": gap,
+            "env_off_psnr": off["psnr"] if off else None,
+            "env_contribution_db": contrib,
+        }
+        with open(os.path.join(scene.model_path, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"\n[stage2 Final] env-on  {_fmt_eval(on)}")
+        if off is not None:
+            print(f"[stage2 Final] env-off PSNR {off['psnr']:.3f}  →  env contributes "
+                  f"{contrib:+.3f} dB (env-on minus env-off; ~0 ⇒ env-on≈env-off / atmosphere effect tiny)")
 
 def prepare_output_and_logger(args, pipe=None):
     if not args.model_path:
@@ -399,7 +453,7 @@ def prepare_output_and_logger(args, pipe=None):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, final_iteration=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -438,12 +492,17 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= n_cams
                 l1_test /= n_cams
                 ssim_test /= n_cams
-                lpips_str = (
-                    f" LPIPS {lpips_test / lpips_count:.4f}"
-                    if lpips_count > 0 else ""
-                )
+                lpips_avg = (lpips_test / lpips_count) if lpips_count > 0 else None
+                lpips_str = f" LPIPS {lpips_avg:.4f}" if lpips_avg is not None else ""
                 print("\n[ITER {}] Evaluating {}: L1 {:.6f} PSNR {:.3f} SSIM {:.4f}{}".format(
                     iteration, config['name'], float(l1_test), float(psnr_test), ssim_test, lpips_str))
+                # Persist the final test metrics to metrics.json (the run's landing
+                # result); the full-test pass here doubles as the final eval.
+                if config['name'] == 'test' and iteration == final_iteration:
+                    metrics = {"test_psnr": float(psnr_test), "test_ssim": float(ssim_test),
+                               "test_lpips": lpips_avg}
+                    with open(os.path.join(scene.model_path, "metrics.json"), "w") as f:
+                        json.dump(metrics, f, indent=2)
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -463,11 +522,17 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--stage2", action="store_true", default=False,
+                        help="Stage 2: load & freeze a Stage-1 model and train ONLY the "
+                             "environment-lighting net (global T_sun + E_lm of sun_dir). "
+                             "-s points to the env-on dataset.")
+    parser.add_argument("--stage1_model", type=str, default="",
+                        help="Stage 2: path to the Stage-1 output dir (or a point_cloud.ply) "
+                             "to load and freeze. Its result is left untouched.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -477,7 +542,11 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.debug_from)
+    if args.stage2:
+        training_stage2(lp.extract(args), op.extract(args), pp.extract(args),
+                        args.test_iterations, args.save_iterations, args.stage1_model)
+    else:
+        training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations)
 
     # All done
     print("\nTraining complete.")
