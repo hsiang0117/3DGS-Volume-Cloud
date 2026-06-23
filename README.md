@@ -75,7 +75,9 @@ L = T_sun(sun_dir) ⊙ [Stage 1 太阳项]  +  ρ · Σ_lm E_lm(sun_dir) · V_lm
 - **监督**:env-on 数据集是**纯黑背景**(SkyAtmosphere 天空亮度因子=0,但保留瑞利/米氏/臭氧对云的打光),所以全图直接监督、**无需 mask**(背景两边都 0)。
 - 环境网络与 `V_lm` 存进 PLY 同目录 sidecar(`env_net.pt` / `sky_transfer.npy` / `env.json`),viewer/eval 自动加载。
 
-设计与取证细节见 [`environment_lighting_design.md`](environment_lighting_design.md)。
+**设计取舍 / 未来方向**:这套大气就是标准的瑞利 + 米氏 + 臭氧模型(= UE SkyAtmosphere = Hillaire/Bruneton)。因为 `L` 对 `(T_sun, E_lm)` **线性**(`V_lm`、`ρ` 冻结),二者是**可热插拔的输入**——transfer 只标定一次,运行时既可用学到的网络,也可换成同系数的**解析大气**(把物理天空投影成 SH 喂进 `E_lm`),云响应零重训。这正是"云体环境着色与可见天空着色解耦、只共用 `sun_dir`"的接口形态:**别把天空烘进 `V_lm`**,保持 `(T_sun, E_lm) 输入 → L 输出`。
+
+**跨框架对比**(如对照 *Don't Splat your Gaussians* 的 VPRF):用**黑底**把"可见天空"这个变量消掉(GT/本方法/对照方都渲黑底 → 背景恒 0、平凡一致、无需 mask),从 GT 算一次云掩膜套到两边,且两边输出施加**同一 tonemap/色彩空间**再算指标(最易翻车的跨框架坑)。注意纯发射式 SH 重建(VPRF)结构上**不能 relighting**,只能当固定光照的重建/紧凑度基线,held-out 太阳 relighting 是本方法独有。
 
 ## 数据集
 
