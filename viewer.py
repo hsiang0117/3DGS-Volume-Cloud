@@ -24,7 +24,7 @@ import viser
 
 from scene.gaussian_model import GaussianModel
 from scene.cameras import MiniCam
-from gaussian_renderer import render, compute_T_light, compute_T_light_raster, normalized_gaussian_line_integral
+from gaussian_renderer import render, compute_T_light_voxel, compute_T_light_raster, normalized_gaussian_line_integral
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import build_rotation
 
@@ -32,9 +32,6 @@ from utils.general_utils import build_rotation
 # --- Pipeline stub (mirrors arguments.PipelineParams, no argparse needed) ---
 @dataclass
 class _ViewerPipe:
-    compute_cov3D_python: bool = False
-    debug: bool = False
-    antialiasing: bool = False
     k_sigma: float = 1.5
     # T_light is supplied via precomputed_T_light (compute_T_light_cache), so
     # render() never reaches its own T_light branch; tlight_voxel only guards
@@ -47,6 +44,11 @@ class _ViewerPipe:
     # channels (override_color set).
     tonemap_aces: bool = False
     tonemap_learnable: bool = False
+    # Stage-2 environment lighting. When True, render() adds the learned global sky
+    # (T_sun sun transmittance ⊙ sun_term + ρ·Σ E_lm·V_lm in-scatter) on top of the
+    # frozen sun shading; tracks the sun direction for relighting. Auto-set when the
+    # loaded model carries env sidecars (env_net.pt / sky_transfer.npy).
+    env_lighting: bool = False
 
 
 def _quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -124,7 +126,7 @@ def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor,
             image_size=raster_res,
         )
         return T.view(-1, 1)
-    return compute_T_light(
+    return compute_T_light_voxel(
         gaussians.get_xyz,
         tau_sun_per_gauss,
         s,
@@ -360,6 +362,14 @@ def main():
     else:
         print(f"[viewer] Output tonemap: linear (clamp)")
 
+    # Stage-2 environment lighting: enabled iff load_ply restored the env sidecars
+    # (env_net.pt + sky_transfer.npy). The sun slider then drives T_sun + E_lm for
+    # relighting; V_lm is the precomputed, sun-independent transfer.
+    has_env = env_on = (gaussians.env_net is not None) and (gaussians._sky_transfer.numel() > 0)
+    print(f"[viewer] Environment lighting: ON (SH{gaussians.env_sh_order}, "
+          f"V_lm {tuple(gaussians._sky_transfer.shape)})" if has_env
+          else "[viewer] Environment lighting: none (Stage-1 model)")
+
     # --- Precompute T_light for the initial sun direction --------------------
     initial_sun = _spherical_to_dir(altitude_deg=90.0, azimuth_deg=0.0)  # straight up
     print(f"[viewer] Precomputing T_light (sun={initial_sun.tolist()}) ...")
@@ -433,6 +443,7 @@ def main():
     pipe = _ViewerPipe()
     pipe.tonemap_aces = tonemap_aces
     pipe.tonemap_learnable = tonemap_learnable
+    pipe.env_lighting = env_on
     bg_color = torch.tensor(
         [1.0, 1.0, 1.0] if args.bg == "white" else [0.0, 0.0, 0.0],
         dtype=torch.float32, device="cuda",
@@ -537,10 +548,6 @@ def main():
                 hint=(f"Type a training camera img_name and press Enter. "
                       f"Dropdown disabled (have {len(train_cam_names)} cams)."),
             )
-    gui_scaling = server.gui.add_slider(
-        "Gaussian scale", min=0.1, max=2.0, step=0.05, initial_value=1.0,
-        hint="Multiplies all Gaussian scales at render time (visual only, does not modify stored model).",
-    )
     gui_ksigma = server.gui.add_slider(
         "Sort k·σ clamp", min=0.0, max=3.0, step=0.1, initial_value=0.0,
         hint="Per-tile max-response sort: how far t* may deviate from centre depth, "
@@ -560,8 +567,10 @@ def main():
              "Changes auto-recompute T_light (~0.5s lag).",
     )
     gui_res = server.gui.add_slider(
-        "Render size", min=256, max=1920, step=32, initial_value=args.width,
-        hint="Render resolution width; height is derived from client aspect.",
+        "Max render size", min=256, max=3840, step=32, initial_value=max(args.width, 1920),
+        hint="Upper bound on the rendered longer-side resolution. The render matches "
+             "the browser canvas's true pixel size (aspect follows the window), capped "
+             "here to bound GPU cost on large windows. Lower it if the frame rate drops.",
     )
     gui_bgcolor = server.gui.add_rgb(
         "Background color",
@@ -578,6 +587,14 @@ def main():
              "has one (tonemap.json), else the fixed Narkowicz ACES curve. Auto-set from "
              "the run's cfg_args. Toggle to A/B the model's native space; tonemapped "
              "models look too bright / washed-out with this off.",
+    )
+    gui_env = server.gui.add_checkbox(
+        "Environment light",
+        initial_value=env_on,
+        hint="Stage-2 environment lighting: add the learned global sky (T_sun sun "
+             "transmittance ⊙ sun_term + ρ·Σ E_lm·V_lm in-scatter fill) on top of the "
+             "frozen sun shading; tracks the sun slider for relighting. Only active for "
+             "a --stage2 model (env sidecars present); a no-op otherwise.",
     )
     gui_reset = server.gui.add_button(
         "Reset camera",
@@ -726,11 +743,11 @@ def main():
     gui_sun_az.on_update(_apply_sun)
 
     gui_mode.on_update(_mark_dirty)
-    gui_scaling.on_update(_mark_dirty)
     gui_ksigma.on_update(_mark_dirty)
     gui_res.on_update(_mark_dirty)
     gui_bgcolor.on_update(_mark_dirty)
     gui_tonemap.on_update(_mark_dirty)
+    gui_env.on_update(_mark_dirty)
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
@@ -849,18 +866,28 @@ def main():
 
     # --- Render loop --------------------------------------------------------
     print(f"[viewer] Serving at http://localhost:{args.port}")
+    _last_canvas = {}
     while True:
         if not state["needs_render"]:
-            if recorder.active:
-                # While recording, idle frames still advance wall-clock time;
-                # duplicate-fill happens inside recorder.add() on next render.
-                # Re-render at the capture cadence so slow changes (e.g. sun
-                # recompute) appear smoothly instead of as a single jump.
-                time.sleep(1.0 / REC_FPS)
-                state["needs_render"] = True
+            # Poll for window/canvas resizes (camera on_update doesn't always fire
+            # on resize): if any client's canvas pixel size changed, re-render so
+            # the render resolution tracks the new window size.
+            for _cid, _cl in server.get_clients().items():
+                _cw, _ch = int(_cl.camera.image_width or 0), int(_cl.camera.image_height or 0)
+                if _last_canvas.get(_cid) != (_cw, _ch):
+                    _last_canvas[_cid] = (_cw, _ch)
+                    state["needs_render"] = True
+            if not state["needs_render"]:
+                if recorder.active:
+                    # While recording, idle frames still advance wall-clock time;
+                    # duplicate-fill happens inside recorder.add() on next render.
+                    # Re-render at the capture cadence so slow changes (e.g. sun
+                    # recompute) appear smoothly instead of as a single jump.
+                    time.sleep(1.0 / REC_FPS)
+                    state["needs_render"] = True
+                    continue
+                time.sleep(0.01)
                 continue
-            time.sleep(0.01)
-            continue
         state["needs_render"] = False
 
         clients = server.get_clients()
@@ -872,19 +899,29 @@ def main():
         first_client = True
         for client in clients.values():
             cam = client.camera
-            # Keep aspect consistent with client window to avoid distortion.
-            render_w = int(gui_res.value)
-            render_h = max(1, int(render_w / max(cam.aspect, 1e-3)))
+            # Render at the client canvas's true pixel size (aspect follows the
+            # window, not locked to 1:1) so the image isn't upscaled/blurred by the
+            # browser. gui_res caps the LONGER side to bound cost on big windows;
+            # fall back to the slider value if the canvas size isn't known yet.
+            max_side = int(gui_res.value)
+            cw, ch = int(cam.image_width or 0), int(cam.image_height or 0)
+            if cw > 0 and ch > 0:
+                scale = min(1.0, max_side / float(max(cw, ch)))
+                render_w = max(1, int(round(cw * scale)))
+                render_h = max(1, int(round(ch * scale)))
+            else:
+                render_w = max_side
+                render_h = max(1, int(render_w / max(cam.aspect, 1e-3)))
             current_sun = state["sun_dir"]
             current_T_light = state["T_light"]
             mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far, sun_dir=current_sun)
-            scaling_mod = float(gui_scaling.value)
             pipe.k_sigma = float(gui_ksigma.value)
             # The single checkbox = "tonemap on/off". Route it to the learnable
             # curve if the model carries one, else the fixed ACES curve.
             _tm_on = bool(gui_tonemap.value)
             pipe.tonemap_learnable = _tm_on and tonemap_learnable
             pipe.tonemap_aces = _tm_on and not tonemap_learnable
+            pipe.env_lighting = bool(gui_env.value) and has_env
             mode = gui_mode.value
 
             # Update background colour in place (RGB 0-255 -> 0-1) so we don't
@@ -907,7 +944,6 @@ def main():
                 with torch.no_grad():
                     out = render(
                         mini, gaussians, pipe, bg_color,
-                        scaling_modifier=scaling_mod,
                         override_color=override,
                         precomputed_T_light=current_T_light,
                     )
@@ -952,7 +988,7 @@ def main():
                         f"({len(recorder.frames)} frames)")
                 first_client = False
 
-            client.scene.set_background_image(img_np, format="jpeg")
+            client.scene.set_background_image(img_np, format="png")
 
         dt = time.time() - t_frame
         if dt > 0:

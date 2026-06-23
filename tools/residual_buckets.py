@@ -46,14 +46,14 @@ print(f'source_path={source_path}')
 print(f'T_light={"raster" if use_raster else "voxel"} | tonemap_aces={tonemap_aces} '
       f'| tonemap_learnable={tonemap_learnable}')
 
-g = GaussianModel('default')
+g = GaussianModel()
 g.load_ply(ply)
 coeffs = g.get_tonemap_coeffs
 if coeffs is not None:
     print(f'learned tonemap coeffs (a,b,c,d) = {[round(c,4) for c in coeffs.tolist()]} '
           f'(canonical {list(GaussianModel.TONEMAP_CANONICAL)})')
 
-pipe = Namespace(compute_cov3D_python=False, debug=False, antialiasing=False,
+pipe = Namespace(
                  k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
                  tonemap_aces=tonemap_aces, tonemap_learnable=tonemap_learnable)
 bg = torch.zeros(3, device='cuda')

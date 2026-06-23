@@ -42,10 +42,10 @@ print(f'run={run} iter={iteration} | source={source_path}')
 print(f'T_light={"raster" if use_raster else "voxel"} | aces={tonemap_aces} '
       f'| learnable={tonemap_learnable}')
 
-g = GaussianModel('default')
+g = GaussianModel()
 g.load_ply(ply)
 
-pipe = Namespace(compute_cov3D_python=False, debug=False, antialiasing=False,
+pipe = Namespace(
                  k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
                  tonemap_aces=tonemap_aces, tonemap_learnable=tonemap_learnable)
 bg = torch.zeros(3, device='cuda')

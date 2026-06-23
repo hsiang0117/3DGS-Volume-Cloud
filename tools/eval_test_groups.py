@@ -30,7 +30,7 @@ elif os.path.exists(cfg_path):
         raster_res = int(m.group(1))
 print(f'T_light source: {"raster" if use_raster else "voxel"}')
 
-g = GaussianModel('default')
+g = GaussianModel()
 g.load_ply(ply)
 
 cam_infos = readCamerasFromTransforms(r'D:\3DGS-Volume-Cloud\data\CloudDataset', 'transforms_test.json', False, True)
@@ -44,7 +44,7 @@ for f in test_json['frames']:
     parts = f['file_path'].split('/')          # camXX / images / TTTT.png
     time_by_key[(parts[0], parts[-1])] = f['time_index']
 
-pipe = Namespace(compute_cov3D_python=False, debug=False, antialiasing=False,
+pipe = Namespace(
                  k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res)
 bg = torch.zeros(3, device='cuda')
 

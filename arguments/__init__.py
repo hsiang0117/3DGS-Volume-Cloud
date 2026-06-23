@@ -65,9 +65,6 @@ class ModelParams(ParamGroup):
 
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
-        self.compute_cov3D_python = False
-        self.debug = False
-        self.antialiasing = False
         # Per-tile max-response sort: max deviation of t* from centre depth, in
         # units of σ along the view ray. ≤0 reverts to stock 3DGS centre-depth sort
         # (kernel skips the t* shift). Disabled: it produced blocky tile-boundary
@@ -102,6 +99,18 @@ class PipelineParams(ParamGroup):
         # curve drifts from Narkowicz. (For a truly-linear HDR GT use tonemap OFF, NOT
         # learnable — the Narkowicz family cannot represent identity.)
         self.tonemap_learnable = False
+        # --- Stage 2: environment lighting (frozen geometry + global sky) ---
+        # When on (set by --stage2), render adds the atmospheric env term on top of
+        # the frozen Stage-1 sun shading:
+        #     L = T_sun(sun_dir) ⊙ sun_term  +  ρ · Σ_lm E_lm(sun_dir) · V_lm
+        # T_sun (RGB ≤1, sun atmospheric transmittance — expresses low-sun dimming/
+        # reddening) and E_lm (sky radiance SH) are GLOBAL functions of sun_dir (a
+        # small MLP, no per-Gaussian colour DOF); V_lm is the precomputed per-Gaussian
+        # achromatic sky-visibility transfer. Persists to cfg_args so the viewer
+        # auto-detects. Default OFF — Stage 1 behaviour unchanged.
+        self.env_lighting = False
+        self.env_sh_order = 2          # SH order for sky radiance E_lm and visibility V_lm (SH2 = 9 coeffs)
+        self.env_transfer_dirs = 48    # # hemisphere directions sampled for the V_lm precompute
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -126,6 +135,10 @@ class OptimizationParams(ParamGroup):
         # poles; this is a cheap insurance that f stays non-decreasing on [0,8]
         # so highlights never invert. Hinge on negative slope, like lambda_aniso.
         self.lambda_tonemap_mono = 1e-2
+        # LR for the Stage-2 environment net (global T_sun + E_lm MLP of sun_dir),
+        # only used with --stage2. Lives in its own Adam (isolated from densify/prune
+        # like the tonemap optimizer); decays to 0.1x over the schedule.
+        self.env_lr = 1e-3
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
@@ -156,7 +169,6 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 1e-4
         self.densify_scale_grad_threshold = 1e-6
-        self.optimizer_type = "default"
         # Adaptive density threshold: take top `densify_top_frac` of grads each
         # round so growth doesn't stall when grads decay late in training.
         self.densify_adaptive = True

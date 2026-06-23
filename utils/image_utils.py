@@ -10,6 +10,9 @@
 #
 
 import os
+import io
+import warnings
+import contextlib
 import torch
 from PIL import Image
 
@@ -60,7 +63,12 @@ def get_lpips_fn(net: str = "vgg", device: str = "cuda"):
         _LPIPS_FN = None
         return None
     try:
-        model = lpips.LPIPS(net=net).to(device).eval()
+        # LPIPS construction is noisy: a "Setting up [LPIPS]..." banner (stdout)
+        # plus torchvision 'pretrained'/'weights' deprecation warnings from the
+        # VGG backbone load. Silence both — one-time, purely cosmetic.
+        with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = lpips.LPIPS(net=net).to(device).eval()
     except Exception as e:
         print(f"[lpips] failed to construct {net} model: {e}; skipping.")
         _LPIPS_FN = None

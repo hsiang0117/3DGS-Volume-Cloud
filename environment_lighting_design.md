@@ -1,322 +1,294 @@
-# 环境光接入设计方案（Stage 2：固定几何 + PRT 环境光）
+# 环境光接入设计方案（Stage 2：冻结几何 + 大气入射光照 = T_sun 消光 + E_θ 天空填充，黑底无 cubemap）
 
-> 状态：设计文档（2026-06-16；2026-06-18 修订）。Stage 1（仅太阳光、黑背景数据集）
-> 已达优秀水平（uniform 数据集 ~33.3 PSNR，held-out 太阳零泛化差距）。本文档定义
-> Stage 2：冻结已标定的高斯点集，以预计算辐射传输（PRT）的形式叠加环境光。
-
----
-
-## 1. 背景与两阶段设计
-
-**目标**：在不破坏 Stage 1 已标定物理参数（β/ρ/g/octave/位置/协方差）的前提下，
-给着色叠加天空环境光的贡献，实现真正的全光照 relighting（任意太阳 + 任意天空）。
-
-**两阶段划分**（用户设计，本文档采纳）：
-
-- **Stage 1（已完成）**：仅太阳光、黑背景数据集 → 得到物理参数稳定的高斯点集。
-- **Stage 2（本文档）**：**冻结**高斯点集（几何 + 物理参数），仅训练环境光相关的
-  少量自由度，以某种形式给着色加上环境光。
-
-**关键洞察**：这正是 **Precomputed Radiance Transfer（PRT, Sloan et al. 2002）**
-的标准框架。"冻结几何"不是工程妥协，而是让环境光变得极廉价且稳定的**前提**——
-几何固定 ⇒ 光传输（遮挡）固定 ⇒ 可一次性预计算 ⇒ Stage 2 前向只剩一个 SH 点积。
-
-**场景现状（2026-06-16 / 06-18 经 MCP 核实 /Game/Maps/Cloud）**：场景已配
-`SkyAtmosphere` + `SkyLight`(bAffectsWorld, RealTimeCapture, LowerHemisphereIsBlack)
-+ `SceneCaptureCube → /Game/VolumetricCloud/RT_SkyCube`（HDR, bCaptureEveryFrame）。
-**环境 cubemap 捕获机制已现成**，采集侧不需新建。云本体是 `HeterogeneousVolume`。
-
-**env-off / env-on 的开关机制**：Stage 1 的黑背景是把 **`SkyAtmosphere` 设为不可视**
-实现的（背景纯黑、云只受太阳）；改回**可视**即得 env-on——蓝天背景 + 天空环境光
-对云着色（06-18 视口确认：受光面亮白，背光面带淡蓝天光填充、非纯黑，薄边透出天空）。
-所以 `img_env_off`（SkyAtmosphere 不可视）和 `img_env_on`（可视）只差这一个开关，
-天然成对，正是 Stage 2 监督所需的两套数据。
+> 状态：设计文档。2026-06-16 初稿（cubemap-PRT）；2026-06-22 改定「无 cubemap」；
+> **2026-06-22 再修订**：① 加入太阳大气透射 `T_sun`（**纯加性 env 表达不出「变暗」**，UE 实证）；
+> ② 已能采到**纯黑底 env-on**（SkyAtmosphere 瑞利/米氏/臭氧三系数为真值 + 天空亮度因子=0）
+> → **删除全部 mask 监督**，改为黑底全图直接监督。Stage 1（仅太阳、黑底）已达 37.55，
+> held-out 太阳零泛化差距。
 
 ---
 
-## 2. 物理基础
+## 1. 两阶段设计与一句话
 
-某高斯点 x 处、朝相机方向 ω_o 的环境内散射辐亮度：
+**目标**：不破坏 Stage 1 已标定物理参数（β/ρ/g/octave/位置/协方差）的前提下，叠加天空大气
+环境光，实现任意太阳的全光照 relighting。
 
-```
-L_env(x, ω_o) = ρ(x) · ∫_{sphere} p(ω_i · ω_o) · E_sky(ω_i) · T_sky(x, ω_i) dω_i
-                                  └─相函数─┘   └─天空辐射─┘  └─该方向天空可见度─┘
-```
-
-三个因子：
-- **p**：相函数（HG）。高反照率云的环境观感由**多次散射主导**，趋于各向同性，
-  v1 可近似为各向同性（丢掉 view-dependent 的相函数瓣，作为一阶足够）。
-- **E_sky(ω_i)**：天空辐射场 = cubemap。**已知输入**（UE 场景我们控制）。
-- **T_sky(x, ω_i)**：x 沿 ω_i 方向对天空的透射率（环境遮挡 / 天空可见度）。
-  **这是环境光的灵魂**——云核 T_sky≈0（天光进不去），云边 T_sky≈1。
-
-> ⚠️ **没有 T_sky 的环境项 = 给所有高斯加常数底光**，会均匀提亮深核——正是
-> Stage 1 一路在防的"假底光"形态（见 [[octave 假底光证伪]] 教训）。遮挡结构
-> 不是可选项，是这一项的全部价值所在。
+- **Stage 1（已完成）**：仅太阳、黑底 → 物理参数稳定的高斯点集（37.55）。
+- **Stage 2（本文档）**：**冻结**点集，新增**两个全局、只依赖太阳方向的可学项**——乘性太阳
+  大气透射 `T_sun(sun_dir)` 与加性天空填充 `E_θ(sun_dir)`——配合**预计算无色传输 `V_lm`** 与
+  **已有 albedo `ρ`**，把大气环境光加进着色。
 
 ---
 
-## 3. 核心方法：PRT 分解
+## 2. 物理基础：环境效应 = 大气（瑞利+米氏+臭氧）对光做的两件事
 
-各向同性近似下（环境项相函数 ≈ const），积分塌成**逐高斯传输向量**与
-**逐帧天空 SH** 的点积：
+**UE 实证（2026-06-22）**：把 SkyAtmosphere 的**瑞利散射 / 米氏散射 / 吸收(臭氧)** 三项强度全调 0，
+画面就退回「只有方向光」(= env-off)。所以 env-on 相对 env-off 的**全部差异**，就是这三项产生的
+**两个效应**：
 
-```
-L_env(x) ≈ ρ(x) · Σ_{lm}  E_lm · V_lm(x)
-                          └天空SH┘ └传输向量┘
-```
+1. **消光（乘性，≤1）**：三项把能量从**直射太阳光束**移除 → 太阳**变暗 + 变红**（瑞利 ∝λ⁻⁴
+   把蓝散掉 → 偏红；米氏前向 → 红晕/光晕；臭氧吸收）。这是 `T_sun(sun_dir)`。
+2. **内散射（加性，≥0）**：散进云体/视线的天空填充（瑞利 → 蓝天填充；米氏 → 雾状前向）。
+   这是 `E_θ(sun_dir)`。
 
-- **E_lm**：天空 cubemap 的 SH 系数（逐帧输入，随太阳方向变）。
-- **V_lm(x)**：逐高斯天空可见度 T_sky(x, ·) 的 SH 投影 = PRT "transfer 向量"。
-  **只依赖冻结的几何（β、位置、协方差）** ⇒ **Stage 2 只需算一次，缓存复用**。
-
-存储量：200k 高斯 × 9 系数（SH2）× float32 ≈ **7 MB**，缓存到 PLY 同目录
-（镜像 `tonemap.json` 的 sidecar 套路，见 §7）。
-
-着色总式：
+加性项（内散射）某高斯点 x、朝相机 ω_o：
 
 ```
-L = L_sun_term(已冻结、已标定)  +  ρ · Σ_{lm} E_lm · V_lm(x)
-    └────── Stage 1 原封不动 ──────┘   └──── 叠加的新环境项 ────┘
+L_fill(x, ω_o) = ρ(x) · ∫_{sphere} p(ω_i·ω_o) · E_sky(ω_i; sun) · T_sky(x, ω_i) dω_i
+                                    └─相函数─┘  └──天空辐亮度──┘  └─该方向天空可见度─┘
 ```
 
-方向性（云朝亮天一侧更亮）由 V_lm 与 E_lm 共同保留——**不是平铺 ambient**。
+- **p**：相函数（HG）。高反照率云的环境观感由多次散射主导、趋各向同性，v1 取各向同性。
+- **E_sky**：天空**辐亮度场（radiance）**，随太阳方向变。
+- **T_sky(x, ω_i)**：x 沿 ω_i 的天空可见度（环境遮挡）——**环境光的灵魂**：云核≈0、云边≈1。
+  > ⚠️ 没有 T_sky 的填充 = 给所有高斯加常数底光，均匀提亮深核——正是 Stage 1 一路在防的
+  > 「假底光」形态。遮挡结构不是可选项，是这一项的全部价值。
 
-### env-on 整图 = 内散射 + 背景透射（关键分解）
-
-注意 env-on 画面里有**两个**环境效应，必须分清（否则监督会混淆）：
-
-```
-img_env_on(px) = [ρ·(sun_scatter + k_env·Σ E_lm V_lm)] 经相机透射累积   ← 云内散射
-                + T_cam(px) · E_sky(view_dir(px))                      ← 背景天空透射
-```
-
-- **内散射**：唯一的**新学习项**（锁在共享 ρ + 全局 `k_env`）。
-- **背景天空透射**（天空从云薄处/背后透过来）：**不是新东西**。光栅化器本就做
-  `C + T·bg`（`forward.cu:485`），背景经云的逐像素最终透射率 T 合成——viewer 切
-  背景色看到的就是它。**零新增学习参数**，唯一改动是把常数 bg 换成方向性天空（§5）。
-
-这条很重要：env-on 里**绝大部分是确定性合成**（背景透射 = 已知天空 × 模型自身 T），
-可学的只有内散射的 k_env(/可选 ρ)——进一步缩小了可退化面（见 §9 决策 3 / 退化担忧）。
+**太阳消光不是积分项,是对整个太阳项的乘性缩放**(消光发生在阳光进云之前)。
 
 ---
 
-## 4. 问题一：cubemap 如何接入训练管线
+## 3. 核心方法：消光 `T_sun` ⊙ 太阳项 + PRT 填充 `E·V`
 
-**结论：不喂原始 cubemap，投到低阶 SH，作为逐帧输入，与 `sun_dir` 完全同等待遇。**
+```
+L = T_sun(sun_dir) ⊙ [ρ·L_sun·Σ wₙ T_light^bⁿ HG(...)]   ← 太阳项 ×全局RGB透射(≤1)：变暗+红
+  + ρ · Σ_{lm} E_lm(sun_dir) · V_lm(x)                     ← 加性天空填充（≥0）
+```
 
-1. **不可学**：E_sky 是已知输入。一旦把它设成可学习参数，就把"某一个特定天空"
-   烤进模型 → relighting 报废。与太阳同理：光源是输入，云的物理参数才是学习量。
-2. **SH 阶数**：环境光低频，**SH2（9 系数/通道）通常够**；UE SkyLight 内部本就
-   按 SH 存，天作之合。SH3（16/通道）作为精度后备（**待定，见 §9**）。
-3. **坐标系**：world 空间（OpenGL Y-up，与模型一致）。SH 基定义在 world，
-   与 `convert_transforms.py` 的太阳方向同一坐标约定，避免二次旋转。
-4. **数据格式**：每帧 JSON 加 `sky_sh: [[r,g,b]×系数数]`，key 跟太阳方向走
-   （"每个太阳方向一张 cubemap" 正确——SkyAtmosphere 让天空随太阳变）。
+四类量的角色与可学性：
 
-### ⚠️ 采集的关键坑：捕获 sky cubemap 时必须隐藏云体
+| 项 | 是什么 | 来源 | 可学？ |
+|---|---|---|---|
+| Stage-1 太阳项形状 | β/g/octave/T_light/位置/协方差 | Stage 1 | 冻结 |
+| `ρ(x)` | 反照率，**逐高斯**，色度锁这里 | Stage 1 | 冻结 |
+| `V_lm(x)` | 天空可见度 SH 投影，**逐高斯、无色、纯几何** | 预计算（§6） | 否 |
+| `T_sun(sun_dir)` | 太阳大气透射，**全局** RGB，≤1 | 学 / 解析大气（§4） | **是（新增）** |
+| `E_lm(sun_dir)` | 天空**辐亮度场**(radiance,非 irradiance)SH，**全局** RGB | 学 / 解析大气（§4） | **是（新增）** |
 
-cubemap 要的是"**云所在位置看到的纯天空辐射场**"，云的遮挡由 T_sky 单独算。
-若捕获时云（HeterogeneousVolume）在场，则**遮挡被算两遍**（cubemap 里一次、
-V_lm 里一次）→ 双重压暗。采集脚本须在 cube 捕获前隐藏云体、捕获后恢复。
+### 🔴 红线：env 绝不能引入「逐高斯的色彩自由度」
 
----
+新增可学的只有**两个全局逐太阳函数** `T_sun`、`E_θ`；逐高斯自由度一个不加（还是 ρ/几何/β，
+全冻结）→ 物理上**无法退回 vanilla 3DGS**、relighting 保住。
 
-## 5. 问题二：环境光以什么形式融入着色
+- `T_sun`/`E_θ` 是 RGB（太阳/天空本就有色），但**全局**（整场景共享）——逐高斯颜色仍只有 ρ。
+- 全局色调歧义（T_sun/E 色 vs ρ 色）由**冻结 ρ**（env-off 白太阳下已定）解掉。
+- 反例（必避）：env = 逐高斯可学颜色 / sun-conditioned per-Gaussian MLP 出色 = 退回 3DGS、杀 relighting。
 
-**结论：PRT 传输向量 V_lm，复用现有 `compute_T_light_raster` 预计算。**
+### ⚠ 为什么必须乘性 `T_sun`（不能只加 `E_θ`）
 
-### V_lm 怎么算（复用现有机器，不写新光追）
-
-`gaussian_renderer/compute_T_light_raster(means3D, tau, scales, rotations, L_dir, ...)`
-本就接受**任意方向** `L_dir` 算逐高斯透射率。环境可见度 = 它对半球的积分：
-
-1. 在（上）半球取 **N≈32–64 个 Fibonacci 方向**；
-2. 每方向调一次 `compute_T_light_raster` → 逐高斯 T_sky(x, ω_j)；
-3. 把 {ω_j → T_sky} 投到 SH2 → V_lm(x)，缓存。
-
-> `bLowerHemisphereIsBlack=true`：UE SkyLight 下半球为黑（地面方向不补光），
-> 采样方向与 SH 投影应与之一致（仅上半球，或下半球权重置零），保证物理对齐。
-
-代价：预计算 N×（一次 raster pass 很快），**仅一次**。可微性不需要——V_lm 是
-冻结几何的常量。
-
-### 前向（Stage 2 训练 + 推理）
-
-逐高斯一个 SH 点积，**极便宜**。这正是"冻结几何"的回报：传输固定 ⇒ 预计算掉
-⇒ 训练只剩 `E_lm · V_lm` 点积 + 少量自由度。
-
-### 环境多次散射（可选精化）
-
-环境项可复用 Stage 1 的六阶 octave：`T_sky^(bⁿ)` + **同一套已学到的 octave
-权重**，环境多次散射免费复用、无新参数。**v1 先纯各向同性，octave 复用待定（§9）**。
-
-### 背景透射：复用现有 `C+T·bg`，唯一改动是 bg → 方向性天空
-
-背景透射**不需要新着色项**——光栅化器 `forward.cu:485` 已做
-`out_color = C + T·bg_color`：背景经逐像素最终透射率 T 合成（viewer 切 bg 色即此）。
-逐像素剩余透射率 `final_T` 也已在 kernel 算好（`forward.cu:482`），只是当前**未经
-Python 绑定返回**（色彩路径只返回 color/radii/depth/contribution）。
-
-env-on 唯一变化：bg 从**常数色**变成**方向性天空**（cubemap 按每像素视线方向采样）。
-两条实现路径：
-
-1. **暴露 `final_T`**（已存在，只差绑定层加一个返回），外部合成
-   `img = cloud_render(bg=0) + final_T · sky(view_dir)`——最干净，改动是把已有缓冲透出来；
-2. 改 kernel 让 `bg` 接受逐像素背景图。
-
-背景透射**零新增学习参数** = 已知天空 × 模型自身透射率。
+加性项 `E_θ ≥ 0` **只能加亮、永远不能减暗**。低太阳时 env-on 比 env-off **更暗**，那必然是太阳
+被大气消光到了白太阳以下（填充再多只能往回补、补不出更暗）。**纯加性环境光在结构上表达不出
+「变暗」**，必须让太阳项乘 `T_sun(≤1)`——这是本次修订的核心。
 
 ---
 
-## 6. Stage 2 训练什么 + 监督方式
+## 4. 入射光照三种拿法：测 cubemap / 学 / 解析大气
 
-E_lm 已知、V_lm 预计算、ρ 冻结 ⇒ L_env **几乎完全确定**。这是好事（高度受约束，
-不会破坏已标定几何）。需要决定加几个自由度：
+环境 = 瑞利+米氏+臭氧大气 = **UE SkyAtmosphere = Hillaire 2020 / Bruneton 式解析模型**。它从
+`sun_dir` + 三个（你已知的）系数**同时**吐出 `T_sun`（沿太阳光路 Beer-Lambert）和 `E`
+（内散射积分 → SH）。所以入射光照有三种来源：
 
-- **最小（推荐起点）**：一个全局环境强度标量 `k_env`。先做 sanity——纯物理预测
-  能否对上 GT？`k_env≈1` 且残差小 ⇒ 物理正确实锤。
-- **稍多**：解冻 ρ 微调（太阳光与环境光**共享 albedo**，物理正确，且让 ρ 吸收
-  更多打光信息）；或学一个环境相函数阶数。**待定（§9）**。
+| 来源 | 怎么得 | 泛化 | 代价 |
+|---|---|---|---|
+| 测 cubemap | 采图投 SH | 离散需球面插值 | 整条采集/SH/抠盘/地平线管线 |
+| **学（v1 推荐起步）** | 从 env_on 图学全局 `T_sun/E_θ` | held-out 太阳验证 | 砍掉 cubemap 管线；起步快 |
+| **解析大气（endgame）** | 同系数跑 Hillaire 大气算 `T_sun/E` | **完美**（连续、无盘） | 复刻多次散射 LUT 才能像素级对上 UE |
 
-### 监督：env-on 直接监督（背景用方向性天空合成）
-
-模型在 env-on 模式下渲：云内散射(sun+env) 经现有 `C+T·bg` 机制合成到**方向性天空
-背景**上（§5）。直接对 `img_env_on` 监督。背景透射由已知天空 × 模型 T 确定（零参数），
-太阳项冻结，所以 **loss 能动的只有内散射的 `k_env`(/可选 ρ)**。任何残差纯属内散射
-模型本身。与 tonemap/octave 实验同一方法论：先隔离、再合并。
-
-> **为什么不直接拿差分图**：`img_env_on − img_env_off` = 内散射 + 背景透射 之和
-> （env_off 是黑底、无透射）。直接用差分监督内散射会把背景天空透射混进来，归因不干净。
-> 背景透射既然是确定性的，更干净的做法是把它当**已知合成掉、直接监督 env_on**，而非相减。
-> 若仍想用差分，必须额外减去已知的 `T_cam·E_sky` 背景项才等于纯内散射。
+因 L 对 `E`、`T_sun` 都线性（§7），可**先学后换解析、零重训**：先用学的 `T_sun/E_θ` 把云
+**响应**机器验证好，以后把同系数的解析大气热插拔进去。
+> 注:「零重训」以学到的 `(T_sun, E)` 能复刻解析输出为前提;若解析大气保真更高（multi-scatter
+> LUT vs 学到的近似），可选 ≪100 步微调 `E_θ` 收尾，残差更小。
 
 ---
 
-## 7. 实现改动清单（复用 tonemap 基建）
+## 5. `T_sun(sun_dir)` 与 `E_θ(sun_dir)`：两个全局逐太阳函数
 
-环境光的全局/逐高斯参数完全可以照搬刚为 learnable tonemap 建好的模式。
+- **`E_θ`**：RGB 低阶 SH（SH2=9 系数/通道够低频）或小 MLP，**全局**。天生连续 + 无太阳盘
+  （散射天空的低频积分）。
+- **`T_sun`**：**全局** RGB，`exp(−τ_atm(sun_dir))` 或 sigmoid 保证 ∈[0,1]；几个标量或小 MLP。
+  全局(云上均匀)成立于**云尺度 ≪ 大气标高(~8km)**;未来多高度/大尺度云再细化为 `T_sun(h)` 或逐光线查表。
+- **输入** `sun_dir`（OpenGL world，同 `convert_transforms.py` 约定），逐帧从 camera 取，无需新字段。
+- **太阳盘**：直射归 Stage-1 DirectionalLight 项；`E_θ` 必须**排除太阳盘**（否则与显式太阳重复
+  计数）。监督目标 `env_on−env_off` 天然不含盘，自洽。
+
+> 复杂度阶梯：`E_θ` 最简 SH0（逐高斯一个无色 AO × 全局天空色），SH2 拿「天顶暗、近地平线亮」
+> 的梯度，建议直接 SH2。`T_sun` 起步可只学一个 RGB 标量场（按太阳俯仰/方位）。
+
+---
+
+## 6. `V_lm` 预计算（复用 `compute_T_light_raster`，不写新光追）
+
+`gaussian_renderer/compute_T_light_raster(means3D, tau, scales, rotations, L_dir, ...)` 本就接受
+**任意方向** `L_dir` 算逐高斯透射率。环境可见度 = 它对（上）半球的积分：
+
+1. 上半球取 **N≈32–64 个 Fibonacci 方向**；
+2. 每方向调一次 → 逐高斯 `T_sky(x, ω_j)`；
+3. `{ω_j → T_sky}` 投到 SH2 → `V_lm(x)`，缓存。**无色、纯几何、只算一次。**
+
+- **下半球**：UE `bLowerHemisphereIsBlack=true` → 采样/投影**只取上半球**（或下半球权重置零）。
+- 存储：200k 高斯 × 9 系数 × float32 ≈ **7 MB**，sidecar 缓存（§10）。
+- 可微性不需要——`V_lm` 是冻结几何的常量。（可选 v0：只投 SH0 = 逐高斯环境遮挡标量，先验管线。）
+
+---
+
+## 7. PRT 线性 → `E`/`T_sun` 可热插拔（关键性质 + 未来方向）
+
+`L` 对 `E` 与 `T_sun` 都**线性**（**前提：`V_lm` 与 `ρ` 冻结**——任一可学/动态则线性破裂），而
+transfer（`V_lm` / 可选 env-MS / `ρ`）**与天空长相无关**。因此：
+
+- **transfer 只标定一次**；
+- **运行时 `(T_sun, E)` 可来自任何地方**：学到的全局函数，或同系数的解析大气。
+
+**未来方向（用户规划）**：自实现基于物理的大气（瑞利+米氏+臭氧），从 `sun_dir` 同时输出 `T_sun`
+和 `E`——**云体环境着色与可见天空着色解耦、只共用 `sun_dir`**；因二者可热插拔，随时收紧到「共用
+整片天空、完全一致、零重训」。**实现铁律**：env 接口做成 **`(T_sun, E_lm) 输入 → L 输出`**，
+**别把天空烘进 `V_lm`**。
+
+---
+
+## 8. 数据采集：纯黑底 env-on（已跑通）
+
+**配方（2026-06-22 已验证）**：SkyAtmosphere 三系数（瑞利/米氏/臭氧）保持**真实值**（→ 大气照云
++ 压暗太阳），**把天空亮度因子调 0** → **背景纯黑、云仍有大气环境光**。env-off = Stage 1 现有数据
+（等价于三系数=0，只有方向光），**不重采**。所以只新增一套：**纯黑底 env-on 图**（同太阳/相机/曝光）。
+
+- **不需要**冻结 SkyLight、**不需要**采 sky cubemap（`E` 是学/解析的，非测）。
+- **曝光必须与 env-off 同一 EV0**，否则差分无意义（见 [[uniform-sun-dataset]] 教训）。
+- **一个验证点**：跨太阳角确认 `E_θ`（蓝色填充）在「天空亮度因子=0」下是否仍在——若该因子把
+  内散射填充也压没了，则采到的 env-on 主要是 `T_sun`（太阳消光）、`E_θ≈0`。预期：**低太阳 `T_sun`
+  主导（红+暗），高太阳填充更明显**。据此决定 `E_θ` 是否需要、还是 `T_sun` 独挑。
+
+---
+
+## 9. Stage 2 训练什么 + 监督（黑底 → 全图直接监督，**无 mask**）
+
+冻结 Stage 1（其渲染 = 纯太阳项）。新增可学：**`T_sun(sun_dir)`、`E_θ(sun_dir)`**（均全局），
+可选**环境云内多次散射**（复用六阶 octave 思路 `T_sky^(bⁿ)` + 无色能量权重，类比 `octave_w`）。
+
+**监督 = 纯黑底全图直接监督**：模型渲云 on 黑（bg=0），直接对 `env_on`（黑底）算 L1 + DSSIM。
+
+- **不需要任何 mask**：背景两边都 0（GT 黑底、模型 bg=0）→ 背景像素 **0=0 平凡匹配**、无 show-through，
+  loss 信号天然集中在云上。这正是「纯黑底 env-on」相对带天空背景方案的最大简化——**整套掩膜 /
+  逐像素 final_T / 方向性天空合成全部不再需要**。
+  > 前提:模型 bg **固定为 0、不可学**;GT 与模型**抗锯齿核一致**(否则云边像素会在黑区引入泄漏)。
+  > 可选自检:统计 GT 黑区里 `0 < 模型色 < 1e-3` 的像素数,确认无意外泄漏。
+- 等价地可监督 `env_on − env_off`（黑底下 = 纯大气效应：`T_sun` 对太阳项的缩放 + `E·V` 填充）。
+- 太阳/环境分离由**数据**给定（两套图，非模型猜）；冻结 `ρ` 解全局色调歧义。
+
+---
+
+## 10. 实现改动清单（复用 tonemap 的独立优化器 + sidecar）
 
 ### `scene/gaussian_model.py`
-- `_sky_transfer`（(P, n_sh) buffer，**非 nn.Parameter**，预计算的 V_lm）+
-  `_k_env`（标量 nn.Parameter，可选解冻的环境强度）。
-- 新方法 `precompute_sky_transfer(N_dirs, sh_order)`：复用
-  `compute_T_light_raster` 取 N 方向 → 投 SH → 写入 `_sky_transfer`。
-- 新方法 `apply_env(E_lm)`：返回逐高斯 `ρ · Σ E_lm V_lm`（可微 in E_lm 与 _k_env）。
-- **独立优化器** `env_optimizer`（仅 `_k_env` / 解冻的 ρ），隔离 densify/prune
-  （Stage 2 不 densify，但隔离仍是安全惯例；理由同 tonemap，见 `_prune_optimizer`
-  对每组无脑 `[mask]` 的坑）。
-- **sidecar 持久化**：`sky_transfer.npy` + `env.json`（k_env、sh_order、N_dirs）
-  写到 PLY 同目录，镜像 `tonemap.json`。`load_ply` 自动恢复。
+- `_sky_transfer`（(P, n_sh) buffer，**非 nn.Parameter**，预计算 `V_lm`）。
+- `_sky` / `E_θ`（全局天空 SH (n_sh,3) 或小 MLP）；`_t_sun` / `T_sun`（全局 RGB，sigmoid/exp 保证 ≤1）；可选 `_k_env`。
+- `precompute_sky_transfer(N, order)`：复用 `compute_T_light_raster` → SH（上半球，下半球 0）。
+- `apply_env(sun_dir)` → 逐高斯 `ρ·Σ E_θ(sun)·V_lm`；`sun_atten(sun_dir)` → `T_sun(sun)`（可微）。
+- **独立优化器** `env_optimizer`（仅全局新参数 `E_θ`/`T_sun`/`k_env`）；隔离 densify/prune（理由同
+  tonemap：`_prune_optimizer` 对每组无脑 `[mask]`，全局参数会崩）。
+- **sidecar**：`sky_transfer.npy` + `env.json`（`E_θ`/`T_sun` 参数、sh_order、N），镜像 `tonemap.json`，`load_ply` 自动恢复。
 
 ### `arguments/__init__.py`
-- `PipelineParams`：`env_lighting=False`（开关）、`env_sh_order=2`、
-  `env_transfer_dirs=48`、`env_octave_reuse=False`。
-- `OptimizationParams`：`env_lr`、`unfreeze_albedo_in_env=False`。
+- `PipelineParams`：`env_lighting=False`、`env_sh_order=2`、`env_transfer_dirs=48`、`env_octave_reuse=False`。
+- `OptimizationParams`：`env_lr`。**ρ 保持冻结**（不提供解冻开关——解冻会重开全局色调歧义、破坏
+  已冻结太阳项的标定，红线）。
 
 ### `gaussian_renderer/__init__.py`（render）
-- 网关：`if getattr(pipe,"env_lighting",False) and pc 有 transfer`：
-  `Lk = sun_term + pc.apply_env(viewpoint_camera.sky_sh)`（内散射）。
-- **背景透射**：渲云用 bg=0，取逐像素 `final_T`，外部合成
-  `img = cloud + final_T · sky(view_dir)`，`sky(view_dir)` = cubemap 按视线方向采样。
-- 逐帧 `sky_sh`（投影系数）+ sky cubemap 从 camera 取（dataset_readers 注入，
-  同 `sun_dir` 路径）。诊断通道（override_color）与现有 tonemap 网关不变。
+- 网关：`if pipe.env_lighting and pc 有 transfer`：
+  `Lk = T_sun(cam.sun_dir) ⊙ sun_term + pc.apply_env(cam.sun_dir)`。
+- 环境项与 `T_sun` 缩放都在**线性空间**、tonemap 之前：`(T_sun⊙sun + E·V) → ACES → loss`。
+  诊断通道（override_color）与现有 tonemap 网关不变。
 
-### `submodules/diff-gaussian-rasterization`（绑定层）
-- 暴露 kernel 已算的逐像素 `final_T`（`forward.cu:482`）到 Python 返回值，供背景
-  方向性天空外部合成。当前色彩路径只返回 color/radii/depth/contribution。
-
-### `train.py`（Stage 2 入口，可能是新脚本 `train_env.py`）
-- 加载 Stage 1 的 PLY（冻结），调 `precompute_sky_transfer` 一次。
-- 冻结主优化器（或只建 `env_optimizer`），用差分图 / env_on 图监督。
-- 复用 tonemap optimizer 的 step / sidecar 保存模式。
+### `train_env.py`（Stage 2 入口，新脚本）
+- 加载 Stage 1 PLY（冻结），`precompute_sky_transfer` 一次；只建 `env_optimizer`；
+  **黑底全图直接监督 `env_on`（无 mask）**；复用 tonemap 的 step / sidecar 保存模式。
 
 ### `scene/dataset_readers.py` + `cameras.py`
-- 读取每帧 `sky_sh`，挂到 camera（同 `sun_direction` 现有路径）。
+- env-on 图作为第二套图读入（同太阳同相机），挂到 camera；`sun_dir` 已有路径不变。
 
 ### `viewer.py`
-- auto-detect `env_lighting` + 加载 sky_transfer/env sidecar。
-- GUI：天空 SH 编辑（或预设若干天空）→ 实时 relighting 演示。
+- auto-detect `env_lighting` + 加载 sidecar；GUI 环境光开关/强度；**无极太阳直接 evaluate
+  `(T_sun, E_θ)` 做 relighting**（连续、无盘、无插值、无冻结亮点）。背景默认黑。
 
-### `tools/`（数据采集，**第一步、不需训练代码**）
-- 扩 `cloud_dataset_generator.py`（手动 py 模式，避开会崩的 MCP 插件），每太阳方向三采：
-  - （a）**sky cubemap**：SkyAtmosphere 可视 + **隐藏 HeterogeneousVolume** → 捕获
-    `RT_SkyCube` → 投 radiance SH（`E_lm`）；
-  - （b）**env_on 图**：SkyAtmosphere 可视 + 云可见（蓝天背景 + 环境光着色）；
-  - （c）**env_off 图**：SkyAtmosphere 不可视 + 云可见 = **Stage 1 现有数据**，无需重采。
-  即 env_off/on 只差 SkyAtmosphere 可见性一个开关。
+### （可选）光栅化器 `final_T` —— 仅 viewer/配图想把云衬在天空前时才需
+- **训练黑底不需要 `final_T`**。仅当 viewer/配图要合成方向性天空背景，才暴露逐像素 `final_T`
+  （当前 forward 返回 `color, radii, invdepths, contribution, tau_front_sum, tau_front_wsum`，
+  **无逐像素 alpha**；`diff_gaussian_rasterization/__init__.py:96`）+ 重编译。属可选 cosmetic，不挡训练。
 
 ---
 
-## 8. 复用的既有实现
+## 11. viewer / 配图（背景默认黑，sky 合成是可选 cosmetic）
 
-- `compute_T_light_raster`（gaussian_renderer/__init__.py）：V_lm 预计算的逐方向
-  透射率，直接复用，不写新光追。
-- tonemap 的**独立优化器 + sidecar**模式（gaussian_model.py 的 `setup_tonemap` /
-  `tonemap.json` save/load）：env 参数照搬。
-- octave 着色循环（render 的 `T_eff = T_light^(ms_b^n)` + 学到的 octave_w）：
-  环境多次散射复用（可选）。
-- `metrics.json` / `tonemap.json` sidecar 写法：`env.json` / `sky_transfer.npy` 镜像。
-- `cloud_dataset_generator.py` 手动 py 采集模式 + throttle 关闭：env 双渲扩展。
+- 训练与默认 viewer：**黑底**。relighting = 无极太阳直接 evaluate `(T_sun, E_θ)`。
+- 想配图把云衬在天空前（可选）：用 `E_θ`/解析大气重建低频天空 + 沿**连续 sun_dir** 叠**解析太阳盘**
+  （随滑块走、无冻结错位），框架外合成 `C + final_T·SKY`（需上面 `final_T`）。背景**从不被训练**
+  → 随便好看，不破坏一致性（模型=云+环境光两端一致，背景只是末端贴图）。
 
 ---
 
-## 9. 待定的设计决策（需用户拍板）
+## 12. 跨框架对比协议（DSYG）
 
-1. **SH 阶数**：SH2（9/通道，够低频）还是 SH3（16/通道，更准但 transfer 翻倍）？
-2. **环境多次散射**：v1 纯各向同性，还是复用 octave 做 `T_sky^(bⁿ)`？
-3. **Stage 2 自由度**：只放 `k_env`（纯验证物理自洽）还是同时解冻 ρ 微调？
-4. **监督信号**：env-on 直接监督（背景方向性天空合成）为主；差分图为备选（须额外
-   减去已知 `T_cam·E_sky` 背景项才等于纯内散射）。倾向直接监督。
-5. **数据规模**：每个太阳方向各一张 sky cubemap + env_on 图，复用现有 60 太阳？
+DSYG 的 VPRF = 纯发射 SH、无光照输入 → **不能 relighting**；只能当**固定光照新视角重建/紧凑度
+基线**，**不是 held-out 太阳 relighting 基线**（结构上做不到）。
 
----
-
-## 10. 验证（端到端）
-
-1. **物理自洽 sanity**：仅 `k_env`、冻结一切，看预测能否对上差分图；`k_env≈1` 且
-   残差小 = 物理正确。
-2. **残差分桶**：复用 `tools/residual_buckets.py` / `penumbra_residual.py`，确认
-   环境光是否补对了"朝亮天一侧"，且**没有均匀提亮深核**（假底光回归检查）。
-3. **relighting 泛化**：held-out 天空（留几个太阳方向的 cubemap 不参与训练）测
-   外推；viewer 里手动换天空 SH 看观感。
-4. **回归**：`env_lighting=False` 时行为与 Stage 1 完全一致（不加载 transfer、
-   不改 sun_term）。
+- **黑底消变量**：GT / 本方法 / DSYG 全用黑底渲染 → 可见背景恒 0、平凡一致；**无需 mask**（两边
+  0=0）。DSYG(Mitsuba) 不挂 environment emitter → 打空返回黑。
+- **指标可全图（黑底）算**；若担心大片黑像素抬高 PSNR，可**附报**云区指标（GT `invdepth>0`），
+  但对**公平性非必需**（两边同样的黑像素）。
+- **同 tonemap/色彩空间**：两边输出施加**同一变换**再算指标（本管线 ACES，Mitsuba 出线性 HDR）——
+  **最易翻车的跨框架坑**。
+- **同数据契约**：同图/位姿/分辨率/split/曝光。
+- **定性天空配图**：两边只输出 `(C, final_T)`，框架外共享脚本合成同一片天空 → 像素级一致。
+- **范围声明**：① 固定太阳「体积云重建质量 + 紧凑度」与 DSYG 比；② **relighting(held-out 太阳)
+  是本方法独有，不与 DSYG 比**（同时凸显贡献）。
 
 ---
 
-## 11. 风险与坑（务必前置）
+## 13. 验证（端到端）
 
-- **双重遮挡**：捕获 sky cubemap 时未隐藏云 → cubemap 和 V_lm 各算一遍遮挡 →
-  深核双重压暗。**采集脚本必须隐藏云体**（§4）。
-- **环境光变可学习 fudge**：若 E_sky 不当输入而去学，或 `k_env` 在无差分监督下
-  自由漂移，会变成补别的误差的 fudge（重蹈 aniso 针 / octave 假底光覆辙）。
-  **E_sky 必须是输入，监督必须用差分图隔离**。
-- **下半球**：UE `bLowerHemisphereIsBlack=true`，采样/投影须一致，否则给云底
-  补了 UE 里不存在的光。
-- **tonemap 叠加**：Stage 2 仍在 ACES tonemap 空间训练（默认）；环境项在**线性
-  空间**加进 sun_term 之后、tonemap 之前。顺序：`(sun+env) → ACES → loss`。
-- **背景须用方向性天空，不是常数**：env-on 背景是蓝天渐变 + 太阳侧偏亮，常数 bg
-  合成会在背景及云薄边与 GT 失配。须把 bg 喂方向性天空（cubemap 视线采样）。注意：
-  show-through 本身零参数、是确定性合成，**不是**退化风险，只是要喂对背景。
-- **部署**：线性辐亮度场塞回 UE 时输出线性、让 UE 自己 tonemap，勿双重 ACES。
+1. **物理 sanity**：仅 `T_sun`+`E_θ`、冻结一切，看预测对不对得上 `env_on`（或 `env_on−env_off`）；残差小=结构正确。
+2. **变暗/变红方向性**：低太阳 `T_sun<1` 且偏红是否复现；**加性-only 基线对照应做不出「变暗」**
+   → 反向佐证 `T_sun` 的必要性。
+3. **残差分桶**：复用 `tools/residual_buckets.py` / `penumbra_residual.py`，确认填充补对「朝亮天
+   一侧」、且**无均匀提亮深核**（假底光回归检查）。
+4. **relighting 泛化**：**4 个 held-out 太阳**（time_index 7/22/37/52）测 `T_sun/E_θ` 外推；viewer
+   无极太阳看观感。残差小 = 学到的大气泛化成立。
+5. **回归**：`env_lighting=False` 时行为与 Stage 1 完全一致（不加载 transfer、不改 sun_term）。
 
 ---
 
-## 12. v1 明确不做
+## 14. 风险与坑（务必前置）
 
-- view-dependent 环境相函数瓣（v1 各向同性；若残差显方向性再加）。
-- 环境光下重新 densify / 动几何（Stage 2 几何严格冻结）。
-- 学习天空（E_sky 永远是输入）。
-- per-channel 之外的色彩自由度（色度锁在 ρ，原则不变）。
-- 动态时变天空插值（先离散每太阳一张，插值留后续）。
+- **🔴 退化为 3DGS**：env 只许「全局 `T_sun/E_θ` × 逐高斯无色 `V` × 已有 `ρ`」，**禁逐高斯色彩 DOF**（含 sun-conditioned per-Gaussian MLP）。
+- **⚠ 加性表达不出变暗**：必须乘性 `T_sun`（§3）。
+- **太阳盘双重计数**：`E_θ` 必须无盘；直射归 DirectionalLight；监督目标 `env_on−env_off` 天然无盘。
+- **下半球**：`bLowerHemisphereIsBlack=true`，`V_lm` 采样/投影只取上半球。
+- **曝光必须锁定**：env-on 与 env-off 同一 EV0。
+- **sun_dir 约定**：云 HG 用 `ω_in=−sun_dir`（见 [[g-collapse-was-phase-sign-bug]]）；`T_sun`/`E_θ`/未来大气同约定。
+- **ρ 保持冻结**：解冻会重开全局色调歧义、破坏太阳项标定。
+- **差分二阶耦合**：`env_on−env_off=纯大气效应` 假设太阳项与环境散射不耦合；实际多次散射可能引入小残差，由可选 env-MS 项吸收（v1 可接受）。典型云(ρ~0.7-0.9、τ~1-2)残差约 **5–15%**;训练时记录 `‖env_on−env_off−(T_sun⊙L_sun+E·V)‖`,**>20% 才开 env-MS**。
+- **解析大气 vs UE 多散射**：单次散射对不上 UE 的 multi-scatter LUT；要像素级匹配需复刻 Hillaire。**先学后换**兜底。
+- **部署**：线性辐亮度塞回 UE 输出线性、让 UE 自己 tonemap，勿双重 ACES。
 
 ---
 
-## 13. 建议的第一步
+## 15. v1 明确不做
 
-**不写训练代码**：先准备 UE 采集脚本（隐藏云 + sky cubemap 双渲 + SH 导出），
-把干净的 env_on / sky_sh 监督信号拿到手。数据一到，按 §7 接入即可。
+- view-dependent 环境相函数瓣（v1 各向同性；残差显方向性再加）。
+- 环境光下重新 densify / 动几何（几何严格冻结）。
+- **逐高斯色彩自由度 / 学习逐高斯颜色**（红线）。
+- 采 sky cubemap（学/解析，除非泛化不过关才回退）。
+- 动态时变天空插值（`E_θ`/`T_sun` 已连续）。
+- **训练期 mask / 方向性天空背景合成**（纯黑底 → 全图直接监督；天空合成是 viewer 可选 cosmetic）。
 
-相关记忆：[[uniform-sun-dataset]]（env-off 控制变量设计、采集走手动 py）、
-[[tlight_raster_arc]]（compute_T_light_raster 复用）。
+---
+
+## 16. 建议的第一步
+
+数据已可得（§8 纯黑底 env-on）。直接按 §10 接入：① 预计算 `V_lm`；② 加全局 `T_sun` + `E_θ`；
+③ **黑底全图直接监督 `env_on`（无 mask）**；④ sanity（`T_sun` 复现变暗/红）+ 4 个 held-out 太阳
+验证泛化。之后（endgame）把同系数解析大气的 `(T_sun, E)` 热插拔进来（§4 / §7）。
+
+相关记忆：[[env-lighting-no-cubemap]]（本方案决策、红线、T_sun、黑底采集）、[[uniform-sun-dataset]]
+（env-off 控制变量、固定曝光、手动 py 采集）、[[tlight_raster_arc]]（compute_T_light_raster 复用）、
+[[g-collapse-was-phase-sign-bug]]（sun_dir 约定）。
