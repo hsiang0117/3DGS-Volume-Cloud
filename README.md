@@ -260,9 +260,14 @@ python tools/eval_test_groups.py output/<run>
 
 ```shell
 python viewer.py --ply output/<run>/point_cloud/iteration_30000/point_cloud.ply
+
+# 可选:HDR cubemap 天空背景(替换纯色底)
+python viewer.py --ply output/<run>/.../point_cloud.ply --sky_dir data/sky_backdrop
 ```
 
 基于 viser:实时改变太阳方向(relighting)、可视化通道(RGB / T_light / β_peak / depth)、可调背景色、snap 到训练相机。`--tlight auto|voxel|raster` 控制阴影源(auto 读训练 run 的 cfg_args)。加载 Stage 2 模型时自动检测 env sidecar 并开启环境光(太阳滑块同时驱动 `T_sun` + `E_lm`,可勾选框 A/B 开关)。
+
+**天空背景(`--sky_dir`,可选,纯展示)**:给定一组 per-太阳高度的 HDR cubemap(由 `tools/ue_capture_sky_backdrop.py` 从 UE 采集,见下),viewer 把云合成到真实天空前而非纯色底。太阳**高度**滑块选 cube、**方位**滑块旋转它(SkyAtmosphere 绕天顶轴旋转对称,唯一破对称的太阳随之转)。合成在 **rasterizer 内一趟完成**(逐像素 `bg_image` 线性 over + 单次 tonemap),"Sky backdrop" 勾选框开关,`Sky exposure`(默认 3.35)/`Sky warmth`(默认 0.09)对齐 UE 视口观感(实测多太阳高度 RMSE≈0.024)。**纯 viewer 展示,不进训练、不碰冻结的 albedo**;诊断通道保持纯色底。
 
 ### 工具
 
@@ -272,6 +277,7 @@ tools/plot_phase_function.py       # 有效相函数重建
 tools/project_pointcloud.py        # 初始点云-图像对齐快检
 tools/residual_buckets.py          # 有符号残差分桶(GT 亮度 × 深度覆盖)+ held-out 太阳 PSNR
 tools/penumbra_residual.py         # 残差按逐像素 T_light(阴影深度)分桶 × GT 亮度 cross-tab
+tools/ue_capture_sky_backdrop.py   # [UE 内运行] 采集 viewer 天空背景:per-太阳高度 6 面 HDR cube
 ```
 
 ## 当前状态与已知限制
