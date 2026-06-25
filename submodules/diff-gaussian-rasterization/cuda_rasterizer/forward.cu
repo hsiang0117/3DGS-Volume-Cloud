@@ -339,6 +339,7 @@ renderCUDA(
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
+	const float* __restrict__ bg_image,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
 	float* __restrict__ invdepth,
@@ -482,7 +483,13 @@ renderCUDA(
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
-			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		{
+			// Per-pixel background (e.g. a sky cubemap sampled per ray) when
+			// bg_image is provided; otherwise the constant bg_color. Linear
+			// alpha-over: out = Σ(cloud·α·T) + T_final·bg.
+			const float bg = bg_image ? bg_image[ch * H * W + pix_id] : bg_color[ch];
+			out_color[ch * H * W + pix_id] = C[ch] + T * bg;
+		}
 
 		if (invdepth)
 		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
@@ -501,6 +508,7 @@ void FORWARD::render(
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
+	const float* bg_image,
 	float* out_color,
 	float* depths,
 	float* depth,
@@ -519,6 +527,7 @@ void FORWARD::render(
 		final_T,
 		n_contrib,
 		bg_color,
+		bg_image,
 		out_color,
 		depths,
 		depth,

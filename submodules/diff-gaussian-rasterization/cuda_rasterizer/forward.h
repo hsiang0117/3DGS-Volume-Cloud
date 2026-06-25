@@ -65,6 +65,7 @@ namespace FORWARD
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
+		const float* bg_image,
 		float* out_color,
 		float* depths,
 		float* depth,
