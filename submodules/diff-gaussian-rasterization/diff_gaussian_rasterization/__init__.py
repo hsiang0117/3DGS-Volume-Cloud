@@ -59,9 +59,16 @@ class _RasterizeGaussians(torch.autograd.Function):
         raster_settings,
     ):
 
+        # Per-pixel background (sky backdrop) or an empty tensor for the
+        # constant-bg path. Must match the C++ arg order (right after `bg`).
+        bg_image = raster_settings.bg_image
+        if bg_image is None:
+            bg_image = torch.empty(0, device=means3D.device, dtype=means3D.dtype)
+
         # Restructure arguments the way that the C++ lib expects them
         args = (
             raster_settings.bg,
+            bg_image,
             means3D,
             colors_precomp,
             opacities,
@@ -177,6 +184,7 @@ class _RasterizeLightpass(torch.autograd.Function):
 
         args = (
             raster_settings.bg,
+            empty,  # bg_image: lightpass uses the constant-bg path
             means3D,
             dummy_colors,
             dummy_opacity,
@@ -254,6 +262,11 @@ class GaussianRasterizationSettings(NamedTuple):
     # light-space shadow pass: T_light = exp(-tau_front_sum/tau_front_wsum).
     # Forward-only (gradients ignored).
     record_front_tau : bool = False
+    # Optional per-pixel background image (CHANNELS x H x W, planar, linear),
+    # used in place of the constant `bg` in the final alpha-over. The viewer's
+    # sky backdrop sets this so the rasterizer composites cloud-over-sky in one
+    # pass. None -> constant `bg` (training path, unchanged). Forward-only.
+    bg_image : torch.Tensor = None
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
