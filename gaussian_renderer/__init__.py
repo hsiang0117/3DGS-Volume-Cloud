@@ -268,7 +268,7 @@ def compute_T_light_raster(means3D, tau_sun_per_gauss, scales, rotations,
     return T_light.unsqueeze(-1)
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, override_color = None, precomputed_T_light=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, override_color = None, precomputed_T_light=None, bg_image=None):
     """
     Render the scene.
 
@@ -282,6 +282,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         precomputed_T_light:   (P, 1) tensor; if provided, skip the expensive
                                compute_T_light call. Useful when the sun is static
                                and T_light only needs to be computed once.
+        bg_image:              (3, H, W) linear tensor; if provided, used per-pixel
+                               in place of bg_color in the final alpha-over (cloud
+                               over sky). Viewer sky backdrop only; None in training.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -310,6 +313,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         debug=False,
         antialiasing=False,
         k_sigma=getattr(pipe, "k_sigma", 0.0),
+        bg_image=bg_image,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)

@@ -9,3 +9,5 @@ submodules/*/*.egg-info
 **/__pycache__
 .mcp.json
 recordings/
+# compiled CUDA extensions (build artifacts)
+**/*.pyd
