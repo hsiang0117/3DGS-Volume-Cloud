@@ -12,6 +12,7 @@ beta_peak), and interactive sun direction (T_light recomputed on change).
 """
 
 import os
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # enable cv2 EXR before cv2 is imported (sky_backdrop / recorder)
 import argparse
 import math
 import re
@@ -27,6 +28,7 @@ from scene.cameras import MiniCam
 from gaussian_renderer import render, compute_T_light_voxel, compute_T_light_raster, normalized_gaussian_line_integral
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import build_rotation
+from sky_backdrop import SkyBackdrop, camera_ray_dirs
 
 
 # --- Pipeline stub (mirrors arguments.PipelineParams, no argparse needed) ---
@@ -287,6 +289,17 @@ def main():
                              "(learnable coeffs from tonemap.json if present, else fixed Narkowicz "
                              "ACES); 'on'/'off' force tonemap on/off. Tonemapped models look too "
                              "bright / low-contrast without it.")
+    parser.add_argument("--sky_dir", default=None,
+                        help="Optional directory of captured HDR sky cubemaps "
+                             "(sky.json + sky_alt*_*.exr from tools/ue_capture_sky_backdrop.py). "
+                             "Enables the 'Sky backdrop' checkbox: the flat background is replaced "
+                             "by the per-sun-elevation sky, composited behind the cloud.")
+    parser.add_argument("--sky_exposure", type=float, default=3.35,
+                        help="Linear exposure multiplier applied to the (linear-HDR) sky before "
+                             "tonemapping, so the captured SceneColorHDR (no UE exposure baked in) "
+                             "matches the editor look. Default 3.35 (calibrated against the UE "
+                             "viewport across sun elevations); live-adjustable via the 'Sky "
+                             "exposure' slider.")
     args = parser.parse_args()
 
     # Resolve the T_light source. Models calibrate β/albedo against their
@@ -439,6 +452,18 @@ def main():
         print(f"[viewer] Falling back to cameras.json ({len(train_cams)} entries) from {train_cams_path}.")
     else:
         train_cam_names = []
+
+    # --- Optional sky backdrop (viewer-only eye-candy; not training) --------
+    backdrop = None
+    if args.sky_dir:
+        try:
+            backdrop = SkyBackdrop(args.sky_dir)
+            print(f"[viewer] Sky backdrop: {args.sky_dir} "
+                  f"(elevations {backdrop.alt_min}..{backdrop.alt_max}, {backdrop.ext}). "
+                  f"Toggle 'Sky backdrop'; the sun sliders drive elevation/azimuth.")
+        except Exception as e:
+            print(f"[viewer] Sky backdrop disabled (load failed: {e})")
+            backdrop = None
 
     pipe = _ViewerPipe()
     pipe.tonemap_aces = tonemap_aces
@@ -596,6 +621,30 @@ def main():
              "frozen sun shading; tracks the sun slider for relighting. Only active for "
              "a --stage2 model (env sidecars present); a no-op otherwise.",
     )
+    gui_sky = server.gui.add_checkbox(
+        "Sky backdrop",
+        initial_value=(backdrop is not None),
+        hint="Replace the flat background with the captured HDR sky cubemap: picks the "
+             "cube for the sun-altitude slider and rotates it to the azimuth slider, "
+             "composited behind the cloud via its transmittance. RGB view only; needs "
+             "--sky_dir. Viewer-only backdrop — does not affect cloud shading.",
+    )
+    gui_sky.disabled = backdrop is None
+    gui_sky_exposure = server.gui.add_slider(
+        "Sky exposure", min=0.25, max=8.0, step=0.05, initial_value=float(args.sky_exposure),
+        hint="Linear exposure multiplier on the HDR sky before tonemapping. The capture "
+             "is raw SceneColorHDR (no UE exposure), so this dials the sky brightness to "
+             "match the editor / cloud. ~3.0 ≈ the UE viewport. Sky backdrop only.",
+    )
+    gui_sky_exposure.disabled = backdrop is None
+    gui_sky_warmth = server.gui.add_slider(
+        "Sky warmth", min=-0.3, max=0.3, step=0.01, initial_value=0.09,
+        hint="White-balance the sky: R·(1+w), B·(1-w). Corrects the "
+             "residual cool/blue cast of Narkowicz ACES vs UE's filmic+grading so the "
+             "backdrop matches the editor. Default 0.09 (calibrated across sun elevations; "
+             "RMSE≈0.024). + = warmer, - = cooler. Sky backdrop only.",
+    )
+    gui_sky_warmth.disabled = backdrop is None
     gui_reset = server.gui.add_button(
         "Reset camera",
         hint="Re-fit the camera to the cloud's bounding box.",
@@ -748,6 +797,9 @@ def main():
     gui_bgcolor.on_update(_mark_dirty)
     gui_tonemap.on_update(_mark_dirty)
     gui_env.on_update(_mark_dirty)
+    gui_sky.on_update(_mark_dirty)
+    gui_sky_exposure.on_update(_mark_dirty)
+    gui_sky_warmth.on_update(_mark_dirty)
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
@@ -923,6 +975,7 @@ def main():
             pipe.tonemap_aces = _tm_on and not tonemap_learnable
             pipe.env_lighting = bool(gui_env.value) and has_env
             mode = gui_mode.value
+            sky_active = bool(gui_sky.value) and (backdrop is not None) and mode == "rgb"
 
             # Update background colour in place (RGB 0-255 -> 0-1) so we don't
             # allocate a new GPU tensor every frame.
@@ -940,12 +993,31 @@ def main():
             else:
                 override = None
 
+            # Sky backdrop source: sample the HDR cube along this view's rays and
+            # hand it to the rasterizer as a per-pixel background (cloud-over-sky
+            # composite in one pass). Exposure + warmth white-balance it to match
+            # the editor.
+            sky_image = None
+            if sky_active:
+                c2w_rot = _quat_wxyz_to_matrix(np.asarray(cam.wxyz, dtype=np.float32))
+                rays = camera_ray_dirs(c2w_rot, float(cam.fov), render_w, render_h)
+                sky_image = backdrop.sample(
+                    rays, float(gui_sun_alt.value), float(gui_sun_az.value)
+                ).permute(2, 0, 1) * float(gui_sky_exposure.value)
+                w = float(gui_sky_warmth.value)
+                if w != 0.0:
+                    sky_image = sky_image * torch.tensor(
+                        [1.0 + w, 1.0, 1.0 - w], device=sky_image.device, dtype=sky_image.dtype
+                    ).view(3, 1, 1)
+                sky_image = sky_image.contiguous()
+
             try:
                 with torch.no_grad():
                     out = render(
                         mini, gaussians, pipe, bg_color,
                         override_color=override,
                         precomputed_T_light=current_T_light,
+                        bg_image=sky_image,
                     )
             except RuntimeError as e:
                 print(f"[viewer] render failed: {e}")
@@ -978,6 +1050,8 @@ def main():
             if mode == "depth":
                 img_np = _depth_to_image(out["depth"])
             else:
+                # For the sky backdrop, out["render"] is already tonemap(cloud +
+                # T_final·sky) — composited in the rasterizer, tonemapped once.
                 img_np = _tensor_to_image(out["render"])
 
             if first_client:
