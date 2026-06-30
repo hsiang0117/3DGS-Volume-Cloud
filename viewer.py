@@ -66,13 +66,19 @@ def _quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
     )
 
 
-def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: float = 100.0, sun_dir=None) -> MiniCam:
+def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: float = 100.0, sun_dir=None, aspect=None) -> MiniCam:
     """Build a 3DGS MiniCam from a viser CameraHandle.
 
     Both viser and the 3DGS rasterizer use the same camera-local convention:
     +X right, +Y down, +Z forward (OpenCV / COLMAP style). `cam.wxyz` is
     world-from-camera rotation; `cam.fov` is vertical FOV in radians. So we can
     use viser's pose as-is, with no axis flipping.
+
+    `aspect` overrides the horizontal FOV's aspect ratio: None uses the live
+    canvas aspect (interactive view); pass an explicit value (e.g. 1.0 for a
+    square still) so fovx matches the requested width/height — the still capture
+    needs this so the rasterizer FOV and the sky-backdrop rays (which derive
+    their own aspect from width/height) agree.
 
     (Datasets read via `readCamerasFromTransforms` come from OpenGL/Blender
     transforms and DO need a Y/Z axis flip — but that's a property of the
@@ -86,7 +92,8 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
     world_view = torch.from_numpy(w2c).float().cuda().T
 
     fovy = float(cam.fov)
-    aspect = float(cam.aspect) if cam.aspect > 0 else (width / max(1, height))
+    if aspect is None:
+        aspect = float(cam.aspect) if cam.aspect > 0 else (width / max(1, height))
     fovx = 2.0 * math.atan(math.tan(fovy / 2.0) * aspect)
 
     proj = getProjectionMatrix(znear=z_near, zfar=z_far, fovX=fovx, fovY=fovy).cuda().T
@@ -664,6 +671,19 @@ def main():
     )
     gui_record_status = server.gui.add_text("Recording", initial_value="-")
     gui_record_status.disabled = True
+    gui_shot_size = server.gui.add_slider(
+        "Still size (px)", min=256, max=4096, step=128, initial_value=1024,
+        hint="Side length of the square still saved by 'Capture still'. Fixed "
+             "aspect 1:1, independent of the browser window.",
+    )
+    gui_shot = server.gui.add_button(
+        "📷 Capture still",
+        hint="Render a square PNG at the current camera pose (and all current "
+             "settings: sun, tonemap, sky backdrop, view mode) into ./figures/. "
+             "For paper figures — resolution is fixed by 'Still size', not the window.",
+    )
+    gui_shot_status = server.gui.add_text("Still", initial_value="-")
+    gui_shot_status.disabled = True
     gui_fps = server.gui.add_text("FPS", initial_value="-")
     gui_fps.disabled = True
     gui_ngauss = server.gui.add_text("# Gaussians", initial_value=f"{P:,}")
@@ -918,6 +938,96 @@ def main():
 
     # --- Render loop --------------------------------------------------------
     print(f"[viewer] Serving at http://localhost:{args.port}")
+
+    def render_frame(cam, render_w, render_h, aspect=None):
+        """Render one frame for `cam` at (render_w, render_h), honouring every
+        live GUI control (mode, tonemap, env, sky backdrop, bg colour, k_sigma).
+
+        Shared by the interactive loop and the still-capture button so their
+        output is identical. `aspect` overrides the camera's horizontal FOV
+        aspect (the still passes render_w/render_h so a square capture isn't
+        stretched by the live canvas aspect). Returns (H, W, 3) uint8.
+        """
+        current_sun = state["sun_dir"]
+        current_T_light = state["T_light"]
+        if aspect is None:
+            aspect = render_w / max(1, render_h)
+        mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far,
+                                sun_dir=current_sun, aspect=aspect)
+        pipe.k_sigma = float(gui_ksigma.value)
+        _tm_on = bool(gui_tonemap.value)
+        pipe.tonemap_learnable = _tm_on and tonemap_learnable
+        pipe.tonemap_aces = _tm_on and not tonemap_learnable
+        pipe.env_lighting = bool(gui_env.value) and has_env
+        mode = gui_mode.value
+        sky_active = bool(gui_sky.value) and (backdrop is not None) and mode == "rgb"
+
+        _bg = gui_bgcolor.value
+        bg_color[0] = _bg[0] / 255.0
+        bg_color[1] = _bg[1] / 255.0
+        bg_color[2] = _bg[2] / 255.0
+
+        if mode == "T_light":
+            override = current_T_light.expand(-1, 3).contiguous()
+        elif mode == "beta_peak":
+            beta = gaussians.get_extinction.detach() / beta_max
+            override = beta.clamp(0.0, 1.0).expand(-1, 3).contiguous()
+        else:
+            override = None
+
+        # Sky backdrop: sample the HDR cube along this view's rays and hand it to
+        # the rasterizer as a per-pixel background (cloud-over-sky in one pass).
+        sky_image = None
+        if sky_active:
+            c2w_rot = _quat_wxyz_to_matrix(np.asarray(cam.wxyz, dtype=np.float32))
+            rays = camera_ray_dirs(c2w_rot, float(cam.fov), render_w, render_h)
+            sky_image = backdrop.sample(
+                rays, float(gui_sun_alt.value), float(gui_sun_az.value)
+            ).permute(2, 0, 1) * float(gui_sky_exposure.value)
+            w = float(gui_sky_warmth.value)
+            if w != 0.0:
+                sky_image = sky_image * torch.tensor(
+                    [1.0 + w, 1.0, 1.0 - w], device=sky_image.device, dtype=sky_image.dtype
+                ).view(3, 1, 1)
+            sky_image = sky_image.contiguous()
+
+        with torch.no_grad():
+            out = render(
+                mini, gaussians, pipe, bg_color,
+                override_color=override,
+                precomputed_T_light=current_T_light,
+                bg_image=sky_image,
+            )
+        if mode == "depth":
+            return _depth_to_image(out["depth"]), out
+        # For the sky backdrop, out["render"] is already tonemap(cloud +
+        # T_final·sky) — composited in the rasterizer, tonemapped once.
+        return _tensor_to_image(out["render"]), out
+
+    def _save_still(_):
+        """Render a square still at the current camera for paper figures."""
+        clients = server.get_clients()
+        if not clients:
+            gui_shot_status.value = "no client connected"
+            return
+        cam = next(iter(clients.values())).camera
+        side = int(gui_shot_size.value)
+        try:
+            img_np, _ = render_frame(cam, side, side, aspect=1.0)
+        except RuntimeError as e:
+            gui_shot_status.value = f"render failed: {e}"
+            print(f"[viewer] still capture failed: {e}")
+            return
+        os.makedirs("figures", exist_ok=True)
+        path = os.path.join("figures", time.strftime("fig_%Y%m%d_%H%M%S") + ".png")
+        # render_frame returns RGB uint8; cv2 writes BGR, so flip channels.
+        import cv2
+        cv2.imwrite(path, img_np[..., ::-1])
+        gui_shot_status.value = f"saved {os.path.basename(path)} ({side}²)"
+        print(f"[viewer] still saved: {path} ({side}x{side})")
+
+    gui_shot.on_click(_save_still)
+
     _last_canvas = {}
     while True:
         if not state["needs_render"]:
@@ -964,61 +1074,9 @@ def main():
             else:
                 render_w = max_side
                 render_h = max(1, int(render_w / max(cam.aspect, 1e-3)))
-            current_sun = state["sun_dir"]
-            current_T_light = state["T_light"]
-            mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far, sun_dir=current_sun)
-            pipe.k_sigma = float(gui_ksigma.value)
-            # The single checkbox = "tonemap on/off". Route it to the learnable
-            # curve if the model carries one, else the fixed ACES curve.
-            _tm_on = bool(gui_tonemap.value)
-            pipe.tonemap_learnable = _tm_on and tonemap_learnable
-            pipe.tonemap_aces = _tm_on and not tonemap_learnable
-            pipe.env_lighting = bool(gui_env.value) and has_env
-            mode = gui_mode.value
-            sky_active = bool(gui_sky.value) and (backdrop is not None) and mode == "rgb"
-
-            # Update background colour in place (RGB 0-255 -> 0-1) so we don't
-            # allocate a new GPU tensor every frame.
-            _bg = gui_bgcolor.value
-            bg_color[0] = _bg[0] / 255.0
-            bg_color[1] = _bg[1] / 255.0
-            bg_color[2] = _bg[2] / 255.0
-
-            if mode == "T_light":
-                # T_light is (P, 1); broadcast to RGB grayscale.
-                override = current_T_light.expand(-1, 3).contiguous()
-            elif mode == "beta_peak":
-                beta = gaussians.get_extinction.detach() / beta_max
-                override = beta.clamp(0.0, 1.0).expand(-1, 3).contiguous()
-            else:
-                override = None
-
-            # Sky backdrop source: sample the HDR cube along this view's rays and
-            # hand it to the rasterizer as a per-pixel background (cloud-over-sky
-            # composite in one pass). Exposure + warmth white-balance it to match
-            # the editor.
-            sky_image = None
-            if sky_active:
-                c2w_rot = _quat_wxyz_to_matrix(np.asarray(cam.wxyz, dtype=np.float32))
-                rays = camera_ray_dirs(c2w_rot, float(cam.fov), render_w, render_h)
-                sky_image = backdrop.sample(
-                    rays, float(gui_sun_alt.value), float(gui_sun_az.value)
-                ).permute(2, 0, 1) * float(gui_sky_exposure.value)
-                w = float(gui_sky_warmth.value)
-                if w != 0.0:
-                    sky_image = sky_image * torch.tensor(
-                        [1.0 + w, 1.0, 1.0 - w], device=sky_image.device, dtype=sky_image.dtype
-                    ).view(3, 1, 1)
-                sky_image = sky_image.contiguous()
 
             try:
-                with torch.no_grad():
-                    out = render(
-                        mini, gaussians, pipe, bg_color,
-                        override_color=override,
-                        precomputed_T_light=current_T_light,
-                        bg_image=sky_image,
-                    )
+                img_np, out = render_frame(cam, render_w, render_h)
             except RuntimeError as e:
                 print(f"[viewer] render failed: {e}")
                 continue
@@ -1046,13 +1104,6 @@ def main():
                     else:
                         print("[viewer] DIAG depth: NO non-zero depth pixels (all Gaussians culled?)")
                 state["diag_done"] = True
-
-            if mode == "depth":
-                img_np = _depth_to_image(out["depth"])
-            else:
-                # For the sky backdrop, out["render"] is already tonemap(cloud +
-                # T_final·sky) — composited in the rasterizer, tonemapped once.
-                img_np = _tensor_to_image(out["render"])
 
             if first_client:
                 recorder.add(img_np)
