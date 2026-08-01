@@ -30,7 +30,7 @@ class Camera(nn.Module):
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  is_test_dataset = False, is_test_view = False,
                  is_nerf_synthetic = False,
-                 sun_dir=None,
+                 v_l=None,
                  ):
         super(Camera, self).__init__()
 
@@ -74,9 +74,9 @@ class Camera(nn.Module):
 
         # Per-frame sun direction (OpenGL world coords, points toward the
         # sun). Falls back to [0,1,0] when the dataset supplies none.
-        if sun_dir is None:
-            sun_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        self.sun_dir = torch.from_numpy(np.asarray(sun_dir, dtype=np.float32)).to(self.data_device)
+        if v_l is None:
+            v_l = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.v_l = torch.from_numpy(np.asarray(v_l, dtype=np.float32)).to(self.data_device)
 
     # ------------------------------------------------------------------
     # Lazy-loaded tensor. Same-step accesses share one decode via a tiny
@@ -129,7 +129,7 @@ class Camera(nn.Module):
 
 
 class MiniCam:
-    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform, sun_dir=None):
+    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform, v_l=None):
         self.image_width = width
         self.image_height = height
         self.FoVy = fovy
@@ -141,8 +141,8 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
         # Optional per-frame sun direction (OpenGL world coords). If None,
-        # the renderer falls back to pc.get_sun_dir.
-        if sun_dir is not None and not torch.is_tensor(sun_dir):
-            sun_dir = torch.as_tensor(sun_dir, dtype=torch.float32, device="cuda")
-        self.sun_dir = sun_dir
+        # the renderer falls back to pc.get_v_l.
+        if v_l is not None and not torch.is_tensor(v_l):
+            v_l = torch.as_tensor(v_l, dtype=torch.float32, device="cuda")
+        self.v_l = v_l
 

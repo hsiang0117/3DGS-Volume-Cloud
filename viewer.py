@@ -8,7 +8,7 @@ then open http://localhost:8080 in a browser.
 
 Provides PLY loading, free-fly camera (viser orbit / WASD), FOV and
 per-Gaussian scaling sliders, visualisation modes (RGB | depth | T_light |
-beta_peak), and interactive sun direction (T_light recomputed on change).
+sigma_t), and interactive sun direction (T_light recomputed on change).
 """
 
 import os
@@ -47,7 +47,7 @@ class _ViewerPipe:
     tonemap_aces: bool = False
     tonemap_learnable: bool = False
     # Stage-2 environment lighting. When True, render() adds the learned global sky
-    # (T_sun sun transmittance ⊙ sun_term + ρ·Σ E_lm·V_lm in-scatter) on top of the
+    # (T_sun sun transmittance ⊙ sun_term + ω·Σ E_lm·V_lm in-scatter) on top of the
     # frozen sun shading; tracks the sun direction for relighting. Auto-set when the
     # loaded model carries env sidecars (env_net.pt / sky_transfer.npy).
     env_lighting: bool = False
@@ -66,7 +66,7 @@ def _quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
     )
 
 
-def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: float = 100.0, sun_dir=None, aspect=None) -> MiniCam:
+def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: float = 100.0, v_l=None, aspect=None) -> MiniCam:
     """Build a 3DGS MiniCam from a viser CameraHandle.
 
     Both viser and the 3DGS rasterizer use the same camera-local convention:
@@ -99,11 +99,11 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
     proj = getProjectionMatrix(znear=z_near, zfar=z_far, fovX=fovx, fovY=fovy).cuda().T
     full_proj = world_view.unsqueeze(0).bmm(proj.unsqueeze(0)).squeeze(0)
 
-    return MiniCam(width, height, fovy, fovx, z_near, z_far, world_view, full_proj, sun_dir=sun_dir)
+    return MiniCam(width, height, fovy, fovx, z_near, z_far, world_view, full_proj, v_l=v_l)
 
 
 @torch.no_grad()
-def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor,
+def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
                           use_raster: bool = False, raster_res: int = 512) -> torch.Tensor:
     """Compute T_light for the given sun direction.
 
@@ -112,34 +112,34 @@ def compute_T_light_cache(gaussians: GaussianModel, sun_dir: torch.Tensor,
 
     use_raster selects the light-space rasterized shadow pass instead of the
     128^3 voxel cache. View a model with the SAME T_light source it was trained
-    with — β/albedo calibrate against their training-time shadow field, so mixing
+    with — σ_t/albedo calibrate against their training-time shadow field, so mixing
     sources shows mis-lit results.
     """
-    sun_dir = sun_dir.to(device="cuda", dtype=torch.float32)
-    sun_dir = sun_dir / (torch.linalg.norm(sun_dir) + 1e-8)
+    v_l = v_l.to(device="cuda", dtype=torch.float32)
+    v_l = v_l / (torch.linalg.norm(v_l) + 1e-8)
     s = gaussians.get_scaling
-    beta_peak = gaussians.get_extinction
-    mass = beta_peak * ((2.0 * math.pi) ** 1.5) * torch.prod(s, dim=1, keepdim=True)
+    sigma_t = gaussians.get_sigma_t
+    mass = sigma_t * ((2.0 * math.pi) ** 1.5) * torch.prod(s, dim=1, keepdim=True)
     R = build_rotation(gaussians.get_rotation)                              # (P,3,3)
     R_t = R.transpose(1, 2)
-    l_local = torch.matmul(R_t, sun_dir.view(3, 1)).squeeze(-1)             # (P,3)
-    line_int_sun = normalized_gaussian_line_integral(s, l_local)
-    tau_sun_per_gauss = mass * line_int_sun
+    l_local = torch.matmul(R_t, v_l.view(3, 1)).squeeze(-1)             # (P,3)
+    line_int_v_l = normalized_gaussian_line_integral(s, l_local)
+    tau_v_l = mass * line_int_v_l
     if use_raster:
         T = compute_T_light_raster(
             gaussians.get_xyz,
-            tau_sun_per_gauss,
+            tau_v_l,
             s,
             gaussians.get_rotation,
-            sun_dir,
+            v_l,
             image_size=raster_res,
         )
         return T.view(-1, 1)
     return compute_T_light_voxel(
         gaussians.get_xyz,
-        tau_sun_per_gauss,
+        tau_v_l,
         s,
-        sun_dir,
+        v_l,
         grid_res=128,
     )
 
@@ -208,7 +208,7 @@ def _load_train_transforms(ply_path: str) -> tuple[dict | None, str | None]:
     cameras.json stores image_name = file_stem, which collapses multi-camera /
     multi-time datasets onto duplicate strings (e.g. all 49 cams sharing
     "0000".."0060"). We need the original transforms file to recover the
-    (camera_index, time_index) double-key and per-frame c2w / sun_dir.
+    (camera_index, time_index) double-key and per-frame c2w / v_l.
 
     Recognises the layout used by Scene.__init__: <model>/cfg_args records
     the dataset source path. If we can't find that, falls back to a few
@@ -309,7 +309,7 @@ def main():
                              "exposure' slider.")
     args = parser.parse_args()
 
-    # Resolve the T_light source. Models calibrate β/albedo against their
+    # Resolve the T_light source. Models calibrate σ_t/albedo against their
     # training-time shadow field, so the viewer must use the same source.
     # Read from cfg_args: tlight_voxel=True -> voxel; else tlight_raster=True
     # -> raster; absent both -> voxel.
@@ -401,8 +401,8 @@ def main():
     torch.cuda.synchronize()
     print(f"[viewer] T_light ready in {time.time() - t0:.2f}s. Shape = {tuple(T_light.shape)}")
 
-    # Max β_peak for normalising the beta_peak visualisation channel.
-    beta_max = max(gaussians.get_extinction.detach().max().item(), 1e-6)
+    # Max σ_t for normalising the sigma_t visualisation channel.
+    sigma_t_max = max(gaussians.get_sigma_t.detach().max().item(), 1e-6)
 
     # --- Compute a sensible initial camera pose from cloud bounds ----------
     # Use 1st–99th percentile bounds to shrug off floater outliers, then sit the
@@ -433,7 +433,7 @@ def main():
 
     # --- Optional: training cameras for snap-to-pose comparison --------------
     # Prefer the original transforms_train.json: it preserves the
-    # (camera_index, time_index) double-key plus per-frame sun_dir, which the
+    # (camera_index, time_index) double-key plus per-frame v_l, which the
     # collapsed cameras.json does not (img_name there is just the file stem,
     # so multi-time datasets get duplicate keys).
     train_transforms, train_transforms_path = _load_train_transforms(args.ply)
@@ -494,8 +494,8 @@ def main():
 
     # Local arrow geometry: tail at origin, head at +arrow_len along local +X.
     # We then rotate the whole arrow so local +X aligns with the world
-    # "light propagation" direction (= -sun_dir), and translate so the tail
-    # sits at cloud_center + sun_dir * arrow_offset (outside the cloud,
+    # "light propagation" direction (= -v_l), and translate so the tail
+    # sits at cloud_center + v_l * arrow_offset (outside the cloud,
     # opposite the sun).
     _local_arrow_points = np.array([[[0.0, 0.0, 0.0],
                                      [arrow_len, 0.0, 0.0]]], dtype=np.float32)
@@ -517,10 +517,10 @@ def main():
         s = math.sin(angle / 2.0)
         return np.array([math.cos(angle / 2.0), axis[0] * s, axis[1] * s, axis[2] * s], dtype=np.float32)
 
-    def _sun_arrow_pose(sun_dir_np: np.ndarray):
-        s = sun_dir_np / max(np.linalg.norm(sun_dir_np), 1e-8)
+    def _sun_arrow_pose(v_l_np: np.ndarray):
+        s = v_l_np / max(np.linalg.norm(v_l_np), 1e-8)
         position = (cloud_center + s * arrow_offset).astype(np.float32)
-        # Light propagation = -sun_dir; rotate local +X → -s.
+        # Light propagation = -v_l; rotate local +X → -s.
         wxyz = _quat_align_x_to(-s)
         return position, wxyz
 
@@ -538,7 +538,7 @@ def main():
 
     gui_mode = server.gui.add_dropdown(
         "View mode",
-        options=("rgb", "T_light", "beta_peak", "depth"),
+        options=("rgb", "T_light", "sigma_t", "depth"),
         initial_value="rgb",
     )
     # Snap-to-training-cam controls. With transforms_train.json, show one
@@ -624,7 +624,7 @@ def main():
         "Environment light",
         initial_value=env_on,
         hint="Stage-2 environment lighting: add the learned global sky (T_sun sun "
-             "transmittance ⊙ sun_term + ρ·Σ E_lm·V_lm in-scatter fill) on top of the "
+             "transmittance ⊙ sun_term + ω·Σ E_lm·V_lm in-scatter fill) on top of the "
              "frozen sun shading; tracks the sun slider for relighting. Only active for "
              "a --stage2 model (env sidecars present); a no-op otherwise.",
     )
@@ -694,7 +694,7 @@ def main():
         "needs_render": True,
         "last_render_time": 0.0,
         "diag_done": False,
-        "sun_dir": initial_sun.copy(),     # numpy (3,) — current cached sun
+        "v_l": initial_sun.copy(),     # numpy (3,) — current cached sun
         "T_light": T_light,                # current cached T_light tensor
     }
 
@@ -799,14 +799,14 @@ def main():
                 use_raster=use_raster_tlight, raster_res=tlight_raster_res,
             ).detach()
         torch.cuda.synchronize()
-        state["sun_dir"] = new_sun
+        state["v_l"] = new_sun
         state["T_light"] = new_cache
         state["needs_render"] = True
         # Move the arrow to follow the new direction.
         new_pos, new_wxyz = _sun_arrow_pose(new_sun)
         sun_arrow.position = new_pos
         sun_arrow.wxyz = new_wxyz
-        print(f"[viewer] sun_dir → {new_sun.tolist()} (alt={gui_sun_alt.value:.1f}°, az={gui_sun_az.value:.1f}°)")
+        print(f"[viewer] v_l → {new_sun.tolist()} (alt={gui_sun_alt.value:.1f}°, az={gui_sun_az.value:.1f}°)")
 
     gui_sun_alt.on_update(_apply_sun)
     gui_sun_az.on_update(_apply_sun)
@@ -901,7 +901,7 @@ def main():
             c.camera.position = pos
             c.camera.look_at = look_at
             c.camera.fov = fov_y
-        # Also push the frame's sun_dir into the global sun state so T_light
+        # Also push the frame's v_l into the global sun state so T_light
         # matches what training saw. Falls back to the slider value if the
         # frame lacks sun_direction.
         sd = frame.get("sun_direction")
@@ -913,7 +913,7 @@ def main():
                     gaussians, torch.from_numpy(new_sun).cuda(),
                     use_raster=use_raster_tlight, raster_res=tlight_raster_res,
                 ).detach()
-            state["sun_dir"] = new_sun
+            state["v_l"] = new_sun
             state["T_light"] = new_cache
             new_pos, new_wxyz = _sun_arrow_pose(new_sun)
             sun_arrow.position = new_pos
@@ -948,12 +948,12 @@ def main():
         aspect (the still passes render_w/render_h so a square capture isn't
         stretched by the live canvas aspect). Returns (H, W, 3) uint8.
         """
-        current_sun = state["sun_dir"]
+        current_sun = state["v_l"]
         current_T_light = state["T_light"]
         if aspect is None:
             aspect = render_w / max(1, render_h)
         mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far,
-                                sun_dir=current_sun, aspect=aspect)
+                                v_l=current_sun, aspect=aspect)
         pipe.k_sigma = float(gui_ksigma.value)
         _tm_on = bool(gui_tonemap.value)
         pipe.tonemap_learnable = _tm_on and tonemap_learnable
@@ -969,9 +969,9 @@ def main():
 
         if mode == "T_light":
             override = current_T_light.expand(-1, 3).contiguous()
-        elif mode == "beta_peak":
-            beta = gaussians.get_extinction.detach() / beta_max
-            override = beta.clamp(0.0, 1.0).expand(-1, 3).contiguous()
+        elif mode == "sigma_t":
+            sigma_t = gaussians.get_sigma_t.detach() / sigma_t_max
+            override = sigma_t.clamp(0.0, 1.0).expand(-1, 3).contiguous()
         else:
             override = None
 

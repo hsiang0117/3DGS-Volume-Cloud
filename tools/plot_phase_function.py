@@ -62,15 +62,16 @@ def main(path):
     el = ply.elements[0]
     names = [p.name for p in el.properties]
 
-    ow_names = sorted(
-        [n for n in names if n.startswith("octave_weight_")],
-        key=lambda x: int(x.split("_")[-1]),
-    )
+    ow_names = [n for n in names if n.startswith("w_")]
     if not ow_names:
-        print(f"ERROR: no octave_weight_* columns in {path}.")
+        ow_names = [n for n in names if n.startswith("octave_weight_")]
+    ow_names = sorted(ow_names, key=lambda x: int(x.split("_")[-1]))
+    if not ow_names:
+        print(f"ERROR: no w_* / octave_weight_* columns in {path}.")
         sys.exit(1)
-    if "g_factor" not in names:
-        print(f"ERROR: no g_factor column in {path}.")
+    g_col = "g" if "g" in names else "g_factor"
+    if g_col not in names:
+        print(f"ERROR: no g / g_factor column in {path}.")
         sys.exit(1)
 
     P = el.count
@@ -81,7 +82,7 @@ def main(path):
     w_learned = softplus(raw).mean(axis=0)             # (n_oct,)
 
     # g activation in the model is 0.8 * tanh(raw)
-    g_raw = np.asarray(el["g_factor"]).astype(np.float64)
+    g_raw = np.asarray(el[g_col]).astype(np.float64)
     g_learned = float(np.mean(0.8 * np.tanh(g_raw)))
 
     w_fixed = np.array([0.5 ** n for n in range(n_oct)])

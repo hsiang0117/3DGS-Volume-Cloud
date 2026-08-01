@@ -183,10 +183,10 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--position_lr_init / _final` | 1.6e-4 / 1.6e-6 | 位置学习率退火起止(×spatial_lr_scale) |
 | `--position_lr_max_steps` | 30000 | 位置退火长度。**应与 iterations 同步**,否则各向异性会失控 |
 | `--position_lr_delay_mult` | 0.01 | 位置 LR 预热系数 |
-| `--extiction_lr` | 0.025 | σ_t 学习率 |
-| `--feature_lr` | 0.0025 | 反照率 ω 学习率 |
-| `--g_factor_lr` | 0.0025 | HG g 学习率 |
-| `--octave_weights_lr` | 0.0025 | 多次散射八度权重学习率 |
+| `--sigma_t_lr` | 0.025 | σ_t 学习率 |
+| `--omega_lr` | 0.0025 | 反照率 ω 学习率 |
+| `--g_lr` | 0.0025 | HG g 学习率 |
+| `--w_lr` | 0.0025 | 多次散射八度权重学习率 |
 | `--scaling_lr` | 0.005 | 尺度学习率 |
 | `--rotation_lr` | 0.001 | 旋转学习率 |
 

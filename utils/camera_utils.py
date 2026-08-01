@@ -56,7 +56,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   is_nerf_synthetic=is_nerf_synthetic,
-                  sun_dir=getattr(cam_info, "sun_dir", None))
+                  v_l=getattr(cam_info, "v_l", None))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     # Each loadCam does a PIL header read + Camera() construction. Both are

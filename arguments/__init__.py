@@ -76,7 +76,7 @@ class PipelineParams(ParamGroup):
         self.k_sigma = 0.0
         # T_light source. Default: light-space rasterization (sun-camera shadow
         # pass, record_front_tau CUDA channel + native lightpass backward) with the
-        # full shadow gradient (β AND σ_d through scales/rotation). Avoids the voxel
+        # full shadow gradient (σ_t AND σ_d through scales/rotation). Avoids the voxel
         # cache's needle shadows / chord bias / self-leak / bbox aliasing.
         # --tlight_voxel falls back to the legacy 128^3 voxel cache (correct only for
         # models trained pre-raster; the viewer reads cfg_args to match). store_true
@@ -105,9 +105,9 @@ class PipelineParams(ParamGroup):
         # --- Stage 2: environment lighting (frozen geometry + global sky) ---
         # When on (set by --stage2), render adds the atmospheric env term on top of
         # the frozen Stage-1 sun shading:
-        #     L = T_sun(sun_dir) ⊙ sun_term  +  ρ · Σ_lm E_lm(sun_dir) · V_lm
+        #     L = T_sun(v_l) ⊙ sun_term  +  ω · Σ_lm E_lm(v_l) · V_lm
         # T_sun (RGB ≤1, sun atmospheric transmittance — expresses low-sun dimming/
-        # reddening) and E_lm (sky radiance SH) are GLOBAL functions of sun_dir (a
+        # reddening) and E_lm (sky radiance SH) are GLOBAL functions of v_l (a
         # small MLP, no per-Gaussian colour DOF); V_lm is the precomputed per-Gaussian
         # achromatic sky-visibility transfer. Persists to cfg_args so the viewer
         # auto-detects. Default OFF — Stage 1 behaviour unchanged.
@@ -123,12 +123,12 @@ class OptimizationParams(ParamGroup):
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0025
-        self.extiction_lr = 0.025
-        self.g_factor_lr = 0.0025
+        self.omega_lr = 0.0025
+        self.sigma_t_lr = 0.025
+        self.g_lr = 0.0025
         # LR for per-Gaussian multiple-scattering octave weights (softplus, >=0).
-        # Same order as g_factor; tune down if the weights overfit per-view.
-        self.octave_weights_lr = 0.0025
+        # Same order as g; tune down if the weights overfit per-view.
+        self.w_lr = 0.0025
         # LR for the 4 global learnable tonemap coeffs (only used with
         # --tonemap_learnable). Higher than the per-Gaussian LRs because it's a
         # handful of scalars seen by every pixel of every frame; decays to 0.1x.
@@ -138,7 +138,7 @@ class OptimizationParams(ParamGroup):
         # poles; this is a cheap insurance that f stays non-decreasing on [0,8]
         # so highlights never invert. Hinge on negative slope, like lambda_aniso.
         self.lambda_tonemap_mono = 1e-2
-        # LR for the Stage-2 environment net (global T_sun + E_lm MLP of sun_dir),
+        # LR for the Stage-2 environment net (global T_sun + E_lm MLP of v_l),
         # only used with --stage2. Lives in its own Adam (isolated from densify/prune
         # like the tonemap optimizer); decays to 0.1x over the schedule.
         self.env_lr = 1e-3
@@ -182,7 +182,7 @@ class OptimizationParams(ParamGroup):
         # — main role is to remove "ghost" Gaussians, not active ones.
         self.contribution_threshold = 1e-4
         self.prune_min_visible_frames = 5      # require at least 5 visible frames before judging
-        self.resurrect_interval = 3000         # every N iters, reset bottom β_peak
+        self.resurrect_interval = 3000         # every N iters, reset bottom σ_t
         self.resurrect_fraction = 0.05         # 5% of points
         # How often to clear the contribution accumulator so the running mean
         # tracks current model state. Independent of densify_until_iter; keeps

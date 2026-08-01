@@ -1,4 +1,4 @@
-#
+﻿#
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -128,24 +128,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         with torch.no_grad():
             # Physical parameter statistics
             if iteration % 500 == 0:
-                beta_peak = gaussians.get_extinction
-                albedo = gaussians.get_albedo
-                g = gaussians.get_g_factor
+                sigma_t = gaussians.get_sigma_t
+                omega = gaussians.get_omega
+                g = gaussians.get_g
                 scales = gaussians.get_scaling
-                # Prefer the current frame's per-frame sun_dir (from JSON)
+                # Prefer the current frame's per-frame v_l (from JSON)
                 # over the model-level fallback so the diag reflects what the
                 # renderer actually used this iteration.
-                if hasattr(viewpoint_cam, "sun_dir") and viewpoint_cam.sun_dir is not None:
-                    sun_dir = viewpoint_cam.sun_dir
+                if hasattr(viewpoint_cam, "v_l") and viewpoint_cam.v_l is not None:
+                    v_l = viewpoint_cam.v_l
                 else:
-                    sun_dir = gaussians.get_sun_dir
+                    v_l = gaussians.get_v_l
 
                 def _ms(x):
                     x = x.detach()
                     return x.mean().item(), x.std(unbiased=False).item()
 
-                m_bp, s_bp = _ms(beta_peak)
-                m_alb, s_alb = _ms(albedo)
+                m_bp, s_bp = _ms(sigma_t)
+                m_alb, s_alb = _ms(omega)
                 m_g, s_g = _ms(g)
                 m_scale, s_scale = _ms(scales)
                 gscale = torch.pow(torch.prod(scales, dim=1) + 1e-8, 1.0 / 3.0)
@@ -156,13 +156,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
                 print(
                     f"\n [ITER {iteration}] Physical stats | "
-                    f"\n beta_peak mean/std: {m_bp:.4f}/{s_bp:.4f} | "
-                    f"albedo mean/std: {m_alb:.4f}/{s_alb:.4f} | "
+                    f"\n sigma_t mean/std: {m_bp:.4f}/{s_bp:.4f} | "
+                    f"omega mean/std: {m_alb:.4f}/{s_alb:.4f} | "
                     f"g mean/std: {m_g:.4f}/{s_g:.4f}"
                     f"\n scale mean/std: {m_scale:.4f}/{s_scale:.4f} | "
                     f"gscale min: {min_gscale:.6f} | "
                     f"aniso mean/std/p99: {m_an:.2f}/{s_an:.2f}/{p99_an:.2f} | "
-                    f"sun_dir: [{sun_dir[0].item():.3f}, {sun_dir[1].item():.3f}, {sun_dir[2].item():.3f}]"
+                    f"v_l: [{v_l[0].item():.3f}, {v_l[1].item():.3f}, {v_l[2].item():.3f}]"
                 )
                 if gaussians.tonemap_optimizer is not None:
                     tm = gaussians.get_tonemap_coeffs.detach().tolist()
@@ -347,7 +347,7 @@ def _fmt_eval(r):
 
 def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, stage1_model):
     """Stage 2: load & FREEZE a Stage-1 model and train ONLY the global environment-
-    lighting net (T_sun + E_lm of sun_dir) on the env-on dataset (-s). Pure-black
+    lighting net (T_sun + E_lm of v_l) on the env-on dataset (-s). Pure-black
     background, full-image supervision (no mask: bg is 0 in both GT and render).
     The Stage-1 output is left untouched; results go to this run's -m / model_path."""
     pipe.env_lighting = True
@@ -360,8 +360,8 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
     gaussians = GaussianModel()
     gaussians.load_ply(stage1_ply)
     # Freeze ALL per-Gaussian params — Stage 2 optimises only the global EnvNet.
-    for p in (gaussians._xyz, gaussians._extinction, gaussians._albedo,
-              gaussians._g_factor, gaussians._octave_weights,
+    for p in (gaussians._xyz, gaussians._sigma_t, gaussians._omega,
+              gaussians._g, gaussians._w,
               gaussians._scaling, gaussians._rotation):
         p.requires_grad_(False)
 
@@ -531,7 +531,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                                              lpips_test / lpips_count, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram("scene/beta_peak_histogram", scene.gaussians.get_extinction, iteration)
+            tb_writer.add_histogram("scene/sigma_t_histogram", scene.gaussians.get_sigma_t, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
@@ -547,7 +547,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--stage2", action="store_true", default=False,
                         help="Stage 2: load & freeze a Stage-1 model and train ONLY the "
-                             "environment-lighting net (global T_sun + E_lm of sun_dir). "
+                             "environment-lighting net (global T_sun + E_lm of v_l). "
                              "-s points to the env-on dataset.")
     parser.add_argument("--stage1_model", type=str, default="",
                         help="Stage 2: path to the Stage-1 output dir (or a point_cloud.ply) "
@@ -569,3 +569,4 @@ if __name__ == "__main__":
 
     # All done
     print("\nTraining complete.")
+

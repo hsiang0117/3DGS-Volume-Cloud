@@ -2,8 +2,9 @@
 """Analyze the learned per-Gaussian multiple-scattering octave weights.
 
 Reads a trained point_cloud.ply, applies the softplus activation to the raw
-octave_weight_* columns (matching GaussianModel.get_octave_weights), and reports
-the per-octave distribution against the fixed 0.5^n baseline schedule.
+w_* columns (matching GaussianModel.get_w; legacy 'octave_weight_*' columns are
+also accepted), and reports the per-octave distribution against the fixed 0.5^n
+baseline schedule.
 
 Key question this answers: did the model shift multiple-scattering energy toward
 octave 0 (the un-diluted g_eff = g term)? If so, that explains why the learned
@@ -12,7 +13,7 @@ the high octaves means less g-isotropization (g_eff = g * 0.5^n) diluting the
 effective phase, so g itself can/must grow to represent the real forward lobe.
 
 Usage:
-    python tools/analyze_octave_weights.py <path/to/point_cloud.ply>
+    python tools/analyze_w.py <path/to/point_cloud.ply>
 """
 import sys
 import numpy as np
@@ -29,12 +30,12 @@ def main(path):
     el = ply.elements[0]
     names = [p.name for p in el.properties]
 
-    ow_names = sorted(
-        [n for n in names if n.startswith("octave_weight_")],
-        key=lambda x: int(x.split("_")[-1]),
-    )
+    ow_names = [n for n in names if n.startswith("w_")]
     if not ow_names:
-        print(f"ERROR: no octave_weight_* columns in {path}.")
+        ow_names = [n for n in names if n.startswith("octave_weight_")]
+    ow_names = sorted(ow_names, key=lambda x: int(x.split("_")[-1]))
+    if not ow_names:
+        print(f"ERROR: no w_* / octave_weight_* columns in {path}.")
         print(f"  available columns: {names}")
         sys.exit(1)
 

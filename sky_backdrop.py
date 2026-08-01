@@ -12,7 +12,7 @@ Frames
   Capture (UE world): left-handed, +Z up, +X forward. Empirically the sun glow
     sits on the +X (px) face, so in this frame the sun's horizontal direction is
     +X and the zenith is +Z.
-  Viewer world (OpenGL, matches the trained Gaussians / sun_dir): +Y up, +X right,
+  Viewer world (OpenGL, matches the trained Gaussians / v_l): +Y up, +X right,
     -Z forward.
 We map cube->viewer by aligning (zenith +Z -> +Y) and (sun horizontal +X -> the
 viewer's sun-azimuth horizontal direction). A camera ray d_v is sampled by

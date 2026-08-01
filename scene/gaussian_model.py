@@ -1,4 +1,4 @@
-#
+﻿#
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -23,16 +23,16 @@ from utils.graphics_utils import BasicPointCloud
 
 
 class EnvNet(nn.Module):
-    """Stage-2 global environment-lighting net: sun_dir (3,) -> (T_sun RGB<=1, E_lm SH).
+    """Stage-2 global environment-lighting net: v_l (3,) -> (T_sun RGB<=1, E_lm SH).
 
     GLOBAL — one sky for the whole scene, a function of sun direction ONLY. It adds
-    NO per-Gaussian colour DOF (per-Gaussian colour stays in the frozen albedo ρ),
+    NO per-Gaussian colour DOF (per-Gaussian colour stays in the frozen albedo ω),
     so the env term cannot regress the model to vanilla 3DGS / break relighting.
 
     T_sun is an ANALYTIC atmospheric transmittance with just 3 learnable params —
     the per-channel zenith optical depths τ=(τ_R,τ_G,τ_B):
 
-        T_sun(sun_dir) = exp( − m(θ) · softplus(raw_tau) ),   θ = sun zenith angle
+        T_sun(v_l) = exp( − m(θ) · softplus(raw_tau) ),   θ = sun zenith angle
 
     m(θ) is the Kasten-Young air mass (a fixed geometric function, not learned);
     softplus keeps τ≥0 so T_sun∈(0,1]. Reddening (τ_B>τ_G>τ_R, Rayleigh ∝λ^-4) and
@@ -54,13 +54,13 @@ class EnvNet(nn.Module):
         return torch.log(torch.expm1(y) + eps)
 
     @staticmethod
-    def _air_mass(sun_dir):
+    def _air_mass(v_l):
         """Kasten-Young (1989) relative air mass from a sun direction (up=+Y).
         m(θ)=1/(cosθ + 0.50572 (96.07995-θ_deg)^-1.6364); finite at the horizon.
         Only valid for the upper hemisphere; cosθ is clamped to ~horizon so the
         formula never goes negative/explosive — below-horizon dimming is handled
         separately by the horizon gate in forward()."""
-        cos_theta = torch.clamp(sun_dir.reshape(3)[1], 0.0, 1.0)    # up = +Y, upper hemi only
+        cos_theta = torch.clamp(v_l.reshape(3)[1], 0.0, 1.0)    # up = +Y, upper hemi only
         theta_deg = torch.rad2deg(torch.arccos(cos_theta))
         denom = cos_theta + 0.50572 * torch.clamp(96.07995 - theta_deg, min=1e-3) ** (-1.6364)
         return 1.0 / torch.clamp(denom, min=1e-3)
@@ -75,26 +75,26 @@ class EnvNet(nn.Module):
         self.n_sh = n_sh
         # T_sun: 3 learnable per-channel zenith optical depths (raw -> softplus -> τ≥0).
         self.raw_tau = nn.Parameter(self._softplus_inverse(self.TAU_INIT))
-        # E_lm: small MLP of sun_dir (additive sky in-scatter), zero-init -> neutral.
+        # E_lm: small MLP of v_l (additive sky in-scatter), zero-init -> neutral.
         self.backbone = nn.Sequential(
             nn.Linear(3, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU())
         self.e_head = nn.Linear(hidden, n_sh * 3)   # -> E_lm (n_sh,3) sky radiance SH
         nn.init.zeros_(self.e_head.weight); nn.init.zeros_(self.e_head.bias)
 
-    def forward(self, sun_dir):
+    def forward(self, v_l):
         tau = torch.nn.functional.softplus(self.raw_tau)            # (3,) ≥0
-        m = self._air_mass(sun_dir)                                 # scalar (upper hemi)
+        m = self._air_mass(v_l)                                 # scalar (upper hemi)
         t_sun = torch.exp(-m * tau)                                 # (3,) ∈(0,1]
         # Below-horizon gate: the sun below the horizon (cosθ≤0) means no direct
         # sunlight (occluded by the planet / extreme atmospheric path), so T_sun
         # fades to 0 over a soft band. Smooth (smoothstep) so relighting the sun
         # past the horizon "sets" continuously instead of snapping to white.
-        cos_theta = sun_dir.reshape(3)[1]
+        cos_theta = v_l.reshape(3)[1]
         t = torch.clamp(cos_theta / self.HORIZON_SOFT, 0.0, 1.0)
         gate = t * t * (3.0 - 2.0 * t)                              # smoothstep(0,HORIZON_SOFT)
         t_sun = t_sun * gate
-        h = self.backbone(sun_dir.reshape(1, 3))
+        h = self.backbone(v_l.reshape(1, 3))
         e_lm = self.e_head(h).reshape(self.n_sh, 3)
         return t_sun, e_lm
 
@@ -158,29 +158,29 @@ class GaussianModel:
         self.scaling_inverse_activation = torch.log
 
         self.rotation_activation = torch.nn.functional.normalize
-        self.extinction_activation = lambda x: torch.clamp(torch.nn.functional.softplus(x), max=5.0)
+        self.sigma_t_activation = lambda x: torch.clamp(torch.nn.functional.softplus(x), max=5.0)
         # Inverse softplus (valid below the clamp): x = log(expm1(y)).
-        self.extinction_inverse_activation = lambda y: torch.log(
+        self.sigma_t_inverse_activation = lambda y: torch.log(
             torch.expm1(torch.clamp(y, min=1e-6, max=4.999)))
-        self.albedo_activation = torch.sigmoid
-        self.g_factor_activation = lambda x: 0.8 * torch.tanh(x)
+        self.omega_activation = torch.sigmoid
+        self.g_activation = lambda x: 0.8 * torch.tanh(x)
         # Per-Gaussian multiple-scattering octave weights: softplus keeps them
         # non-negative (scattered energy cannot be negative). A scalar-per-octave
-        # weight only rescales the physical basis functions (HG·T·ρ), so chroma
-        # stays locked in the albedo ρ and lighting still flows through every
+        # weight only rescales the physical basis functions (HG·T·ω), so chroma
+        # stays locked in the albedo ω and lighting still flows through every
         # term — it cannot bypass the physical model.
-        self.octave_weight_activation = torch.nn.functional.softplus
+        self.w_activation = torch.nn.functional.softplus
 
 
     def __init__(self):
         self._xyz = torch.empty(0)
         # Physical appearance parameters (raw, pre-activation)
-        # `_extinction` stores the peak extinction coefficient β_peak (intensive, 1/length),
-        # NOT total mass. Mass = β_peak · (2π)^(3/2) · |Σ|^(1/2) is derived in the renderer.
-        self._extinction = torch.empty(0)   # (P,1) raw -> softplus(β_peak)
-        self._albedo = torch.empty(0)       # (P,3) raw -> sigmoid
-        self._g_factor = torch.empty(0)     # (P,1) raw -> tanh
-        self._octave_weights = torch.empty(0)  # (P,6) raw -> softplus, MS octave energy
+        # `_sigma_t` stores the peak extinction coefficient σ_t (intensive, 1/length),
+        # NOT total mass. Mass = σ_t · (2π)^(3/2) · |Σ|^(1/2) is derived in the renderer.
+        self._sigma_t = torch.empty(0)   # (P,1) raw -> softplus(σ_t)
+        self._omega = torch.empty(0)       # (P,3) raw -> sigmoid
+        self._g = torch.empty(0)     # (P,1) raw -> tanh
+        self._w = torch.empty(0)  # (P,6) raw -> softplus, MS octave energy
         # Global (per-scene, NOT per-Gaussian) learnable output-tonemap coeffs:
         # (4,) raw -> softplus -> (a,b,c,d). Lives in its own optimizer.
         self._tonemap = torch.empty(0)
@@ -197,7 +197,7 @@ class GaussianModel:
         # _sky_transfer: (P, n_sh) precomputed per-Gaussian sky-visibility SH transfer
         # V_lm. A BUFFER, NOT an nn.Parameter (geometry-derived, achromatic constant).
         self._sky_transfer = torch.empty(0)
-        self.env_net = None                 # global EnvNet: sun_dir -> (T_sun, E_lm)
+        self.env_net = None                 # global EnvNet: v_l -> (T_sun, E_lm)
         self.env_optimizer = None
         self.env_sh_order = 2
         self.percent_dense = 0
@@ -217,21 +217,21 @@ class GaussianModel:
         return self._xyz
     
     @property
-    def get_extinction(self):
-        return self.extinction_activation(self._extinction)
+    def get_sigma_t(self):
+        return self.sigma_t_activation(self._sigma_t)
 
     @property
-    def get_albedo(self):
-        return self.albedo_activation(self._albedo)
+    def get_omega(self):
+        return self.omega_activation(self._omega)
 
     @property
-    def get_g_factor(self):
-        return self.g_factor_activation(self._g_factor)
+    def get_g(self):
+        return self.g_activation(self._g)
 
     @property
-    def get_octave_weights(self):
+    def get_w(self):
         # (P,6) non-negative per-Gaussian multiple-scattering octave weights.
-        return self.octave_weight_activation(self._octave_weights)
+        return self.w_activation(self._w)
 
     @property
     def get_tonemap_coeffs(self):
@@ -256,7 +256,7 @@ class GaussianModel:
         return (x * (a * x + b)) / (x * (c * x + d) + e)
 
     @property
-    def get_sun_dir(self):
+    def get_v_l(self):
         return torch.tensor([0.0, 1.0, 0.0], device="cuda", dtype=self._xyz.dtype)
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
@@ -272,22 +272,22 @@ class GaussianModel:
         rots[:, 0] = 1
 
         # Physical parameter initialization (raw / pre-activation)
-        # `_extinction` stores the peak extinction coefficient β_peak directly.
-        # β_peak ≈ 0.1 gives initial τ_center = β_peak·√(2π)·s ≈ 0.25·s at unit scale.
-        beta_peak_init = torch.full((P, 1), 0.1, dtype=torch.float, device="cuda")
-        extinction_raw = self._softplus_inverse(beta_peak_init)
-        albedo_raw = inverse_sigmoid(torch.full((P, 3), 0.8, dtype=torch.float, device="cuda"))
-        g_factor_raw = torch.atanh(torch.full((P, 1), 0.7, dtype=torch.float, device="cuda"))
+        # `_sigma_t` stores the peak extinction coefficient σ_t directly.
+        # σ_t ≈ 0.1 gives initial τ_center = σ_t·√(2π)·s ≈ 0.25·s at unit scale.
+        sigma_t_init = torch.full((P, 1), 0.1, dtype=torch.float, device="cuda")
+        sigma_t_raw = self._softplus_inverse(sigma_t_init)
+        omega_raw = inverse_sigmoid(torch.full((P, 3), 0.8, dtype=torch.float, device="cuda"))
+        g_raw = torch.atanh(torch.full((P, 1), 0.7, dtype=torch.float, device="cuda"))
         # Octave weights initialised so softplus(raw) == 0.5^n for n=0..5, i.e.
         # iteration 0 reproduces the fixed 6-octave a^n=0.5^n schedule.
-        octave_target = torch.tensor([0.5 ** n for n in range(6)], dtype=torch.float, device="cuda")
-        octave_weights_raw = self._softplus_inverse(octave_target).unsqueeze(0).repeat(P, 1)  # (P,6)
+        w_target = torch.tensor([0.5 ** n for n in range(6)], dtype=torch.float, device="cuda")
+        w_raw = self._softplus_inverse(w_target).unsqueeze(0).repeat(P, 1)  # (P,6)
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._extinction = nn.Parameter(extinction_raw.requires_grad_(True))
-        self._albedo = nn.Parameter(albedo_raw.requires_grad_(True))
-        self._g_factor = nn.Parameter(g_factor_raw.requires_grad_(True))
-        self._octave_weights = nn.Parameter(octave_weights_raw.requires_grad_(True))
+        self._sigma_t = nn.Parameter(sigma_t_raw.requires_grad_(True))
+        self._omega = nn.Parameter(omega_raw.requires_grad_(True))
+        self._g = nn.Parameter(g_raw.requires_grad_(True))
+        self._w = nn.Parameter(w_raw.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -311,12 +311,12 @@ class GaussianModel:
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._extinction], 'lr': training_args.extiction_lr, "name": "extinction"},
-            {'params': [self._albedo], 'lr': training_args.feature_lr, "name": "albedo"},
-            {'params': [self._g_factor], 'lr': training_args.g_factor_lr, "name": "g_factor"},
-            {'params': [self._octave_weights],
-             'lr': getattr(training_args, "octave_weights_lr", training_args.g_factor_lr),
-             "name": "octave_weights"},
+            {'params': [self._sigma_t], 'lr': training_args.sigma_t_lr, "name": "sigma_t"},
+            {'params': [self._omega], 'lr': training_args.omega_lr, "name": "omega"},
+            {'params': [self._g], 'lr': training_args.g_lr, "name": "g"},
+            {'params': [self._w],
+             'lr': getattr(training_args, "w_lr", training_args.g_lr),
+             "name": "w"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 
@@ -337,20 +337,20 @@ class GaussianModel:
         # Physical parameter LR decay: decay to 1/10 of initial by end of training
         decay_ratio = 0.1
         iters = training_args.iterations
-        self.extinction_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.extiction_lr,
-            lr_final=training_args.extiction_lr * decay_ratio,
+        self.sigma_t_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.sigma_t_lr,
+            lr_final=training_args.sigma_t_lr * decay_ratio,
             max_steps=iters)
-        self.albedo_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.feature_lr,
-            lr_final=training_args.feature_lr * decay_ratio,
+        self.omega_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.omega_lr,
+            lr_final=training_args.omega_lr * decay_ratio,
             max_steps=iters)
-        self.g_factor_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.g_factor_lr,
-            lr_final=training_args.g_factor_lr * decay_ratio,
+        self.g_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.g_lr,
+            lr_final=training_args.g_lr * decay_ratio,
             max_steps=iters)
-        _ow_lr = getattr(training_args, "octave_weights_lr", training_args.g_factor_lr)
-        self.octave_weights_scheduler_args = get_expon_lr_func(
+        _ow_lr = getattr(training_args, "w_lr", training_args.g_lr)
+        self.w_scheduler_args = get_expon_lr_func(
             lr_init=_ow_lr,
             lr_final=_ow_lr * decay_ratio,
             max_steps=iters)
@@ -425,7 +425,7 @@ class GaussianModel:
         Y = _sh_basis_deg2(dirs)                      # (N,9)
         means3D = self.get_xyz.detach()
         s = self.get_scaling.detach()
-        beta_peak = self.get_extinction.detach()
+        sigma_t = self.get_sigma_t.detach()
         rotation = self.get_rotation                  # normalized quats (compute_T_light_raster detaches)
         R_t = build_rotation(rotation).transpose(1, 2)
         P = means3D.shape[0]
@@ -437,23 +437,23 @@ class GaussianModel:
                 l_local = torch.matmul(R_t, d.view(3, 1)).squeeze(-1)            # (P,3)
                 line_int = normalized_gaussian_line_integral(s, l_local)         # (P,1)
                 geom = ((2.0 * math.pi) ** 1.5) * torch.prod(s, dim=1, keepdim=True) * line_int
-                tau = beta_peak * geom                                           # (P,1)
+                tau = sigma_t * geom                                           # (P,1)
                 T_sky = compute_T_light_raster(
                     means3D, tau, s, rotation, d).squeeze(-1)                   # (P,)
                 V += (T_sky.unsqueeze(1) * Y[j].unsqueeze(0)) * w
         self._sky_transfer = V
         print(f"[gaussian_model] precomputed sky transfer V_lm {tuple(V.shape)} over {n_dirs} dirs")
 
-    def apply_env(self, sun_dir):
+    def apply_env(self, v_l):
         """Return (T_sun (3,), fill (P,3)) for the current sun direction, or (None,
-        None) if env lighting is not active. fill = ρ · (V_lm · E_lm); T_sun is the
+        None) if env lighting is not active. fill = ω · (V_lm · E_lm); T_sun is the
         global RGB sun transmittance. Differentiable in the EnvNet params only
-        (V_lm and ρ are frozen)."""
+        (V_lm and ω are frozen)."""
         if self.env_net is None or self._sky_transfer.numel() == 0:
             return None, None
-        sun_dir = sun_dir.to(self._sky_transfer.dtype)
-        t_sun, e_lm = self.env_net(sun_dir)                 # (3,), (n_sh,3)
-        fill = self.get_albedo * (self._sky_transfer @ e_lm)  # (P,n_sh)@(n_sh,3) -> (P,3)
+        v_l = v_l.to(self._sky_transfer.dtype)
+        t_sun, e_lm = self.env_net(v_l)                 # (3,), (n_sh,3)
+        fill = self.get_omega * (self._sky_transfer @ e_lm)  # (P,n_sh)@(n_sh,3) -> (P,3)
         return t_sun, fill
 
     def update_learning_rate(self, iteration):
@@ -461,10 +461,10 @@ class GaussianModel:
         _sched_map = {
             "xyz": self.xyz_scheduler_args,
             "scaling": self.scaling_scheduler_args,
-            "extinction": self.extinction_scheduler_args,
-            "albedo": self.albedo_scheduler_args,
-            "g_factor": self.g_factor_scheduler_args,
-            "octave_weights": self.octave_weights_scheduler_args,
+            "sigma_t": self.sigma_t_scheduler_args,
+            "omega": self.omega_scheduler_args,
+            "g": self.g_scheduler_args,
+            "w": self.w_scheduler_args,
         }
         for param_group in self.optimizer.param_groups:
             name = param_group["name"]
@@ -473,12 +473,12 @@ class GaussianModel:
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        l.append('extinction')
+        l.append('sigma_t')
         for i in range(3):
-            l.append('albedo_{}'.format(i))
-        l.append('g_factor')
-        for i in range(self._octave_weights.shape[1]):
-            l.append('octave_weight_{}'.format(i))
+            l.append('omega_{}'.format(i))
+        l.append('g')
+        for i in range(self._w.shape[1]):
+            l.append('w_{}'.format(i))
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -490,17 +490,17 @@ class GaussianModel:
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        extinction = self._extinction.detach().cpu().numpy()
-        albedo = self._albedo.detach().cpu().numpy()
-        g_factor = self._g_factor.detach().cpu().numpy()
-        octave_weights = self._octave_weights.detach().cpu().numpy()
+        sigma_t = self._sigma_t.detach().cpu().numpy()
+        omega = self._omega.detach().cpu().numpy()
+        g = self._g.detach().cpu().numpy()
+        w = self._w.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, extinction, albedo, g_factor, octave_weights, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, sigma_t, omega, g, w, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -535,48 +535,61 @@ class GaussianModel:
 
     def load_ply(self, path):
         plydata = PlyData.read(path)
+        props = plydata.elements[0].properties
+        names = [p.name for p in props]
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
 
-        extinction = np.asarray(plydata.elements[0]["extinction"])[..., np.newaxis]
-        albedo = np.stack((np.asarray(plydata.elements[0]["albedo_0"]),
-                           np.asarray(plydata.elements[0]["albedo_1"]),
-                           np.asarray(plydata.elements[0]["albedo_2"])), axis=1)
-        g_factor = np.asarray(plydata.elements[0]["g_factor"])[..., np.newaxis]
+        # σ_t: prefer the new 'sigma_t' column; fall back to the legacy
+        # 'extinction' name so checkpoints trained before the rename still load.
+        st_col = "sigma_t" if "sigma_t" in names else "extinction"
+        sigma_t = np.asarray(plydata.elements[0][st_col])[..., np.newaxis]
 
-        # Per-Gaussian octave weights (6 cols). Backward-compat: PLYs saved before
-        # this parameter existed have no octave_weight_* columns — fall back to the
+        # ω: prefer the new 'omega_{i}' columns; fall back to legacy 'albedo_{i}'.
+        if "omega_0" in names:
+            omega = np.stack([np.asarray(plydata.elements[0][f"omega_{i}"])
+                              for i in range(3)], axis=1)
+        else:
+            omega = np.stack([np.asarray(plydata.elements[0][f"albedo_{i}"])
+                              for i in range(3)], axis=1)
+        g_col = "g" if "g" in names else "g_factor"
+        g = np.asarray(plydata.elements[0][g_col])[..., np.newaxis]
+
+        # Per-Gaussian octave weights (6 cols). Prefer the new 'w_{i}' columns,
+        # then the legacy 'octave_weight_{i}' names, and finally fall back to the
         # fixed 0.5^n schedule (softplus-inverse) so old checkpoints still load.
-        ow_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("octave_weight_")]
+        ow_names = [p.name for p in props if p.name.startswith("w_")]
+        if not ow_names:
+            ow_names = [p.name for p in props if p.name.startswith("octave_weight_")]
         if ow_names:
             ow_names = sorted(ow_names, key=lambda x: int(x.split('_')[-1]))
-            octave_weights = np.zeros((xyz.shape[0], len(ow_names)), dtype=np.float32)
+            w = np.zeros((xyz.shape[0], len(ow_names)), dtype=np.float32)
             for idx, attr_name in enumerate(ow_names):
-                octave_weights[:, idx] = np.asarray(plydata.elements[0][attr_name])
+                w[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
             target = np.array([0.5 ** n for n in range(6)], dtype=np.float32)
             raw = np.log(np.expm1(np.clip(target, 1e-8, None)) + 1e-8)  # softplus^-1
-            octave_weights = np.tile(raw[None, :], (xyz.shape[0], 1))
+            w = np.tile(raw[None, :], (xyz.shape[0], 1))
 
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+        scale_names = [p.name for p in props if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+        rot_names = [p.name for p in props if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._extinction = nn.Parameter(torch.tensor(extinction, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._albedo = nn.Parameter(torch.tensor(albedo, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._g_factor = nn.Parameter(torch.tensor(g_factor, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._octave_weights = nn.Parameter(torch.tensor(octave_weights, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._sigma_t = nn.Parameter(torch.tensor(sigma_t, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._omega = nn.Parameter(torch.tensor(omega, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._g = nn.Parameter(torch.tensor(g, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._w = nn.Parameter(torch.tensor(w, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -663,10 +676,10 @@ class GaussianModel:
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
-        self._extinction = optimizable_tensors["extinction"]
-        self._albedo = optimizable_tensors["albedo"]
-        self._g_factor = optimizable_tensors["g_factor"]
-        self._octave_weights = optimizable_tensors["octave_weights"]
+        self._sigma_t = optimizable_tensors["sigma_t"]
+        self._omega = optimizable_tensors["omega"]
+        self._g = optimizable_tensors["g"]
+        self._w = optimizable_tensors["w"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -734,30 +747,30 @@ class GaussianModel:
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        # β_peak is intensive (local density): children inherit unchanged; scale shrinks meaningfully.
+        # σ_t is intensive (local density): children inherit unchanged; scale shrinks meaningfully.
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8 * N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
-        new_extinction = self._extinction[selected_pts_mask].repeat(N,1)
-        new_albedo = self._albedo[selected_pts_mask].repeat(N,1)
-        new_g_factor = self._g_factor[selected_pts_mask].repeat(N,1)
-        new_octave_weights = self._octave_weights[selected_pts_mask].repeat(N,1)
+        new_sigma_t = self._sigma_t[selected_pts_mask].repeat(N,1)
+        new_omega = self._omega[selected_pts_mask].repeat(N,1)
+        new_g = self._g[selected_pts_mask].repeat(N,1)
+        new_w = self._w[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
         d = {
             "xyz": new_xyz,
-            "extinction": new_extinction,
-            "albedo": new_albedo,
-            "g_factor": new_g_factor,
-            "octave_weights": new_octave_weights,
+            "sigma_t": new_sigma_t,
+            "omega": new_omega,
+            "g": new_g,
+            "w": new_w,
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
-        self._extinction = optimizable_tensors["extinction"]
-        self._albedo = optimizable_tensors["albedo"]
-        self._g_factor = optimizable_tensors["g_factor"]
-        self._octave_weights = optimizable_tensors["octave_weights"]
+        self._sigma_t = optimizable_tensors["sigma_t"]
+        self._omega = optimizable_tensors["omega"]
+        self._g = optimizable_tensors["g"]
+        self._w = optimizable_tensors["w"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
@@ -794,7 +807,7 @@ class GaussianModel:
         The aniso tail is ~95% disks (two long axes, one thin axis), so this
         fattens the thin axis rather than splitting the major axis: children
         keep the parent's orientation and long axes, the min axis is doubled,
-        and β_peak is reduced to conserve total extinction mass (β·∏s). The two
+        and σ_t is reduced to conserve total extinction mass (σ_t·∏s). The two
         children are offset by ±σ_major/2 along the major axis so the pair
         approximately covers the parent's footprint. Each pass halves the ratio
         of every offender; converges to the threshold in log2(max/threshold)
@@ -826,37 +839,37 @@ class GaussianModel:
         new_xyz = torch.cat([parent_xyz + offset, parent_xyz - offset], dim=0)
 
         # Fatten the thin axis (x2) — ratio halves. Mass bookkeeping per child:
-        # volume x2 (fattened axis), and TWO children replace one parent, so β
+        # volume x2 (fattened axis), and TWO children replace one parent, so σ_t
         # would drop x4 for exact total-mass conservation. Child footprints
         # overlap near the parent centre, so /3.2 is mass-neutral in practice.
         child_scaling = sel_scaling.clone()
         child_scaling.scatter_(1, minor_idx.unsqueeze(1), sigma_minor * 2.0)
         new_scaling = self.scaling_inverse_activation(child_scaling.repeat(2, 1))
 
-        beta = self.get_extinction[mask]                               # activated (n,1)
-        new_extinction = self.extinction_inverse_activation(
-            (beta / 3.2).clamp(min=1e-6)).repeat(2, 1)
+        sigma_t = self.get_sigma_t[mask]                               # activated (n,1)
+        new_sigma_t = self.sigma_t_inverse_activation(
+            (sigma_t / 3.2).clamp(min=1e-6)).repeat(2, 1)
 
         new_rotation = self._rotation[mask].repeat(2, 1)
-        new_albedo = self._albedo[mask].repeat(2, 1)
-        new_g_factor = self._g_factor[mask].repeat(2, 1)
-        new_octave_weights = self._octave_weights[mask].repeat(2, 1)
+        new_omega = self._omega[mask].repeat(2, 1)
+        new_g = self._g[mask].repeat(2, 1)
+        new_w = self._w[mask].repeat(2, 1)
 
         d = {
             "xyz": new_xyz,
-            "extinction": new_extinction,
-            "albedo": new_albedo,
-            "g_factor": new_g_factor,
-            "octave_weights": new_octave_weights,
+            "sigma_t": new_sigma_t,
+            "omega": new_omega,
+            "g": new_g,
+            "w": new_w,
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
-        self._extinction = optimizable_tensors["extinction"]
-        self._albedo = optimizable_tensors["albedo"]
-        self._g_factor = optimizable_tensors["g_factor"]
-        self._octave_weights = optimizable_tensors["octave_weights"]
+        self._sigma_t = optimizable_tensors["sigma_t"]
+        self._omega = optimizable_tensors["omega"]
+        self._g = optimizable_tensors["g"]
+        self._w = optimizable_tensors["w"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -899,12 +912,12 @@ class GaussianModel:
         if alive_or_grace.numel() == self.get_xyz.shape[0]:
             selected_pts_mask = torch.logical_and(selected_pts_mask, alive_or_grace)
 
-        # β_peak is intensive: clone inherits it as-is (no halving of the parent).
+        # σ_t is intensive: clone inherits it as-is (no halving of the parent).
         new_xyz = self._xyz[selected_pts_mask]
-        new_extinction = self._extinction[selected_pts_mask]
-        new_albedo = self._albedo[selected_pts_mask]
-        new_g_factor = self._g_factor[selected_pts_mask]
-        new_octave_weights = self._octave_weights[selected_pts_mask]
+        new_sigma_t = self._sigma_t[selected_pts_mask]
+        new_omega = self._omega[selected_pts_mask]
+        new_g = self._g[selected_pts_mask]
+        new_w = self._w[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
@@ -912,19 +925,19 @@ class GaussianModel:
 
         d = {
             "xyz": new_xyz,
-            "extinction": new_extinction,
-            "albedo": new_albedo,
-            "g_factor": new_g_factor,
-            "octave_weights": new_octave_weights,
+            "sigma_t": new_sigma_t,
+            "omega": new_omega,
+            "g": new_g,
+            "w": new_w,
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
-        self._extinction = optimizable_tensors["extinction"]
-        self._albedo = optimizable_tensors["albedo"]
-        self._g_factor = optimizable_tensors["g_factor"]
-        self._octave_weights = optimizable_tensors["octave_weights"]
+        self._sigma_t = optimizable_tensors["sigma_t"]
+        self._omega = optimizable_tensors["omega"]
+        self._g = optimizable_tensors["g"]
+        self._w = optimizable_tensors["w"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -994,12 +1007,12 @@ class GaussianModel:
           - it is not currently in a grace period (prune_grace == 0).
 
         Resurrection: every `opt.resurrect_interval` iterations, reset the
-        β_peak of the bottom `opt.resurrect_fraction` of Gaussians (by mean
+        σ_t of the bottom `opt.resurrect_fraction` of Gaussians (by mean
         contribution) back toward the initialisation value, and grant them
         another grace period. This restores the predicate flow stock 3DGS
-        gets from `reset_opacity()` — but under our β_peak parametrisation
+        gets from `reset_opacity()` — but under our σ_t parametrisation
         that reset is meaningless (opacity is analytic from extinction +
-        scale), so we resurrect β_peak directly instead.
+        scale), so we resurrect σ_t directly instead.
         """
         # 1. Density growth (stock path, with adaptive threshold)
         denom_g = self.denom.clamp(min=1)
@@ -1100,7 +1113,7 @@ class GaussianModel:
           settle phase is held by the full-schedule aniso regulariser + needle
           surgery, not by a geometric prune.
 
-          - β_peak resurrect of bottom `opt.resurrect_fraction` Gaussians every
+          - σ_t resurrect of bottom `opt.resurrect_fraction` Gaussians every
             `opt.resurrect_interval` iterations.
           - Periodic reset of the contribution accumulators so the running mean
             tracks current model state, every `opt.contribution_reset_interval` iters.
@@ -1136,9 +1149,9 @@ class GaussianModel:
                     self.contribution_denom.zero_()
 
     def _resurrect_low_contribution(self, fraction):
-        """Reset β_peak of the lowest-contribution `fraction` of Gaussians
+        """Reset σ_t of the lowest-contribution `fraction` of Gaussians
         back toward the initial value (0.1), letting them rejoin gradient flow.
-        Only β_peak is touched; xyz / scale / rotation / albedo / g stay put.
+        Only σ_t is touched; xyz / scale / rotation / albedo / g stay put.
         """
         if fraction <= 0 or self.get_xyz.shape[0] == 0:
             return
@@ -1152,13 +1165,13 @@ class GaussianModel:
             low_idx = low_idx[self.prune_grace[low_idx] == 0]
             if low_idx.numel() == 0:
                 return
-            init_beta = torch.full((low_idx.numel(), 1), 0.1, device="cuda")
-            new_extinction = self._extinction.detach().clone()
-            new_extinction[low_idx] = self._softplus_inverse(init_beta)
+            init_sigma_t = torch.full((low_idx.numel(), 1), 0.1, device="cuda")
+            new_sigma_t = self._sigma_t.detach().clone()
+            new_sigma_t[low_idx] = self._softplus_inverse(init_sigma_t)
             # Replace param tensor in the optimiser (uses existing helper).
-            optimizable_tensors = self.replace_tensor_to_optimizer(new_extinction, "extinction")
-            self._extinction = optimizable_tensors["extinction"]
-            # Grant grace so they don't get pruned before β has time to grow.
+            optimizable_tensors = self.replace_tensor_to_optimizer(new_sigma_t, "sigma_t")
+            self._sigma_t = optimizable_tensors["sigma_t"]
+            # Grant grace so they don't get pruned before σ_t has time to grow.
             self.prune_grace[low_idx] = 500
 
     # ----------------------------------------------------------------------
@@ -1170,3 +1183,4 @@ class GaussianModel:
             grow = (-self._scaling.grad[update_filter]).detach().clamp(min=0).sum(dim=-1, keepdim=True)
             self.scale_gradient_accum[update_filter] += grow
         self.denom[update_filter] += 1
+

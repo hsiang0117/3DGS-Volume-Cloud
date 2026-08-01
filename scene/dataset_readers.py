@@ -35,7 +35,7 @@ class CameraInfo(NamedTuple):
     is_test: bool
     # Per-frame sun direction in OpenGL/Blender world coords, points toward the
     # sun, unit length. Defaults to [0,1,0] when the dataset omits the field.
-    sun_dir: np.array = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    v_l: np.array = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -117,19 +117,19 @@ def _parse_one_frame(args):
     with Image.open(image_path) as image:
         width, height = image.size
 
-    sun_dir_raw = frame.get("sun_direction", None)
-    if sun_dir_raw is None:
-        sun_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    v_l_raw = frame.get("sun_direction", None)
+    if v_l_raw is None:
+        v_l = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     else:
-        sun_dir = np.array(sun_dir_raw, dtype=np.float32)
-        norm = np.linalg.norm(sun_dir)
+        v_l = np.array(v_l_raw, dtype=np.float32)
+        norm = np.linalg.norm(v_l)
         if norm > 1e-8:
-            sun_dir = sun_dir / norm
+            v_l = v_l / norm
 
     return idx, CameraInfo(uid=idx, R=R, T=T, FovY=None, FovX=None,
                             image_path=image_path, image_name=image_name,
                             width=width, height=height, is_test=is_test,
-                            sun_dir=sun_dir)
+                            v_l=v_l)
 
 
 def readCamerasFromTransforms(path, transformsfile, white_background, is_test, extension=".png"):
