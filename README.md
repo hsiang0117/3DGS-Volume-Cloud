@@ -16,10 +16,10 @@
 
 | 参数 | 含义 | 激活 |
 |---|---|---|
-| `β_peak` | 峰值消光系数(1/m) | softplus, clamp 5 |
-| `ρ` | 散射反照率(RGB) | sigmoid |
-| `g` | Henyey-Greenstein 相函数偏度 | 0.8·tanh,前向散射 |
-| `octave_w` | 6 阶多次散射能量权重(可学习,Frostbite/Wrenninge 八度近似) | softplus |
+| `σ_t` | 消光系数(1/m,总光学质量) | softplus, clamp 5 |
+| `ω` | 散射反照率(RGB) | sigmoid |
+| `g` | Henyey-Greenstein 相函数各向异性因子 | 0.8·tanh,前向散射 |
+| `w_n` | 6 阶多次散射八度能量权重(可学习,Frostbite/Wrenninge 八度近似) | softplus |
 
 ### 解析光学厚度光栅化
 
@@ -27,13 +27,13 @@
 
 ### 物理着色
 
-逐高斯计算 `L = ρ · L_sun · Σₙ wₙ · T_light^(bⁿ) · HG(g·cⁿ, cosθ)`:HG 相函数(ω_in = −sun_dir 约定)+ 六阶多次散射八度 + 自阴影透射率 T_light。太阳方向逐帧来自数据集,推理时可任意替换 → relighting。
+逐高斯计算 `L = ω · L_light · Σₙ wₙ · T_light^(bⁿ) · P(v_i, v_o; g·cⁿ)`:HG 相函数(cosθ = v_i·v_o,入射方向 v_i = −v_l)+ 六阶多次散射八度 + 自阴影透射率 T_light。太阳方向 v_l 逐帧来自数据集,推理时可任意替换 → relighting。
 
 ### 输出 tonemap(默认匹配 GT 显示空间)
 
-UE 的 HighResScreenshot GT 是 **filmic-tonemapped LDR**,而物理着色在**线性空间**。用线性模型拟合非线性目标会表现为动态范围压缩。默认开启 **固定 Narkowicz ACES** 曲线:着色端放宽 per-高斯辐亮度 clamp 到 HDR、图像端套 ACES,使 loss 与全部指标都在 GT 自己的空间比较(均匀数据集实测 30.80→**33.27**,压缩残差 −67%)。
+UE 的 HighResScreenshot GT 是 **filmic-tonemapped LDR**,而物理着色在**线性空间**。用线性模型拟合非线性目标会表现为动态范围压缩。默认开启 **固定 Narkowicz ACES** 曲线:着色端放宽 per-高斯辐亮度 clamp 到 HDR、图像端套 ACES,使 loss 与全部指标都在 GT 自己的空间比较。
 
-- `--tonemap_learnable`(可选,默认关):把 ACES 的 4 个系数(a,b,c,d)变可学习(e 钉死),自适应 GT 的真实显示曲线。实测在 UE 数据上 ≈ 固定 ACES(−0.14 dB,否定结果),保留为**换其他 filmic 引擎**的保险;系数存进 PLY 同目录 `tonemap.json`,viewer/eval 自动读取。
+- `--tonemap_learnable`(可选,默认关):把 ACES 的 4 个系数(a,b,c,d)变可学习(e 钉死),自适应 GT 的真实显示曲线,保留为**换其他 filmic 引擎**的保险;系数存进 PLY 同目录 `tonemap.json`,viewer/eval 自动读取。
 - **若 GT 是真·线性 HDR**(无 tonemap):应**关闭** tonemap(源码翻 `tonemap_aces=False`),而非用 learnable——Narkowicz 族无法表示 identity。物理模型本身线性、与渲染器无关;部署回 UE 实时渲染时输出**线性辐亮度**让 UE 自己 tonemap,**勿重复套 ACES**。
 
 ### 光源视角自阴影(T_light,默认路径)
@@ -42,20 +42,18 @@ T_light = 每个高斯沿太阳方向的"前方遮挡透射率"。默认实现�
 
 - 远距窄 FOV 透视相机伪装方向光太阳(视差 <2%,免改 EWA 雅可比);
 - CUDA `record_front_tau` 通道:深度序遍历中,每高斯记录其前方累积 τ 的 α·T 加权均值(整个向阳 footprint 上的能量加权,而非中心点采样);
-- **原生可微 backward**(`lightpassBackwardCUDA`):back-to-front 重放 + 运行和,把 dL/dτ_front 传播给前方所有遮挡者;完整几何梯度(β 和 σ_d 经 scale/rotation)默认开启;
+- **原生可微 backward**(`lightpassBackwardCUDA`):back-to-front 重放 + 运行和,把 dL/dτ_light 传播给前方所有遮挡者;完整几何梯度(σ_t 和 σ_d 经 scale/rotation)默认开启;
 - 深埋高斯(early-termination 导致 wsum=0)显式映射为全阴影,防反转;
 - `--tlight_voxel` 回退到旧的 128³ 体素缓存路径(与 raster 之前训练的模型配套;viewer 的 `--tlight auto` 读 cfg_args 自动匹配)。
 
-四版梯度设计迭代(detach → straight-through → 原生 backward → 完整梯度)的教训:β 必须保留穿过 T_light 的负反馈;前向与反向必须是同一个阴影场;几何阴影梯度需要方向均匀的数据兜底。
-
 ### 针手术(结构性 aniso 控制,默认开启)
 
-软正则压不住的高各向异性尾巴(实测 95% 是薄盘而非针)由 `split_needles` 结构性重写:每 1000 迭代,ratio>30 的高斯增肥薄轴 ×2(ratio 减半)、β/3.2 守恒消光质量、沿主轴劈成两子。等效硬上限,不与光度梯度拔河。实测 aniso p99 ~22、max≈阈值,**PSNR 不降反升**。
+软正则压不住的高各向异性尾巴由 `split_needles` 结构性重写:每 1000 迭代,ratio>30 的高斯增肥薄轴 ×2(ratio 减半)、σ_t/3.2 守恒消光质量、沿主轴劈成两子。等效硬上限,不与光度梯度拔河。
 
 ### 物理化的致密化与维护
 
 - 贡献度 prune(per-Gaussian Σ(α·T) CUDA 通道)替代 opacity 阈值;
-- β_peak resurrect 替代 stock 的 reset_opacity(β 参数化下 opacity 是解析量);
+- σ_t resurrect 替代 stock 的 reset_opacity(σ_t 参数化下 opacity 是解析量);
 - 自适应 densify 阈值(top-K% 梯度分位);
 - 维护回路(resurrect→prune→reset)**只在 densify 期运行**,densify 结束即门控关闭,防止 settle 期的净销毁。
 
@@ -64,18 +62,18 @@ T_light = 每个高斯沿太阳方向的"前方遮挡透射率"。默认实现�
 Stage 1 是 env-off 控制变量(纯太阳、黑背景)。Stage 2 **冻结**已标定的高斯点集,只训一个**全局、仅依赖太阳方向**的环境网络,在太阳着色之上叠加天空大气贡献:
 
 ```
-L = T_sun(sun_dir) ⊙ [Stage 1 太阳项]  +  ρ · Σ_lm E_lm(sun_dir) · V_lm(x)
+L = T_sun(v_l) ⊙ [Stage 1 太阳项]  +  ω · Σ_lm E_lm(v_l) · V_lm(x)
     └── 乘性:太阳大气透射 ──┘            └──── 加性:天空内散射填充 ────┘
 ```
 
-- **`T_sun(sun_dir)`** —— 太阳穿过大气的逐通道透射率,**3 参数解析式** `exp(−m(θ)·τ_rgb)`:`m(θ)` 是 Kasten-Young air mass(固定几何),只学天顶光学厚度 `τ=(τ_R,τ_G,τ_B)`。低太阳变暗 + 变红(τ_B>τ_R,Rayleigh ∝λ⁻⁴)、方位对称都从结构自动落出;太阳落到地平线下时 smoothstep 门控熄灭(无直射)。**纯加性项表达不出"变暗",所以太阳项必须乘 T_sun**(≤1)。
-- **`E_lm(sun_dir)`** —— 天空辐亮度场的低阶 SH(小全局 MLP),加性内散射填充。
+- **`T_sun(v_l)`** —— 太阳穿过大气的逐通道透射率,**3 参数解析式** `exp(−m(θ)·τ_rgb)`:`m(θ)` 是 Kasten-Young air mass(固定几何),只学天顶光学厚度 `τ=(τ_R,τ_G,τ_B)`。低太阳变暗 + 变红(τ_B>τ_R,Rayleigh ∝λ⁻⁴)、方位对称都从结构自动落出;太阳落到地平线下时 smoothstep 门控熄灭(无直射)。**纯加性项表达不出"变暗",所以太阳项必须乘 T_sun**(≤1)。
+- **`E_lm(v_l)`** —— 天空辐亮度场的低阶 SH(小全局 MLP),加性内散射填充。
 - **`V_lm(x)`** —— 逐高斯天空可见度的 SH 传输向量(环境遮挡),**无色、纯几何**,在冻结点集上复用 `compute_T_light_raster` 扫半球 N 方向预计算一次。
-- **红线**:新增可学的只有全局 `T_sun`/`E_θ`,**逐高斯不加任何色彩自由度**(色度锁在冻结的 ρ)→ 物理上无法退回 vanilla 3DGS、relighting 保住。
+- **红线**:新增可学的只有全局 `T_sun`/`E_θ`,**逐高斯不加任何色彩自由度**(色度锁在冻结的 ω)→ 物理上无法退回 vanilla 3DGS、relighting 保住。
 - **监督**:env-on 数据集是**纯黑背景**(SkyAtmosphere 天空亮度因子=0,但保留瑞利/米氏/臭氧对云的打光),所以全图直接监督、**无需 mask**(背景两边都 0)。
 - 环境网络与 `V_lm` 存进 PLY 同目录 sidecar(`env_net.pt` / `sky_transfer.npy` / `env.json`),viewer/eval 自动加载。
 
-**设计取舍 / 未来方向**:这套大气就是标准的瑞利 + 米氏 + 臭氧模型(= UE SkyAtmosphere = Hillaire/Bruneton)。因为 `L` 对 `(T_sun, E_lm)` **线性**(`V_lm`、`ρ` 冻结),二者是**可热插拔的输入**——transfer 只标定一次,运行时既可用学到的网络,也可换成同系数的**解析大气**(把物理天空投影成 SH 喂进 `E_lm`),云响应零重训。这正是"云体环境着色与可见天空着色解耦、只共用 `sun_dir`"的接口形态:**别把天空烘进 `V_lm`**,保持 `(T_sun, E_lm) 输入 → L 输出`。
+**设计取舍 / 未来方向**:这套大气就是标准的瑞利 + 米氏 + 臭氧模型(= UE SkyAtmosphere = Hillaire/Bruneton)。因为 `L` 对 `(T_sun, E_lm)` **线性**(`V_lm`、`ω` 冻结),二者是**可热插拔的输入**——transfer 只标定一次,运行时既可用学到的网络,也可换成同系数的**解析大气**(把物理天空投影成 SH 喂进 `E_lm`),云响应零重训。这正是"云体环境着色与可见天空着色解耦、只共用 `sun_dir`"的接口形态:**别把天空烘进 `V_lm`**,保持 `(T_sun, E_lm) 输入 → L 输出`。
 
 **跨框架对比**(如对照 *Don't Splat your Gaussians* 的 VPRF):用**黑底**把"可见天空"这个变量消掉(GT/本方法/对照方都渲黑底 → 背景恒 0、平凡一致、无需 mask),从 GT 算一次云掩膜套到两边,且两边输出施加**同一 tonemap/色彩空间**再算指标(最易翻车的跨框架坑)。注意纯发射式 SH 重建(VPRF)结构上**不能 relighting**,只能当固定光照的重建/紧凑度基线,held-out 太阳 relighting 是本方法独有。
 
@@ -163,8 +161,8 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 |---|---|---|
 | `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化 + 完整几何梯度);与 raster 之前训练的模型配套 |
 | `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
-| `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间(+2.5 dB)。store_true 无法从命令行关闭,真·线性 GT 数据需改源码 |
-| `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`)。UE 数据上为否定结果(−0.14 dB),保留作换 filmic 引擎的保险;开启时优先于固定 ACES |
+| `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间。store_true 无法从命令行关闭,真·线性 GT 数据需改源码 |
+| `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`),保留作换其他 filmic 引擎的保险;开启时优先于固定 ACES |
 | `--k_sigma` | 0.0 | per-tile max-response 深度排序偏移(σ 单位);0 = stock 中心深度排序。曾用于治 popping,因块状伪影弃用,CUDA 路径保留 |
 
 #### 环境光(Stage 2)
@@ -183,16 +181,16 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 |---|---|---|
 | `--iterations` | 30000 | 总迭代数 |
 | `--position_lr_init / _final` | 1.6e-4 / 1.6e-6 | 位置学习率退火起止(×spatial_lr_scale) |
-| `--position_lr_max_steps` | 30000 | 位置退火长度。**应与 iterations 同步**——拉长会延缓主阶段退火,实测 aniso 失控、-0.6 dB |
+| `--position_lr_max_steps` | 30000 | 位置退火长度。**应与 iterations 同步**,否则各向异性会失控 |
 | `--position_lr_delay_mult` | 0.01 | 位置 LR 预热系数 |
-| `--extiction_lr` | 0.025 | β_peak 学习率 |
-| `--feature_lr` | 0.0025 | 反照率 ρ 学习率 |
+| `--extiction_lr` | 0.025 | σ_t 学习率 |
+| `--feature_lr` | 0.0025 | 反照率 ω 学习率 |
 | `--g_factor_lr` | 0.0025 | HG g 学习率 |
 | `--octave_weights_lr` | 0.0025 | 多次散射八度权重学习率 |
 | `--scaling_lr` | 0.005 | 尺度学习率 |
 | `--rotation_lr` | 0.001 | 旋转学习率 |
 
-物理参数(β/ρ/g/octave)的 LR 全程指数退火到 1/10。
+物理参数(σ_t/ω/g/w)的 LR 全程指数退火到 1/10。
 
 #### 损失与正则
 
@@ -200,9 +198,9 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 |---|---|---|
 | `--lambda_dssim` | 0.2 | DSSIM 损失权重(L = 0.8·L1 + 0.2·DSSIM) |
 | `--lambda_scale` | 0.1 | 体积正则(∏s 均值),抑制高斯无界膨胀 |
-| `--lambda_aniso` | 0.001 | 软各向异性正则(log-ratio 二次,超过 aniso_ratio_max 才罚)。调大伤 PSNR(0.05 → PSNR 崩到 ~25);硬约束交给针手术 |
+| `--lambda_aniso` | 0.001 | 软各向异性正则(log-ratio 二次,超过 aniso_ratio_max 才罚)。数值过大将损伤重建质量;硬约束交给针手术 |
 | `--aniso_ratio_max` | 5.0 | 软正则的免罚阈值 |
-| `--aniso_until_iter` | 30000 | 软正则作用区间。**必须全程**——aniso 不自收敛,提前关闭后 p99 单调上涨 |
+| `--aniso_until_iter` | 30000 | 软正则作用区间。**必须全程**——各向异性不自收敛,提前关闭会持续恶化 |
 | `--tonemap_lr` | 1e-3 | 可学习 tonemap 4 系数的学习率(仅 `--tonemap_learnable` 时生效;独立 Adam,衰到 0.1×) |
 | `--lambda_tonemap_mono` | 1e-2 | 可学习 tonemap 单调性惩罚(仅 `--tonemap_learnable` 时;hinge 平方,保证曲线在 [0,8] 不反转,高光不倒挂) |
 
@@ -210,7 +208,7 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--densify_from_iter / _until_iter` | 500 / 15000 | 致密化区间。**15k 后留 settle 抛光期是实测最优**(densify 拉满 30k 反而 -0.2 dB 且 aniso 翻倍) |
+| `--densify_from_iter / _until_iter` | 500 / 15000 | 致密化区间。**结束后留出 settle 收敛期** |
 | `--densification_interval` | 100 | 致密化周期 |
 | `--densify_grad_threshold` | 1e-4 | 位置梯度阈值(densify_adaptive=False 时生效) |
 | `--densify_adaptive` | True | 自适应阈值:每轮取梯度 top `densify_top_frac`,梯度后期衰减也不停摆 |
@@ -226,16 +224,16 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--contribution_threshold` | 1e-4 | 贡献度剪枝阈值:mean Σ(α·T) 低于此值剪除(替代 stock 的 opacity 阈值) |
 | `--prune_min_visible_frames` | 5 | 至少在 N 帧可见才参与剪枝判定 |
 | `--contribution_reset_interval` | 1000 | 贡献度累计器清零周期(保持统计反映当前模型) |
-| `--resurrect_interval` | 3000 | 每 N 迭代把贡献度最低的一批 β_peak 重置回 0.1(替代 stock reset_opacity)。**仅 densify 期间生效**——settle 期运行会与剪枝形成净销毁回路(实测 -17% 点数、-0.7 dB) |
+| `--resurrect_interval` | 3000 | 每 N 迭代把贡献度最低的一批 σ_t 重置回 0.1(替代 stock reset_opacity)。**仅 densify 期间生效**——settle 期运行会与剪枝形成净销毁回路 |
 | `--resurrect_fraction` | 0.05 | 每次 resurrect 的点数占比 |
-| `--post_densify_prune_interval` | 1000 | densify 期内的额外剪枝周期;0 关闭。**注:维护(resurrect/prune/reset)只在 densify 期运行,densify 结束后即停**——settle 期运行会与剪枝形成净销毁回路(实测 -17% 点数、-0.7 dB) |
+| `--post_densify_prune_interval` | 1000 | densify 期内的额外剪枝周期;0 关闭。**注:维护(resurrect/prune/reset)只在 densify 期运行,densify 结束后即停**——settle 期运行会与剪枝形成净销毁回路 |
 
 #### 针手术(结构性 aniso 硬上限)
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--needle_split_interval` | 1000 | 手术周期;**0 = 关闭** |
-| `--needle_split_ratio` | 30.0 | 触发阈值(max/min 轴比)。每刀 ratio 减半,等效硬上限;想逼近体素量级(p99~12)可降到 15 |
+| `--needle_split_ratio` | 30.0 | 触发阈值(max/min 轴比)。每刀 ratio 减半,等效硬上限 |
 | `--needle_split_until_iter` | 29000 | 最后一次手术的截止迭代(留收尾期让子高斯安定) |
 
 #### 调试与日志(train.py)
@@ -265,9 +263,9 @@ python viewer.py --ply output/<run>/point_cloud/iteration_30000/point_cloud.ply
 python viewer.py --ply output/<run>/.../point_cloud.ply --sky_dir data/sky_backdrop
 ```
 
-基于 viser:实时改变太阳方向(relighting)、可视化通道(RGB / T_light / β_peak / depth)、可调背景色、snap 到训练相机。`--tlight auto|voxel|raster` 控制阴影源(auto 读训练 run 的 cfg_args)。加载 Stage 2 模型时自动检测 env sidecar 并开启环境光(太阳滑块同时驱动 `T_sun` + `E_lm`,可勾选框 A/B 开关)。
+基于 viser:实时改变太阳方向(relighting)、可视化通道(RGB / T_light / σ_t / depth)、可调背景色、snap 到训练相机。`--tlight auto|voxel|raster` 控制阴影源(auto 读训练 run 的 cfg_args)。加载 Stage 2 模型时自动检测 env sidecar 并开启环境光(太阳滑块同时驱动 `T_sun` + `E_lm`,可勾选框 A/B 开关)。
 
-**天空背景(`--sky_dir`,可选,纯展示)**:给定一组 per-太阳高度的 HDR cubemap(由 `tools/ue_capture_sky_backdrop.py` 从 UE 采集,见下),viewer 把云合成到真实天空前而非纯色底。太阳**高度**滑块选 cube、**方位**滑块旋转它(SkyAtmosphere 绕天顶轴旋转对称,唯一破对称的太阳随之转)。合成在 **rasterizer 内一趟完成**(逐像素 `bg_image` 线性 over + 单次 tonemap),"Sky backdrop" 勾选框开关,`Sky exposure`(默认 3.35)/`Sky warmth`(默认 0.09)对齐 UE 视口观感(实测多太阳高度 RMSE≈0.024)。**纯 viewer 展示,不进训练、不碰冻结的 albedo**;诊断通道保持纯色底。
+**天空背景(`--sky_dir`,可选,纯展示)**:给定一组 per-太阳高度的 HDR cubemap(由 `tools/ue_capture_sky_backdrop.py` 从 UE 采集,见下),viewer 把云合成到真实天空前而非纯色底。太阳**高度**滑块选 cube、**方位**滑块旋转它(SkyAtmosphere 绕天顶轴旋转对称,唯一破对称的太阳随之转)。合成在 **rasterizer 内一趟完成**(逐像素 `bg_image` 线性 over + 单次 tonemap),"Sky backdrop" 勾选框开关,`Sky exposure`(默认 3.35)/`Sky warmth`(默认 0.09)对齐 UE 视口观感。**纯 viewer 展示,不进训练、不碰冻结的 albedo**;诊断通道保持纯色底。
 
 ### 工具
 
@@ -280,12 +278,13 @@ tools/penumbra_residual.py         # 残差按逐像素 T_light(阴影深度)分
 tools/ue_capture_sky_backdrop.py   # [UE 内运行] 采集 viewer 天空背景:per-太阳高度 6 面 HDR cube
 ```
 
-## 当前状态与已知限制
+## 已知限制
 
-- **Stage 1**(env-off,固定曝光重采):test PSNR **~37.5**(固定 ACES tonemap,默认),**held-out 太阳与已见太阳零泛化差距**(物理参数化对新光照方向外推有效);aniso p99 ~19,popping 受控。
-- **Stage 2**(env-on,冻结几何 + 解析大气):test PSNR **~37.6**,环境项贡献 **+6.16 dB**(env-on 减 env-off),held-out 太阳 relighting gap **−0.32 dB**;学到的 `τ_RGB` 单调(τ_B>τ_R)、低太阳 `T_sun` 明显变暗偏红——大气染色从图像里学了出来。此太阳主导场景里加性天空填充 `E_lm` 学得≈0(UE 中把天空亮度调 0 也确认云着色几乎不变),环境效应主要由乘性 `T_sun` 承担。
-- **Stage 1 数据集是刻意 env-off 的控制变量设计**:UE 场景只有云 + 单方向太阳,背景纯黑,无天空/大气环境光。注意 env-off 控制掉的是**环境光**,但 UE 体积管线仍计算**云内多次散射**——模型的六阶 octave 正确学到了它(自阴影深核 ~78% 亮度来自多次散射,与 GT 匹配)。
-- **残差诊断(tools/residual_buckets.py / penumbra_residual.py)**:深核阴影已标定准(残差 ~0),唯一可见残差是**近受光半影偏亮 +0.013**(仅 ~11% 像素,PSNR 上限 ~0.15 dB),且主要来自单次散射项 / HG 前向散射,octave 杠杆对其结构性无效——优先级低,暂不追。
+- **评估范围**:全部实验基于 UE 渲染的单朵合成云资产(WDAS cloud VDB)与受控光照数据;对其他云型、密度分布以及真实拍摄数据的泛化尚未验证。
+- **光源近似**:光源空间阴影采用远距离透视相机近似平行太阳光;云体范围较大或太阳方向接近地平线时,该近似可能引入误差。
+- **多次散射近似**:六阶 HG 八度展开是实时外观模型,并非严格能量守恒的多重散射解,在半影与光学厚度较大的区域可能留有残差。
+- **Stage 1 数据集是刻意 env-off 的控制变量设计**:UE 场景只有云 + 单方向太阳,背景纯黑,无天空/大气环境光。注意 env-off 控制掉的是**环境光**,但 UE 体积管线仍计算**云内多次散射**——模型的六阶 octave 近似即用于拟合该效应。
+- **残差诊断(tools/residual_buckets.py / penumbra_residual.py)**:近受光半影处存在轻微偏亮残差,主要来自单次散射项与 HG 前向散射,优先级低。
 
 ## 环境
 
