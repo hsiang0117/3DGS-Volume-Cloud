@@ -259,8 +259,10 @@ class GaussianRasterizationSettings(NamedTuple):
     # When True (and tau_precomp is provided), the render kernel records, per
     # Gaussian, the alpha*T-weighted mean of the analytic optical depth
     # accumulated IN FRONT of it along this camera's rays. Used by the
-    # light-space shadow pass: T_light = exp(-tau_light_sum/tau_light_wsum).
-    # Forward-only (gradients ignored).
+    # light-space shadow pass: T_light = exp(-tau_front_sum/tau_front_wsum).
+    # A dedicated backward replays the sorted light-space buffers and propagates
+    # gradients through the accumulated optical depth to tau_precomp. Footprint
+    # blend weights and raster geometry remain frozen in this pass.
     record_front_tau : bool = False
     # Optional per-pixel background image (CHANNELS x H x W, planar, linear),
     # used in place of the constant `bg` in the final alpha-over. The viewer's
