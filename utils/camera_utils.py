@@ -12,6 +12,7 @@
 import numpy as np
 import queue
 import threading
+import torch
 from concurrent.futures import ThreadPoolExecutor
 import os
 from random import randint
@@ -56,7 +57,8 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   is_nerf_synthetic=is_nerf_synthetic,
-                  v_l=getattr(cam_info, "v_l", None))
+                  v_l=getattr(cam_info, "v_l", None),
+                  image_cache_max=getattr(args, "image_cache_max", 0))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     # Each loadCam does a PIL header read + Camera() construction. Both are
@@ -68,6 +70,13 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_syntheti
     def _load(args_tuple):
         id, c = args_tuple
         return id, loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset)
+
+    # Camera() builds CUDA tensors and calls .inverse(); warm the lazy CUDA
+    # wrapper behind that call on this (main) thread first. Letting worker
+    # threads initialise it concurrently raises
+    # "lazy wrapper should be called at most once".
+    if torch.cuda.is_available():
+        torch.eye(4, device="cuda").inverse()
 
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         for id, cam in ex.map(_load, enumerate(cam_infos)):

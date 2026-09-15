@@ -54,6 +54,9 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
+        # Max number of decoded frames kept in the CPU image cache (LRU);
+        # 0 = unlimited. ~3 MB per 1024² RGB frame — caps RAM on huge datasets.
+        self.image_cache_max = 0
         # transforms_test.json holds a real held-out split (tools/split_test_set.py).
         # Keep True normally: eval=False makes the Blender loader merge test frames
         # back into training, leaking the split and inflating metrics. Disable from

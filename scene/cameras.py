@@ -13,8 +13,39 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
+import threading
+from collections import OrderedDict
 from PIL import Image
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+
+# ---------------------------------------------------------------------------
+# CPU-side decoded-image cache. PNG decoding costs ~30 ms per 1024² frame
+# (vs ~8 ms for the uint8 upload), so the raw uint8 array is decoded once and
+# kept in RAM. The GPU-side float tensor is still created and released per
+# step, so VRAM usage is unchanged. `image_cache_max` (ModelParams) caps the
+# number of cached frames (0 = unlimited); ~3 MB per 1024² RGB frame.
+# ---------------------------------------------------------------------------
+_DECODED_CACHE = OrderedDict()
+_DECODED_CACHE_LOCK = threading.Lock()
+
+def _decoded_uint8(image_path, max_entries=0):
+    with _DECODED_CACHE_LOCK:
+        arr = _DECODED_CACHE.get(image_path)
+        if arr is not None:
+            _DECODED_CACHE.move_to_end(image_path)
+            return arr
+
+    # Decode outside the lock (expensive); duplicate decodes on a rare race
+    # are harmless — the last writer wins.
+    with Image.open(image_path) as image:
+        arr = np.array(image.convert("RGB"), dtype=np.uint8)
+
+    with _DECODED_CACHE_LOCK:
+        _DECODED_CACHE[image_path] = arr
+        _DECODED_CACHE.move_to_end(image_path)
+        if max_entries and len(_DECODED_CACHE) > max_entries:
+            _DECODED_CACHE.popitem(last=False)
+    return arr
 
 class Camera(nn.Module):
     """Camera with lazy image loading.
@@ -31,6 +62,7 @@ class Camera(nn.Module):
                  is_test_dataset = False, is_test_view = False,
                  is_nerf_synthetic = False,
                  v_l=None,
+                 image_cache_max=0,
                  ):
         super(Camera, self).__init__()
 
@@ -40,6 +72,7 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.image_cache_max = int(image_cache_max or 0)
 
         try:
             self.data_device = torch.device(data_device)
@@ -79,12 +112,13 @@ class Camera(nn.Module):
         self.v_l = torch.from_numpy(np.asarray(v_l, dtype=np.float32)).to(self.data_device)
 
     # ------------------------------------------------------------------
-    # Lazy-loaded tensor. Same-step accesses share one decode via a tiny
-    # cache released per iteration (`Camera.release_loaded()`); the cache is
-    # never kept across iterations to avoid OOM.
+    # Lazy-loaded tensor. The GPU-side tensor is rebuilt per step and released
+    # via `Camera.release_loaded()`, so VRAM stays bounded by one image. The
+    # expensive PNG decode is NOT repeated: `_decoded_uint8` keeps the uint8
+    # array in RAM (bounded by ModelParams.image_cache_max, 0 = unlimited).
     #
-    # Decode pipeline (minimises CPU work and PCIe bandwidth):
-    #   PIL.open + np.array(uint8) at native resolution
+    # Load pipeline (minimises CPU work and PCIe bandwidth):
+    #   decoded uint8 array from the CPU cache (decode once)
     #   torch.from_numpy(uint8).to(cuda)  — uint8 upload, 4× cheaper than fp32
     #   F.interpolate on GPU to target resolution
     #   uint8 → fp32 / 255 on GPU (fused)
@@ -94,9 +128,9 @@ class Camera(nn.Module):
         if cache is not None:
             return cache
 
-        with Image.open(self.image_path) as image:
-            # Convert ensures 3-channel RGB even if file has palette/L mode.
-            arr = np.array(image.convert("RGB"), dtype=np.uint8)
+        # Decoded once per frame and kept in the CPU cache (see module top);
+        # only the uint8→GPU copy below is repeated per step.
+        arr = _decoded_uint8(self.image_path, self.image_cache_max)
 
         # (H, W, 3) uint8 CPU → (1, 3, H, W) uint8 GPU
         gpu_uint8 = torch.from_numpy(arr).to(self.data_device, non_blocking=True)
