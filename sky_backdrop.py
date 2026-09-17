@@ -2,24 +2,22 @@
 Sky backdrop for the viewer: a per-sun-elevation HDR cubemap sampled per camera
 ray to replace the flat background behind the cloud.
 
-The cubemaps are captured in UE (tools/ue_capture_sky_backdrop.py): one 6-face
-cube per sun elevation 0..90 deg, all at a FIXED sun azimuth. The sky is
-rotationally symmetric about the zenith except for the sun, so azimuth is a free
-runtime rotation about the up axis — we pick the cube for round(sun_altitude) and
-rotate it so the captured sun lands at the viewer's sun azimuth.
+Assets (tools/ue_capture_sky_backdrop.py): one 6-face cube per sun elevation
+0..90 deg, all captured at a fixed sun azimuth. The sky is azimuthally symmetric
+except for the sun, so the cube for round(sun_altitude) is rotated at runtime to
+put the captured sun at the viewer's sun azimuth.
 
 Frames
-  Capture (UE world): left-handed, +Z up, +X forward. Empirically the sun glow
-    sits on the +X (px) face, so in this frame the sun's horizontal direction is
-    +X and the zenith is +Z.
+  Capture (UE world): left-handed, +Z up, +X forward; the sun glow is on the +X
+    (px) face, so the sun's horizontal direction is +X and the zenith is +Z.
   Viewer world (OpenGL, matches the trained Gaussians / v_l): +Y up, +X right,
     -Z forward.
 We map cube->viewer by aligning (zenith +Z -> +Y) and (sun horizontal +X -> the
 viewer's sun-azimuth horizontal direction). A camera ray d_v is sampled by
 rotating it into the cube frame (d_c = R^T d_v) and doing a standard cube lookup.
 
-Values are linear HDR (SceneColorHDRNoAlpha). The caller applies the same tonemap
-it uses for the cloud so sky and cloud share a display space.
+Values are linear HDR (SceneColorHDRNoAlpha); the caller applies its cloud
+tonemap to them.
 """
 import os
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # cv2 ships EXR off by default here

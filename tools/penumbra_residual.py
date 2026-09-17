@@ -1,12 +1,10 @@
 """
-Diagnostic: localize mid-tone over-brightness by binning the signed luminance
-residual (pred-gt) against per-pixel rendered T_light (sun transmittance /
-shadow depth), not GT luminance.
+Diagnostic: bin the signed luminance residual (pred-gt) against per-pixel
+rendered T_light (sun transmittance / shadow depth), not GT luminance.
 
 T_light bins span the penumbra axis: ~0 deep core shadow, ~0.2-0.7 penumbra
 (terminator), ~1 fully lit. Cross-tabbed with GT luminance to correlate mid-tone
-with mid-T_light. Tests whether the multiple-scattering octave approximation
-over-fills the soft lit->shadow transition.
+with mid-T_light.
 
 Read-only: renders RGB + a T_light image (override_color pass) per test frame;
 no retraining or model mutation.
@@ -46,7 +44,7 @@ g = GaussianModel()
 g.load_ply(ply)
 
 pipe = Namespace(
-                 k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
+                 tlight_voxel=not use_raster, tlight_raster_res=raster_res,
                  tonemap_aces=tonemap_aces, tonemap_learnable=tonemap_learnable)
 bg = torch.zeros(3, device='cuda')
 

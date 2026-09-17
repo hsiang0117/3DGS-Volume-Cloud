@@ -22,11 +22,11 @@ from PIL import Image
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    # Local import: scene.cameras → scene/__init__.py → utils.camera_utils
-    # would otherwise circular-import on a cold start.
+    # Local import to avoid a circular import (scene.cameras → scene/__init__
+    # → utils.camera_utils).
     from scene.cameras import Camera
 
-    # Read only PNG header for size (no pixel decode → cheap).
+    # Read only PNG header for size (no pixel decode).
     with Image.open(cam_info.image_path) as image:
         orig_w, orig_h = image.size
 
@@ -61,9 +61,8 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   image_cache_max=getattr(args, "image_cache_max", 0))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
-    # Each loadCam does a PIL header read + Camera() construction. Both are
-    # pure CPU work; parallelising with a thread pool gives a near-linear
-    # speedup at scene-load time for thousands of cameras.
+    # Each loadCam does a PIL header read + Camera() construction: pure CPU
+    # work with no shared state, so the loads run in a thread pool.
     n_workers = min(32, (os.cpu_count() or 4) * 2)
     camera_list = [None] * len(cam_infos)
 
@@ -110,16 +109,12 @@ def camera_to_JSON(id, camera : "Camera"):
 class CameraPrefetcher:
     """Background producer of (Camera, image-loaded) pairs.
 
-    The training loop calls `next()` to get a camera ready for use; a
-    daemon worker thread picks indices off a shared sampler and warms each
-    camera's `original_image` cache (PIL decode + GPU upload) ahead of
-    time. Queue size = 2 keeps the worker one step ahead without holding
-    extra GPU memory.
+    A daemon worker thread picks indices off a shared sampler and warms each
+    camera's `original_image` cache (PIL decode + GPU upload) ahead of time;
+    `next()` returns the next ready camera. Default queue size is 2.
 
-    Sampling matches the inline policy of the original loop: sample without
-    replacement until the stack is empty, then refill from the full
-    training-camera list. Refill happens inside the worker so the producer
-    never starves.
+    Sampling draws without replacement until the stack is empty, then refills
+    from the full training-camera list; the refill happens inside the worker.
 
     Multi-threaded CUDA uploads are safe under PyTorch's default stream —
     operations queue serially and synchronize correctly with the consumer.
@@ -155,9 +150,8 @@ class CameraPrefetcher:
             try:
                 _ = cam.original_image
             except Exception as e:
-                # Don't let a single bad frame kill the producer — surface
-                # the cam in any case; the consumer will hit the same error
-                # synchronously and fail loudly there.
+                # Warm failure is not fatal: the cam is still queued, and the
+                # consumer hits the same error synchronously.
                 print(f"[prefetcher] warm failed for {cam.image_name}: {e}")
             try:
                 self._q.put(cam, timeout=1.0)

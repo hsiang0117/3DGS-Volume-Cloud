@@ -96,8 +96,8 @@ def storePly(path, xyz, rgb):
 def _parse_one_frame(args):
     """Parse a single transforms.json frame into a CameraInfo.
 
-    Top-level so a ThreadPoolExecutor can fan the per-frame PIL header read +
-    matrix work across cores; thousands of frames make sequential parsing slow.
+    Module-level so a ThreadPoolExecutor can fan the per-frame PIL header read
+    + matrix work across threads.
     """
     idx, frame, path, is_test = args
     cam_name = os.path.join(path, frame["file_path"])
@@ -139,8 +139,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, is_test, e
         frames = contents["frames"]
 
     # Parse frames in parallel: per-frame work is pure CPU (PIL header read +
-    # matrix invert) with no shared state, so a CPU-sized thread pool scales
-    # near-linearly.
+    # matrix invert) with no shared state.
     n_workers = min(32, (os.cpu_count() or 4) * 2)
     args_iter = [(idx, frame, path, is_test) for idx, frame in enumerate(frames)]
     results = [None] * len(args_iter)

@@ -4,14 +4,13 @@
 Two modes:
 
 * SUN-held-out (uniform-sun dataset; pass --held-out-suns): whole sun
-  directions named by --held-out-suns (their every frame) go to test as a
-  relighting-generalisation set, plus --per-sun random frames from each
-  remaining sun (stratified over the sun axis). This is the split used by
-  data/CloudDatasetUniform: --held-out-suns 7,22,37,52 --per-sun 1.
+  directions named by --held-out-suns (their every frame) go to test, plus
+  --per-sun random frames from each remaining sun (stratified over the sun
+  axis). e.g. for data/CloudDatasetUniform: --held-out-suns 7,22,37,52 --per-sun 1.
 
-* PER-camera (legacy CloudDataset; default): every camera contributes
-  --per-cam frames, drawn one per equal time-chunk so the split is random yet
-  spread over both camera poses and sun directions.
+* PER-camera (default): every camera contributes --per-cam frames, drawn one per
+  equal time-chunk so the split is spread over both camera poses and sun
+  directions.
 
 Idempotent: on first run the current transforms_train.json is backed up to
 transforms_train_full.json; later runs always re-split from that backup, so
@@ -21,7 +20,7 @@ Usage:
     # uniform-sun dataset (relighting held-out suns + 1 frame/other sun)
     python tools/split_test_set.py --data data/CloudDatasetUniform \
         --held-out-suns 7,22,37,52 --per-sun 1
-    # legacy per-camera split
+    # per-camera split
     python tools/split_test_set.py --data data/CloudDataset --per-cam 2
 
 NOTE: train with --eval (default True). With eval=False the Blender loader
@@ -83,7 +82,7 @@ def main():
                     test_keys.add(fr["file_path"])
         print(f"sun mode: held-out suns {sorted(held)} (whole) + {args.per_sun}/other sun")
     else:
-        # Legacy per-camera: one random draw per equal time chunk.
+        # per-camera: one random draw per equal time chunk.
         by_cam = defaultdict(list)
         for fr in frames:
             by_cam[fr["camera_index"]].append(fr)

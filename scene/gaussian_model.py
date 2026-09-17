@@ -25,27 +25,18 @@ from utils.graphics_utils import BasicPointCloud
 class EnvNet(nn.Module):
     """Stage-2 global environment-lighting net: v_l (3,) -> (T_sun RGB<=1, E_lm SH).
 
-    GLOBAL — one sky for the whole scene, a function of sun direction ONLY. It adds
-    NO per-Gaussian colour DOF (per-Gaussian colour stays in the frozen albedo ω),
-    so the env term cannot regress the model to vanilla 3DGS / break relighting.
+    GLOBAL — one sky for the whole scene, a function of sun direction ONLY; it adds
+    no per-Gaussian colour DOF (per-Gaussian colour stays in the frozen albedo ω).
 
-    T_sun is an ANALYTIC atmospheric transmittance with just 3 learnable params —
-    the per-channel zenith optical depths τ=(τ_R,τ_G,τ_B):
+    T_sun is an analytic atmospheric transmittance with 3 learnable params, the
+    per-channel zenith optical depths τ=(τ_R,τ_G,τ_B):
 
         T_sun(v_l) = exp( − m(θ) · softplus(raw_tau) ),   θ = sun zenith angle
 
-    m(θ) is the Kasten-Young air mass (a fixed geometric function, not learned);
-    softplus keeps τ≥0 so T_sun∈(0,1]. Reddening (τ_B>τ_G>τ_R, Rayleigh ∝λ^-4) and
-    low-sun dimming (m grows toward the horizon) fall out automatically; azimuth
-    independence is exact (depends on θ only) — both confirmed empirically. raw_tau
-    is initialised to a near-neutral, slightly-Rayleigh τ so Stage 2 starts ≈ the
-    frozen Stage-1 sun render and learns the atmosphere on top.
-
-    E_lm (additive sky in-scatter SH) keeps a small MLP; in a sun-dominated scene it
-    learns ≈0 (sky fill negligible) and the env reduces to T_sun, but the term stays
-    for generality (sky-dominated scenes where fill matters)."""
-    # Near-neutral zenith optical depth init (R,G,B): τ_B>τ_R gives a faint Rayleigh
-    # tilt; small so T_sun(zenith)≈exp(-τ)≈[0.98,0.96,0.93], ~Stage-1 neutral.
+    m(θ) is the Kasten-Young air mass (fixed geometric function, not learned) and
+    softplus keeps τ≥0 so T_sun∈(0,1]; it depends on the zenith angle only. E_lm
+    (additive sky in-scatter SH) comes from a small MLP over v_l."""
+    # Near-neutral zenith optical depth init (R,G,B): small, τ_B>τ_R (faint Rayleigh tilt).
     TAU_INIT = (0.02, 0.04, 0.07)
 
     @staticmethod
@@ -55,19 +46,16 @@ class EnvNet(nn.Module):
 
     @staticmethod
     def _air_mass(v_l):
-        """Kasten-Young (1989) relative air mass from a sun direction (up=+Y).
-        m(θ)=1/(cosθ + 0.50572 (96.07995-θ_deg)^-1.6364); finite at the horizon.
-        Only valid for the upper hemisphere; cosθ is clamped to ~horizon so the
-        formula never goes negative/explosive — below-horizon dimming is handled
-        separately by the horizon gate in forward()."""
+        """Kasten-Young (1989) relative air mass from a sun direction (up=+Y):
+        m(θ)=1/(cosθ + 0.50572 (96.07995-θ_deg)^-1.6364), finite at the horizon.
+        Upper hemisphere only; cosθ is clamped to ~horizon so it never goes
+        negative/explosive — below-horizon dimming is the gate in forward()."""
         cos_theta = torch.clamp(v_l.reshape(3)[1], 0.0, 1.0)    # up = +Y, upper hemi only
         theta_deg = torch.rad2deg(torch.arccos(cos_theta))
         denom = cos_theta + 0.50572 * torch.clamp(96.07995 - theta_deg, min=1e-3) ** (-1.6364)
         return 1.0 / torch.clamp(denom, min=1e-3)
 
-    # Horizon softness (in cosθ units) for the below-horizon sun gate: T_sun fades to 0
-    # over roughly cosθ ∈ [0, HORIZON_SOFT] so the sun "sets" smoothly instead of
-    # snapping off. ~3° band.
+    # Horizon softness (cosθ units): the sun gate fades T_sun to 0 over cosθ ∈ [0, HORIZON_SOFT].
     HORIZON_SOFT = 0.05
 
     def __init__(self, n_sh, hidden=64):
@@ -86,10 +74,7 @@ class EnvNet(nn.Module):
         tau = torch.nn.functional.softplus(self.raw_tau)            # (3,) ≥0
         m = self._air_mass(v_l)                                 # scalar (upper hemi)
         t_sun = torch.exp(-m * tau)                                 # (3,) ∈(0,1]
-        # Below-horizon gate: the sun below the horizon (cosθ≤0) means no direct
-        # sunlight (occluded by the planet / extreme atmospheric path), so T_sun
-        # fades to 0 over a soft band. Smooth (smoothstep) so relighting the sun
-        # past the horizon "sets" continuously instead of snapping to white.
+        # Below-horizon gate (cosθ≤0): T_sun fades to 0 over HORIZON_SOFT via a smoothstep.
         cos_theta = v_l.reshape(3)[1]
         t = torch.clamp(cos_theta / self.HORIZON_SOFT, 0.0, 1.0)
         gate = t * t * (3.0 - 2.0 * t)                              # smoothstep(0,HORIZON_SOFT)
@@ -116,9 +101,8 @@ def _fibonacci_hemisphere(n):
 
 
 def _sh_basis_deg2(dirs):
-    """Real orthonormal SH basis up to l=2 (9 coeffs) at unit dirs (M,3) -> (M,9).
-    Matches utils.sh_utils.eval_sh sign/constant convention so the V_lm projection
-    and any reconstruction stay consistent."""
+    """Real orthonormal SH basis up to l=2 (9 coeffs) at unit dirs (M,3) -> (M,9). Matches
+    utils.sh_utils.eval_sh sign/constant convention so V_lm stays consistent."""
     from utils.sh_utils import C0, C1, C2
     x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
     xx, yy, zz = x * x, y * y, z * z
@@ -140,11 +124,8 @@ class GaussianModel:
 
     # Learnable output tonemap (Narkowicz ACES rational form), shared across RGB:
     #     f(x) = (a x^2 + b x) / (c x^2 + d x + e)
-    # (a,b,c,d) learned via softplus(raw): positivity gives no poles for x>=0 and
-    # output >= 0, so the curve stays smooth and bounded. `e` is pinned to remove
-    # the rational form's overall-scale degeneracy (scaling numerator and
-    # denominator by k leaves f unchanged), leaving 4 well-posed DoF. Canonical
-    # init reproduces the fixed Narkowicz curve at iteration 0.
+    # (a,b,c,d) learned via softplus(raw) (positive ⇒ no poles for x>=0); `e` pinned
+    # (removes the form's scale degeneracy). Canonical init = the fixed Narkowicz curve.
     TONEMAP_CANONICAL = (2.51, 0.03, 2.43, 0.59)   # (a, b, c, d)
     TONEMAP_E = 0.14                                # pinned denominator constant
 
@@ -165,24 +146,19 @@ class GaussianModel:
         self.omega_activation = torch.sigmoid
         self.g_activation = lambda x: 0.8 * torch.tanh(x)
         # Per-Gaussian multiple-scattering octave weights: softplus keeps them
-        # non-negative (scattered energy cannot be negative). A scalar-per-octave
-        # weight only rescales the physical basis functions (HG·T·ω), so chroma
-        # stays locked in the albedo ω and lighting still flows through every
-        # term — it cannot bypass the physical model.
+        # non-negative; each only rescales the physical basis (HG·T·ω), so chroma stays in ω.
         self.w_activation = torch.nn.functional.softplus
 
 
     def __init__(self):
         self._xyz = torch.empty(0)
-        # Physical appearance parameters (raw, pre-activation)
-        # `_sigma_t` stores the peak extinction coefficient σ_t (intensive, 1/length),
-        # NOT total mass. Mass = σ_t · (2π)^(3/2) · |Σ|^(1/2) is derived in the renderer.
+        # Physical appearance parameters (raw, pre-activation). `_sigma_t` is the peak
+        # extinction σ_t (intensive, 1/length, not mass; mass = σ_t·(2π)^(3/2)·|Σ|^(1/2)).
         self._sigma_t = torch.empty(0)   # (P,1) raw -> softplus(σ_t)
         self._omega = torch.empty(0)       # (P,3) raw -> sigmoid
         self._g = torch.empty(0)     # (P,1) raw -> tanh
         self._w = torch.empty(0)  # (P,6) raw -> softplus, MS octave energy
-        # Global (per-scene, NOT per-Gaussian) learnable output-tonemap coeffs:
-        # (4,) raw -> softplus -> (a,b,c,d). Lives in its own optimizer.
+        # Global (per-scene) tonemap coeffs: (4,) raw -> softplus -> (a,b,c,d), own optimizer.
         self._tonemap = torch.empty(0)
 
         self._scaling = torch.empty(0)
@@ -271,15 +247,12 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        # Physical parameter initialization (raw / pre-activation)
-        # `_sigma_t` stores the peak extinction coefficient σ_t directly.
-        # σ_t ≈ 0.1 gives initial τ_center = σ_t·√(2π)·s ≈ 0.25·s at unit scale.
+        # Physical parameter init (raw): σ_t = 0.1 gives τ_center = σ_t·√(2π)·s ≈ 0.25·s.
         sigma_t_init = torch.full((P, 1), 0.1, dtype=torch.float, device="cuda")
         sigma_t_raw = self._softplus_inverse(sigma_t_init)
         omega_raw = inverse_sigmoid(torch.full((P, 3), 0.8, dtype=torch.float, device="cuda"))
         g_raw = torch.atanh(torch.full((P, 1), 0.7, dtype=torch.float, device="cuda"))
-        # Octave weights initialised so softplus(raw) == 0.5^n for n=0..5, i.e.
-        # iteration 0 reproduces the fixed 6-octave a^n=0.5^n schedule.
+        # Octave weights init: softplus(raw) == 0.5^n (n=0..5), the fixed 6-octave schedule.
         w_target = torch.tensor([0.5 ** n for n in range(6)], dtype=torch.float, device="cuda")
         w_raw = self._softplus_inverse(w_target).unsqueeze(0).repeat(P, 1)  # (P,6)
 
@@ -299,14 +272,10 @@ class GaussianModel:
         # In log-scale parameterization a negative grad on _scaling increases s.
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        # Per-Gaussian Σ(α·T) accumulator + count of forward passes contributed.
-        # Used by the physical densify_and_prune logic to spot Gaussians with
-        # negligible image contribution (regardless of opacity).
+        # Per-Gaussian Σ(α·T) accumulator + visible-pass count, used by physical densify/prune.
         self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
-        # Per-Gaussian "frozen" counter: when a Gaussian was just split / cloned
-        # / resurrected, give it N steps of prune immunity so it has a chance to
-        # absorb gradient before being judged.
+        # Prune-immunity counter: freshly split / cloned / resurrected points get N settling steps.
         self.prune_grace = torch.zeros((self.get_xyz.shape[0],), dtype=torch.int32, device="cuda")
 
         l = [
@@ -334,7 +303,6 @@ class GaussianModel:
             lr_final=training_args.scaling_lr * 0.1,
             max_steps=training_args.iterations)
 
-        # Physical parameter LR decay: decay to 1/10 of initial by end of training
         decay_ratio = 0.1
         iters = training_args.iterations
         self.sigma_t_scheduler_args = get_expon_lr_func(
@@ -356,14 +324,11 @@ class GaussianModel:
             max_steps=iters)
 
     def setup_tonemap(self, training_args):
-        """Enable the learnable output tonemap (called only when
-        --tonemap_learnable). The 4 global coeffs live in their OWN Adam,
-        isolated from the main optimizer's densify/prune machinery
-        (_prune_optimizer indexes every group with a per-Gaussian mask, which
-        would crash on a global param). Gradients still flow from loss.backward()
-        since _tonemap is a leaf in the render graph."""
-        # Create the parameter at canonical init unless a checkpoint already
-        # populated it (resume / load_ply).
+        """Enable the learnable output tonemap (called only when --tonemap_learnable).
+        The 4 global coeffs live in their OWN Adam: _prune_optimizer indexes every
+        group with a per-Gaussian mask, which would crash on a global param. Gradients
+        still flow from loss.backward() since _tonemap is a leaf in the render graph."""
+        # Create the parameter at canonical init unless a checkpoint already populated it.
         if self._tonemap.numel() == 0:
             raw = self._softplus_inverse(
                 torch.tensor(self.TONEMAP_CANONICAL, dtype=torch.float, device="cuda"))
@@ -414,10 +379,10 @@ class GaussianModel:
             param_group['lr'] = lr
 
     def precompute_sky_transfer(self, n_dirs=48, sh_order=2):
-        """Precompute the per-Gaussian sky-visibility transfer V_lm (SH2) over the
-        upper hemisphere, reusing the light-space rasterizer for per-Gaussian
-        transmittance toward each sky direction. Achromatic, geometry-only; run once
-        on the frozen Stage-1 model. Stored in _sky_transfer (P, n_sh)."""
+        """Precompute the per-Gaussian sky-visibility transfer V_lm (SH2) over the upper
+        hemisphere, reusing the light-space rasterizer for per-Gaussian transmittance
+        toward each sky direction. Achromatic, geometry-only; stored in
+        _sky_transfer (P, n_sh)."""
         from gaussian_renderer import compute_T_light_raster, normalized_gaussian_line_integral
         assert sh_order == 2, "only SH2 env transfer supported"
         self.env_sh_order = sh_order
@@ -445,10 +410,9 @@ class GaussianModel:
         print(f"[gaussian_model] precomputed sky transfer V_lm {tuple(V.shape)} over {n_dirs} dirs")
 
     def apply_env(self, v_l):
-        """Return (T_sun (3,), fill (P,3)) for the current sun direction, or (None,
-        None) if env lighting is not active. fill = ω · (V_lm · E_lm); T_sun is the
-        global RGB sun transmittance. Differentiable in the EnvNet params only
-        (V_lm and ω are frozen)."""
+        """Return (T_sun (3,), fill (P,3)) for the current sun direction, or (None, None)
+        if env lighting is inactive. fill = ω · (V_lm · E_lm); T_sun is the global RGB
+        sun transmittance. Differentiable in the EnvNet params only (V_lm, ω frozen)."""
         if self.env_net is None or self._sky_transfer.numel() == 0:
             return None, None
         v_l = v_l.to(self._sky_transfer.dtype)
@@ -505,10 +469,8 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-        # The global learnable tonemap coeffs are not per-vertex, so they can't
-        # ride the PLY. Mirror the metrics.json sidecar convention: write a small
-        # tonemap.json next to the PLY (only when the param exists). The viewer
-        # and load_ply read it back to reproduce the exact output curve.
+        # The global tonemap coeffs are not per-vertex, so a tonemap.json sidecar next to
+        # the PLY (when the param exists) carries them; load_ply / viewer read it back.
         if self._tonemap.numel() > 0:
             raw = self._tonemap.detach().cpu().numpy().tolist()
             coeffs = torch.nn.functional.softplus(self._tonemap).detach().cpu().numpy().tolist()
@@ -522,9 +484,7 @@ class GaussianModel:
             with open(os.path.join(os.path.dirname(path), "tonemap.json"), "w") as f:
                 json.dump(sidecar, f, indent=2)
 
-        # Stage-2 environment lighting: the per-Gaussian transfer V_lm and the global
-        # EnvNet weights are not per-vertex PLY attributes -> write sidecars next to
-        # the PLY (only when present). load_ply / viewer read them back.
+        # Env lighting: V_lm and the EnvNet weights are not PLY attributes -> sidecars next to the PLY.
         if self.env_net is not None and self._sky_transfer.numel() > 0:
             d = os.path.dirname(path)
             np.save(os.path.join(d, "sky_transfer.npy"), self._sky_transfer.detach().cpu().numpy())
@@ -542,12 +502,11 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
 
-        # σ_t: prefer the new 'sigma_t' column; fall back to the legacy
-        # 'extinction' name so checkpoints trained before the rename still load.
+        # σ_t: prefer 'sigma_t'; fall back to the legacy 'extinction' column.
         st_col = "sigma_t" if "sigma_t" in names else "extinction"
         sigma_t = np.asarray(plydata.elements[0][st_col])[..., np.newaxis]
 
-        # ω: prefer the new 'omega_{i}' columns; fall back to legacy 'albedo_{i}'.
+        # ω: prefer 'omega_{i}'; fall back to legacy 'albedo_{i}'.
         if "omega_0" in names:
             omega = np.stack([np.asarray(plydata.elements[0][f"omega_{i}"])
                               for i in range(3)], axis=1)
@@ -557,9 +516,7 @@ class GaussianModel:
         g_col = "g" if "g" in names else "g_factor"
         g = np.asarray(plydata.elements[0][g_col])[..., np.newaxis]
 
-        # Per-Gaussian octave weights (6 cols). Prefer the new 'w_{i}' columns,
-        # then the legacy 'octave_weight_{i}' names, and finally fall back to the
-        # fixed 0.5^n schedule (softplus-inverse) so old checkpoints still load.
+        # Octave weights (6 cols): prefer 'w_{i}', then 'octave_weight_{i}', else 0.5^n softplus-inverse.
         ow_names = [p.name for p in props if p.name.startswith("w_")]
         if not ow_names:
             ow_names = [p.name for p in props if p.name.startswith("octave_weight_")]
@@ -593,9 +550,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
-        # Restore the learnable tonemap coeffs from the sidecar if present.
-        # Absent → linear-space / fixed-ACES model: leave _tonemap empty so
-        # get_tonemap_coeffs returns None and apply_tonemap is a no-op.
+        # Restore tonemap coeffs from the sidecar if present; absent → apply_tonemap is a no-op.
         tm_path = os.path.join(os.path.dirname(path), "tonemap.json")
         if os.path.exists(tm_path):
             try:
@@ -612,7 +567,7 @@ class GaussianModel:
         else:
             self._tonemap = torch.empty(0)
 
-        # Restore Stage-2 environment lighting (transfer V_lm + EnvNet) if present.
+        # Restore Stage-2 environment lighting (transfer V_lm + EnvNet) if the sidecars exist.
         env_path = os.path.join(os.path.dirname(path), "env.json")
         st_path = os.path.join(os.path.dirname(path), "sky_transfer.npy")
         net_path = os.path.join(os.path.dirname(path), "env_net.pt")
@@ -654,8 +609,8 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            # Some parameter groups are global (not per-point) and should not be pruned.
-
+            # Every group here is per-point, so the mask applies to all of them.
+            # (Global params live in their own optimizers, e.g. tonemap / env.)
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -688,9 +643,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        # tmp_radii is only set transiently inside physical_densify_and_prune;
-        # post-densify prune paths call prune_points with tmp_radii=None (or
-        # unset before the first densify round) and don't need it downstream.
+        # tmp_radii is set only transiently inside physical_densify_and_prune, so it may be absent here.
         tmp_radii = getattr(self, "tmp_radii", None)
         if tmp_radii is not None:
             self.tmp_radii = tmp_radii[valid_points_mask]
@@ -727,17 +680,12 @@ class GaussianModel:
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
-        # Alive-only gate: a Gaussian that has never been visible to any
-        # camera in the current accumulator window has no useful gradient
-        # to propagate; cloning/splitting it just produces more dead
-        # points that pile up until the next prune. New-born points are
-        # protected by their grace counter.
+        # Alive-only gate: a never-visible point has no useful gradient; new-borns have grace.
         alive_or_grace = (self.contribution_denom > 0) | (self.prune_grace > 0)
         if alive_or_grace.numel() == n_init_points:
             selected_pts_mask = torch.logical_and(selected_pts_mask, alive_or_grace)
@@ -778,10 +726,7 @@ class GaussianModel:
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # Append zero stats for new children; preserve existing points' stats so
-        # the prune predicate (visible_enough = denom ≥ 5) keeps working inside
-        # the densify phase. Wholesale reset here stalls aniso / contribution
-        # prune.
+        # Append zero stats for new children; keep existing stats (the prune predicate needs them).
         n_new_children = N * int(selected_pts_mask.sum().item())
         n_kept = self.get_xyz.shape[0] - n_new_children
         self.contribution_accum = torch.cat([
@@ -804,14 +749,11 @@ class GaussianModel:
     def split_needles(self, ratio_threshold, opt=None):
         """Surgical split of high-anisotropy Gaussians (ratio > threshold).
 
-        The aniso tail is ~95% disks (two long axes, one thin axis), so this
-        fattens the thin axis rather than splitting the major axis: children
-        keep the parent's orientation and long axes, the min axis is doubled,
-        and σ_t is reduced to conserve total extinction mass (σ_t·∏s). The two
-        children are offset by ±σ_major/2 along the major axis so the pair
-        approximately covers the parent's footprint. Each pass halves the ratio
-        of every offender; converges to the threshold in log2(max/threshold)
-        passes.
+        Fattens the thin axis (x2) rather than splitting the major axis: children
+        keep the parent's orientation and long axes, the min axis is doubled, and
+        σ_t is reduced to conserve total extinction mass (σ_t·∏s). The two children
+        are offset by ±σ_major/2 along the major axis so the pair approximately
+        covers the parent's footprint. Each pass halves the ratio of every offender.
 
         Returns the number of Gaussians split.
         """
@@ -838,10 +780,7 @@ class GaussianModel:
         parent_xyz = self.get_xyz[mask]
         new_xyz = torch.cat([parent_xyz + offset, parent_xyz - offset], dim=0)
 
-        # Fatten the thin axis (x2) — ratio halves. Mass bookkeeping per child:
-        # volume x2 (fattened axis), and TWO children replace one parent, so σ_t
-        # would drop x4 for exact total-mass conservation. Child footprints
-        # overlap near the parent centre, so /3.2 is mass-neutral in practice.
+        # Fatten the thin axis (x2) — ratio halves; σ_t is divided by 3.2, not the exact-mass /4.
         child_scaling = sel_scaling.clone()
         child_scaling.scatter_(1, minor_idx.unsqueeze(1), sigma_minor * 2.0)
         new_scaling = self.scaling_inverse_activation(child_scaling.repeat(2, 1))
@@ -875,8 +814,7 @@ class GaussianModel:
 
         n_children = 2 * n
         device = "cuda"
-        # tmp_radii only exists transiently inside the densify pass; when the
-        # surgery runs from the maintenance tick it is absent — skip then.
+        # tmp_radii exists only transiently inside the densify pass; absent when called from the tick.
         tmp = getattr(self, "tmp_radii", None)
         if tmp is not None and tmp.numel():
             self.tmp_radii = torch.cat([tmp, torch.zeros(n_children, device=device)])
@@ -903,11 +841,9 @@ class GaussianModel:
         return n
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        # Alive-only gate (see densify_and_split for rationale).
         alive_or_grace = (self.contribution_denom > 0) | (self.prune_grace > 0)
         if alive_or_grace.numel() == self.get_xyz.shape[0]:
             selected_pts_mask = torch.logical_and(selected_pts_mask, alive_or_grace)
@@ -947,9 +883,7 @@ class GaussianModel:
         self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # Append zero stats for clones; preserve existing points' stats so the
-        # prune predicate stays alive across densify rounds. See densify_and_split
-        # for the rationale.
+        # Append zero stats for clones; keep existing stats across densify rounds.
         n_kept = self.get_xyz.shape[0] - n_added
         self.contribution_accum = torch.cat([
             self.contribution_accum[:n_kept],
@@ -970,23 +904,19 @@ class GaussianModel:
     def add_contribution_stats(self, contribution):
         """Per-step accumulator for Σ(α·T) per Gaussian.
 
-        contribution: (P,) tensor from the rasterizer's per-Gaussian
-        accumulator. Called after every forward pass during training.
+        contribution: (P,) tensor from the rasterizer's per-Gaussian accumulator,
+        added after every forward pass during training.
         """
         if self.contribution_accum.numel() == 0:
             self.contribution_accum = torch.zeros((self.get_xyz.shape[0],), device="cuda")
             self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
             self.prune_grace = torch.zeros((self.get_xyz.shape[0],), dtype=torch.int32, device="cuda")
-        # contribution may have been recorded for points that have since been
-        # pruned/split; if shapes don't match, just skip (next forward will
-        # re-align after stats reset in densify).
+        # contribution may cover points since pruned/split; skip on shape mismatch (realigned on reset).
         if contribution.shape[0] != self.contribution_accum.shape[0]:
             return
         with torch.no_grad():
             self.contribution_accum += contribution
-            # Only count this forward pass for Gaussians that were actually
-            # visible (had non-zero contribution). Prevents off-screen frames
-            # from diluting the average.
+            # Count only visible Gaussians (non-zero contribution), so off-screen frames don't dilute.
             self.contribution_denom += (contribution > 0).float()
 
     def get_mean_contribution(self):
@@ -997,22 +927,18 @@ class GaussianModel:
     def physical_densify_and_prune(self, opt, iteration, radii, scene_extent):
         """Cloud-parameterisation-aware densify / prune.
 
-        Density growth: keep stock xyz/scale-grad-driven clone+split.
+        Density growth: stock xyz/scale-grad-driven clone+split.
 
-        Pruning: replace the opacity-threshold prune with image-contribution
-        prune. A Gaussian is removed iff:
+        Pruning: image-contribution prune in place of the opacity threshold. A
+        Gaussian is removed iff:
           - it was visible at all (contribution_denom > some min), AND
-          - its mean contribution Σ(α·T) per visible frame falls below
+          - its mean contribution Σ(α·T) per visible frame is below
             `opt.contribution_threshold`, AND
-          - it is not currently in a grace period (prune_grace == 0).
+          - it is not in a grace period (prune_grace == 0).
 
-        Resurrection: every `opt.resurrect_interval` iterations, reset the
-        σ_t of the bottom `opt.resurrect_fraction` of Gaussians (by mean
-        contribution) back toward the initialisation value, and grant them
-        another grace period. This restores the predicate flow stock 3DGS
-        gets from `reset_opacity()` — but under our σ_t parametrisation
-        that reset is meaningless (opacity is analytic from extinction +
-        scale), so we resurrect σ_t directly instead.
+        Resurrection: every `opt.resurrect_interval` iterations, reset the σ_t of the
+        bottom `opt.resurrect_fraction` of Gaussians (by mean contribution) toward the
+        initialisation value and grant another grace period.
         """
         # 1. Density growth (stock path, with adaptive threshold)
         denom_g = self.denom.clamp(min=1)
@@ -1021,8 +947,7 @@ class GaussianModel:
 
         max_grad_eff = opt.densify_grad_threshold
         if getattr(opt, "densify_adaptive", False):
-            # Take the top-K% of gradients as the threshold this round so that
-            # densify keeps firing even when grads decay late in training.
+            # Top-K% of gradients as the threshold this round (grads decay late in training).
             g = grads.squeeze().abs()
             valid = g > 0
             if valid.any():
@@ -1041,12 +966,10 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad_eff, scene_extent)
         self.densify_and_split(grads, max_grad_eff, scene_extent)
 
-        # 2. Contribution-based prune (replaces opacity threshold).
-        # Per-Gaussian prune_grace protects new-borns; no global warmup needed.
+        # 2. Contribution-based prune (per-Gaussian prune_grace protects new-borns).
         self._prune_by_contribution(opt)
 
-        # Decay grace counter; accumulator reset is handled separately by
-        # tick_post_densify_maintenance() so it stays alive post-densify.
+        # Decay grace counter; the accumulator reset lives in tick_post_densify_maintenance().
         with torch.no_grad():
             self.prune_grace = (self.prune_grace - opt.densification_interval).clamp(min=0)
 
@@ -1054,30 +977,18 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def _prune_by_contribution(self, opt):
-        """Two-channel prune for the physical strategy.
+        """Two-channel prune for the physical strategy; the channels are OR'd.
 
-        Each channel produces its own mask, gated only by `grace_expired`
-        (so newly born / resurrected points still get a settling window),
-        and the channels are OR'd together. Crucially, `visible_enough` is
-        a gate ONLY for the contribution channel — a point that is never
-        seen has no opportunity to contribute, so the contribution
-        threshold doesn't apply to it. A separate dead-point channel
-        handles the "never visible after grace expired" case.
+        Both are gated by `grace_expired` (newly born / resurrected points still get
+        a settling window), and `visible_enough` gates ONLY the contribution channel
+        — a point that is never seen has no opportunity to contribute.
 
-        Channel A — contribution: visible enough times yet projects
-            virtually no light onto valid pixels → dead weight regardless
-            of geometry.
+        Channel A — contribution: visible enough times yet projecting virtually no
+            light onto valid pixels → dead weight regardless of geometry.
 
-        Channel B — dead point: grace has expired but the point hasn't
-            been visible to a single camera in the current accumulator
-            window. Either it sits outside every frustum, or its scale is
-            so small that the rasterizer culls it before it can deposit a
-            single pixel. Without this channel such points pile up
-            indefinitely (visible-frame-count = 0 makes the contribution
-            channel above silently bypass them).
-
-        There is no aniso prune channel: the full-schedule aniso regulariser
-        holds p99 at a ~30 plateau, far below any sane prune ratio.
+        Channel B — dead point: grace expired and not visible to a single camera in
+            the current accumulator window (outside every frustum, or culled by the
+            rasterizer before it deposits a pixel).
         """
         if self.get_xyz.shape[0] == 0:
             return 0
@@ -1102,28 +1013,20 @@ class GaussianModel:
         return n
 
     def tick_post_densify_maintenance(self, opt, iteration):
-        """Per-iteration housekeeping during the densify window (resurrect + prune +
-        accumulator reset). Despite the name, this runs ONLY while
-        iteration < densify_until_iter and is a no-op afterwards — the early return
-        below is intentional:
-
-          Running resurrect/prune during the post-densify settle phase forms a net-
-          destruction loop (resurrect→prune) that cost -17% points and -0.7 dB in
-          testing, so maintenance is gated off once densify stops. Popping in the
-          settle phase is held by the full-schedule aniso regulariser + needle
-          surgery, not by a geometric prune.
+        """Per-iteration housekeeping during the densify window (despite the name it runs
+        ONLY while iteration < densify_until_iter and is a no-op afterwards; the early
+        return below is intentional):
 
           - σ_t resurrect of bottom `opt.resurrect_fraction` Gaussians every
             `opt.resurrect_interval` iterations.
-          - Periodic reset of the contribution accumulators so the running mean
-            tracks current model state, every `opt.contribution_reset_interval` iters.
+          - Contribution prune every `opt.post_densify_prune_interval` iterations.
+          - Reset of the contribution accumulators so the running mean tracks current
+            model state, every `opt.contribution_reset_interval` iterations.
         """
         if iteration <= 0 or iteration >= getattr(opt, "densify_until_iter", float("inf")):
             return
-        # Order matters: resurrect → prune → reset. The prune predicate uses
-        # `contribution_denom >= prune_min_visible_frames` as a gate, so zeroing
-        # the accumulator first would mask every point and nothing would ever be
-        # reclaimed (n_points freezes + aniso p99 grows unbounded).
+        # Order matters: resurrect → prune → reset — the prune predicate gates on
+        # `contribution_denom >= prune_min_visible_frames`, so zeroing first masks every point.
         # 1. Resurrect schedule
         if (
             opt.resurrect_interval > 0
@@ -1131,8 +1034,7 @@ class GaussianModel:
         ):
             self._resurrect_low_contribution(opt.resurrect_fraction)
 
-        # 2. Contribution prune: reclaim low-contribution / dead points that
-        # accumulate within the densify window between the regular prune passes.
+        # 2. Contribution prune: reclaim low-contribution / dead points between the regular passes.
         prune_iv = getattr(opt, "post_densify_prune_interval", 0)
         if prune_iv > 0 and iteration % prune_iv == 0:
             self._prune_by_contribution(opt)
@@ -1149,17 +1051,15 @@ class GaussianModel:
                     self.contribution_denom.zero_()
 
     def _resurrect_low_contribution(self, fraction):
-        """Reset σ_t of the lowest-contribution `fraction` of Gaussians
-        back toward the initial value (0.1), letting them rejoin gradient flow.
-        Only σ_t is touched; xyz / scale / rotation / albedo / g stay put.
-        """
+        """Reset σ_t of the lowest-contribution `fraction` of Gaussians back toward the
+        initial value (0.1), letting them rejoin gradient flow. Only σ_t is touched;
+        xyz / scale / rotation / albedo / g stay put."""
         if fraction <= 0 or self.get_xyz.shape[0] == 0:
             return
         with torch.no_grad():
             mean_contrib = self.get_mean_contribution()
             P = mean_contrib.shape[0]
             k = max(1, int(P * fraction))
-            # Lowest k by mean contribution.
             _, low_idx = torch.topk(mean_contrib, k, largest=False)
             # Skip points that are already in grace (recently born).
             low_idx = low_idx[self.prune_grace[low_idx] == 0]
@@ -1168,13 +1068,10 @@ class GaussianModel:
             init_sigma_t = torch.full((low_idx.numel(), 1), 0.1, device="cuda")
             new_sigma_t = self._sigma_t.detach().clone()
             new_sigma_t[low_idx] = self._softplus_inverse(init_sigma_t)
-            # Replace param tensor in the optimiser (uses existing helper).
             optimizable_tensors = self.replace_tensor_to_optimizer(new_sigma_t, "sigma_t")
             self._sigma_t = optimizable_tensors["sigma_t"]
             # Grant grace so they don't get pruned before σ_t has time to grow.
             self.prune_grace[low_idx] = 500
-
-    # ----------------------------------------------------------------------
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

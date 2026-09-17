@@ -6,9 +6,9 @@ Run:
     python viewer.py --ply <path/to/point_cloud.ply>
 then open http://localhost:8080 in a browser.
 
-Provides PLY loading, free-fly camera (viser orbit / WASD), FOV and
-per-Gaussian scaling sliders, visualisation modes (RGB | depth | T_light |
-sigma_t), and interactive sun direction (T_light recomputed on change).
+Provides PLY loading, free-fly camera (viser orbit / WASD), visualisation modes
+(RGB | depth | T_light | sigma_t), and interactive sun direction (T_light
+recomputed on change).
 """
 
 import os
@@ -34,22 +34,17 @@ from sky_backdrop import SkyBackdrop, camera_ray_dirs
 # --- Pipeline stub (mirrors arguments.PipelineParams, no argparse needed) ---
 @dataclass
 class _ViewerPipe:
-    k_sigma: float = 1.5
-    # T_light is supplied via precomputed_T_light (compute_T_light_cache), so
-    # render() never reaches its own T_light branch; tlight_voxel only guards
-    # against accidental in-render computation.
+    # T_light comes in via precomputed_T_light (compute_T_light_cache), so render()
+    # never reaches its own T_light branch.
     tlight_voxel: bool = True
     # When True, render() shades in HDR linear and applies a tonemap curve to the
     # final RGB. tonemap_aces = fixed Narkowicz; tonemap_learnable = per-model
-    # learned coeffs restored by load_ply (pc.apply_tonemap). Set from cfg_args /
-    # the "Tonemap" checkbox; mutated per frame. Neither affects diagnostic
-    # channels (override_color set).
+    # learned coeffs restored by load_ply (pc.apply_tonemap). Mutated per frame.
     tonemap_aces: bool = False
     tonemap_learnable: bool = False
-    # Stage-2 environment lighting. When True, render() adds the learned global sky
-    # (T_sun sun transmittance ⊙ sun_term + ω·Σ E_lm·V_lm in-scatter) on top of the
-    # frozen sun shading; tracks the sun direction for relighting. Auto-set when the
-    # loaded model carries env sidecars (env_net.pt / sky_transfer.npy).
+    # Stage-2 environment lighting: render() adds the learned global sky (T_sun sun
+    # transmittance ⊙ sun_term + ω·Σ E_lm·V_lm in-scatter) on top of the frozen sun
+    # shading; auto-set when the model carries env sidecars.
     env_lighting: bool = False
 
 
@@ -75,14 +70,10 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
     use viser's pose as-is, with no axis flipping.
 
     `aspect` overrides the horizontal FOV's aspect ratio: None uses the live
-    canvas aspect (interactive view); pass an explicit value (e.g. 1.0 for a
-    square still) so fovx matches the requested width/height — the still capture
-    needs this so the rasterizer FOV and the sky-backdrop rays (which derive
-    their own aspect from width/height) agree.
-
-    (Datasets read via `readCamerasFromTransforms` come from OpenGL/Blender
-    transforms and DO need a Y/Z axis flip — but that's a property of the
-    on-disk transform_matrix, not of any camera the renderer sees.)
+    canvas aspect; pass an explicit value (e.g. 1.0 for a square still) so fovx
+    matches the requested width/height — required for still capture, so the
+    rasterizer FOV and the sky-backdrop rays (which derive their own aspect from
+    width/height) agree.
     """
     c2w = np.eye(4, dtype=np.float32)
     c2w[:3, :3] = _quat_wxyz_to_matrix(np.asarray(cam.wxyz, dtype=np.float32))
@@ -111,9 +102,9 @@ def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
     what render() produces for the same sun direction.
 
     use_raster selects the light-space rasterized shadow pass instead of the
-    128^3 voxel cache. View a model with the SAME T_light source it was trained
-    with — σ_t/albedo calibrate against their training-time shadow field, so mixing
-    sources shows mis-lit results.
+    128^3 voxel cache. Contract: view a model with the SAME T_light source it was
+    trained with, since σ_t/albedo calibrate against their training-time shadow
+    field.
     """
     v_l = v_l.to(device="cuda", dtype=torch.float32)
     v_l = v_l / (torch.linalg.norm(v_l) + 1e-8)
@@ -206,30 +197,26 @@ def _load_train_transforms(ply_path: str) -> tuple[dict | None, str | None]:
     """Walk back from PLY path to find the source dataset's transforms_train.json.
 
     cameras.json stores image_name = file_stem, which collapses multi-camera /
-    multi-time datasets onto duplicate strings (e.g. all 49 cams sharing
-    "0000".."0060"). We need the original transforms file to recover the
-    (camera_index, time_index) double-key and per-frame c2w / v_l.
+    multi-time datasets onto duplicate strings. The original transforms file is
+    needed to recover the (camera_index, time_index) double-key and per-frame
+    c2w / v_l.
 
-    Recognises the layout used by Scene.__init__: <model>/cfg_args records
-    the dataset source path. If we can't find that, falls back to a few
-    common adjacent locations.
+    Reads the Scene.__init__ layout: <model>/cfg_args records the dataset source
+    path; also tries a couple of common adjacent locations.
     """
     import json
     candidates = []
-    # 1. <model>/cfg_args points to the source_path string
     cfg = os.path.normpath(os.path.join(os.path.dirname(ply_path), os.pardir, os.pardir, "cfg_args"))
     if os.path.exists(cfg):
         try:
             with open(cfg, "r", encoding="utf-8") as f:
                 txt = f.read()
-            # cfg_args is `Namespace(source_path='C:/.../CloudDataset', ...)`
             import re
             m = re.search(r"source_path=['\"]([^'\"]+)['\"]", txt)
             if m:
                 candidates.append(os.path.join(m.group(1), "transforms_train.json"))
         except Exception:
             pass
-    # 2. cwd / data/<basename>/transforms_train.json
     candidates.append("data/CloudDataset/transforms_train.json")
     for p in candidates:
         if p and os.path.exists(p):
@@ -250,7 +237,7 @@ def _transforms_frame_to_viser_pose(frame: dict, fov_x: float) -> tuple[np.ndarr
     """
     M = np.asarray(frame["transform_matrix"], dtype=np.float32)
     pos = M[:3, 3]
-    # OpenGL local axes: col0=right (+X), col1=up (+Y), col2=back (+Z) → forward = -col2
+    # OpenGL c2w: col0=right, col1=up, col2=back, so forward = -col2.
     up = M[:3, 1]
     forward = -M[:3, 2]
     look_at = pos + forward * 10.0
@@ -271,7 +258,6 @@ def _training_cam_to_viser_pose(cam: dict) -> tuple[np.ndarray, np.ndarray, np.n
     forward = rot[:, 2]                                          # camera +Z in world
     down = rot[:, 1]                                             # camera +Y in world
     up = -down                                                   # world "up" for viser
-    # Pick a look-at point in front of camera; distance is arbitrary for orientation.
     look_at = pos + forward * 10.0
     fov_y = 2.0 * math.atan(cam["height"] / (2.0 * cam["fy"]))
     return pos, up.astype(np.float32), look_at.astype(np.float32), float(fov_y)
@@ -309,23 +295,17 @@ def main():
                              "exposure' slider.")
     args = parser.parse_args()
 
-    # Resolve the T_light source. Models calibrate σ_t/albedo against their
-    # training-time shadow field, so the viewer must use the same source.
-    # Read from cfg_args: tlight_voxel=True -> voxel; else tlight_raster=True
-    # -> raster; absent both -> voxel.
+    # T_light source (must match the model's training-time shadow field), from
+    # cfg_args: tlight_voxel=True -> voxel; else tlight_raster=True -> raster.
     use_raster_tlight = args.tlight == "raster"
     tlight_raster_res = 512
-    # Tonemap is resolved in two stages: the cfg flags say whether the model was
-    # trained with a curve and which kind; whether learnable coeffs actually
-    # exist is confirmed after load_ply (the tonemap.json sidecar). `forced` is
-    # set by --tonemap on/off; None means auto.
+    # Tonemap: cfg flags say whether a curve was trained and which kind; learnable
+    # coeffs are confirmed after load_ply (tonemap.json sidecar).
     forced_tonemap = {"on": True, "off": False}.get(args.tonemap, None)
     cfg_tonemap_aces = False
     cfg_tonemap_learnable = False
-    # Read cfg_args once if EITHER setting wants to auto-detect from the run.
     cfg = None
     if args.tlight == "auto" or args.tonemap == "auto":
-        # .../<run>/point_cloud/iteration_N/point_cloud.ply -> <run>/cfg_args
         run_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(args.ply))))
         cfg_path = os.path.join(run_dir, "cfg_args")
         if os.path.exists(cfg_path):
@@ -346,7 +326,7 @@ def main():
             if m:
                 tlight_raster_res = int(m.group(1))
         else:
-            use_raster_tlight = False  # no cfg → legacy voxel default
+            use_raster_tlight = False  # no cfg -> voxel
     if cfg is not None:
         # These flags only appear in cfg_args of tonemapped runs; absence means
         # a linear-space model.
@@ -355,24 +335,20 @@ def main():
     print(f"[viewer] T_light source: {'raster' if use_raster_tlight else 'voxel'}"
           f"{f' ({tlight_raster_res}^2)' if use_raster_tlight else ''}")
 
-    # --- Load Gaussians -----------------------------------------------------
     print(f"[viewer] Loading {args.ply} ...")
     gaussians = GaussianModel()
     gaussians.load_ply(args.ply)
     P = gaussians.get_xyz.shape[0]
     print(f"[viewer] Loaded {P} Gaussians.")
 
-    # Resolve the final tonemap state now that load_ply has (or hasn't) restored
-    # the learnable coeffs. A learnable model is only usable if its tonemap.json
-    # was found; otherwise fall back to the fixed-ACES flag.
+    # A learnable model is only usable if load_ply restored its tonemap.json
+    # coeffs; otherwise fall back to the fixed-ACES flag.
     has_learnable = gaussians.get_tonemap_coeffs is not None
     tonemap_learnable = cfg_tonemap_learnable and has_learnable
-    # "tonemap on" = forced on, or (auto and the model was trained with a curve).
     if forced_tonemap is None:
         tonemap_on = tonemap_learnable or cfg_tonemap_aces
     else:
         tonemap_on = forced_tonemap
-    # When on, prefer the learnable curve if the model carries one; else ACES.
     tonemap_aces = tonemap_on and not (tonemap_learnable)
     if tonemap_on and tonemap_learnable:
         print(f"[viewer] Output tonemap: learnable "
@@ -383,14 +359,13 @@ def main():
         print(f"[viewer] Output tonemap: linear (clamp)")
 
     # Stage-2 environment lighting: enabled iff load_ply restored the env sidecars
-    # (env_net.pt + sky_transfer.npy). The sun slider then drives T_sun + E_lm for
-    # relighting; V_lm is the precomputed, sun-independent transfer.
+    # (env_net.pt + sky_transfer.npy). The sun slider then drives T_sun + E_lm;
+    # V_lm is the sun-independent precomputed transfer.
     has_env = env_on = (gaussians.env_net is not None) and (gaussians._sky_transfer.numel() > 0)
     print(f"[viewer] Environment lighting: ON (SH{gaussians.env_sh_order}, "
           f"V_lm {tuple(gaussians._sky_transfer.shape)})" if has_env
           else "[viewer] Environment lighting: none (Stage-1 model)")
 
-    # --- Precompute T_light for the initial sun direction --------------------
     initial_sun = _spherical_to_dir(altitude_deg=90.0, azimuth_deg=0.0)  # straight up
     print(f"[viewer] Precomputing T_light (sun={initial_sun.tolist()}) ...")
     t0 = time.time()
@@ -404,24 +379,20 @@ def main():
     # Max σ_t for normalising the sigma_t visualisation channel.
     sigma_t_max = max(gaussians.get_sigma_t.detach().max().item(), 1e-6)
 
-    # --- Compute a sensible initial camera pose from cloud bounds ----------
-    # Use 1st–99th percentile bounds to shrug off floater outliers, then sit the
-    # camera a few radii away looking at the cloud centre.
+    # --- Initial camera pose from cloud bounds ------------------------------
+    # 1st-99th percentile bounds (floaters excluded).
     with torch.no_grad():
         xyz_np = gaussians.get_xyz.detach().cpu().numpy()
     lo = np.percentile(xyz_np, 1, axis=0)
     hi = np.percentile(xyz_np, 99, axis=0)
     cloud_center = ((lo + hi) * 0.5).astype(np.float32)
     cloud_radius = float(max(np.linalg.norm(hi - lo) * 0.5, 1e-3))
-    # Offset direction in viser (OpenGL) world: slightly above + to the side, looking toward -Z.
     _offset_dir = np.array([0.8, 0.4, 1.0], dtype=np.float32)
     _offset_dir /= np.linalg.norm(_offset_dir)
     default_cam_pos = cloud_center + _offset_dir * (cloud_radius * 2.8)
     default_cam_lookat = cloud_center.copy()
 
-    # Clipping planes scaled to cloud size. Fixed 0.01/100 breaks large scenes:
-    # a camera sitting 2.8·radius from centre is well beyond zfar=100 when radius
-    # exceeds ~35, and every Gaussian gets culled.
+    # Clipping planes scaled to cloud size; fixed 0.01/100 culls large scenes.
     z_near = max(0.01, 0.05 * cloud_radius)
     z_far = max(100.0, 20.0 * cloud_radius)
 
@@ -431,11 +402,9 @@ def main():
         f"[viewer] Clipping planes: znear={z_near:.3f}, zfar={z_far:.3f}."
     )
 
-    # --- Optional: training cameras for snap-to-pose comparison --------------
-    # Prefer the original transforms_train.json: it preserves the
-    # (camera_index, time_index) double-key plus per-frame v_l, which the
-    # collapsed cameras.json does not (img_name there is just the file stem,
-    # so multi-time datasets get duplicate keys).
+    # --- Training cameras for snap-to-pose comparison -----------------------
+    # Prefer transforms_train.json, which preserves the (camera_index,
+    # time_index) double-key plus per-frame v_l.
     train_transforms, train_transforms_path = _load_train_transforms(args.ply)
     # Bucket frames by camera_index. `cam_frames[c]` is a dict {time_idx: frame}
     cam_frames: dict[int, dict[int, dict]] = {}
@@ -452,7 +421,6 @@ def main():
     else:
         print("[viewer] No transforms_train.json found — 'Snap to training cam' will be disabled.")
 
-    # Legacy fallback (cameras.json) — only used if transforms_train.json was missing.
     train_cams, train_cams_path = _load_training_cameras(args.ply, args.cameras_json)
     if not cam_frames and train_cams:
         train_cam_names = [c.get("img_name", str(c.get("id", i))) for i, c in enumerate(train_cams)]
@@ -460,7 +428,7 @@ def main():
     else:
         train_cam_names = []
 
-    # --- Optional sky backdrop (viewer-only eye-candy; not training) --------
+    # --- Optional sky backdrop ----------------------------------------------
     backdrop = None
     if args.sky_dir:
         try:
@@ -481,22 +449,17 @@ def main():
         dtype=torch.float32, device="cuda",
     )
 
-    # --- viser server + GUI -------------------------------------------------
     server = viser.ViserServer(port=args.port)
     server.scene.world_axes.visible = True
 
-    # Sun direction arrow. Drawn outside the cloud bbox, pointing toward the
-    # cloud centre (i.e. along the *light propagation* direction). Updated by
-    # mutating the handle's `position` + `wxyz`; the geometry itself stays
-    # fixed in the arrow's local frame.
+    # Sun direction arrow: drawn outside the cloud bbox, pointing along the
+    # *light propagation* direction. Updated via the handle's `position` + `wxyz`.
     arrow_len = max(cloud_radius * 0.8, 0.5)
     arrow_offset = cloud_radius * 1.6  # stand-off distance from cloud centre
 
-    # Local arrow geometry: tail at origin, head at +arrow_len along local +X.
-    # We then rotate the whole arrow so local +X aligns with the world
-    # "light propagation" direction (= -v_l), and translate so the tail
-    # sits at cloud_center + v_l * arrow_offset (outside the cloud,
-    # opposite the sun).
+    # Local arrow geometry: tail at origin, head at +arrow_len along local +X,
+    # rotated so local +X aligns with the world light-propagation direction
+    # (= -v_l) and translated so the tail sits at cloud_center + v_l*arrow_offset.
     _local_arrow_points = np.array([[[0.0, 0.0, 0.0],
                                      [arrow_len, 0.0, 0.0]]], dtype=np.float32)
 
@@ -520,7 +483,7 @@ def main():
     def _sun_arrow_pose(v_l_np: np.ndarray):
         s = v_l_np / max(np.linalg.norm(v_l_np), 1e-8)
         position = (cloud_center + s * arrow_offset).astype(np.float32)
-        # Light propagation = -v_l; rotate local +X → -s.
+        # Rotate local +X to the light-propagation direction (-s = -v_l).
         wxyz = _quat_align_x_to(-s)
         return position, wxyz
 
@@ -541,10 +504,9 @@ def main():
         options=("rgb", "T_light", "sigma_t", "depth"),
         initial_value="rgb",
     )
-    # Snap-to-training-cam controls. With transforms_train.json, show one
-    # dropdown of unique camera_index values + a time slider. This keeps the
-    # option list at ~49 instead of 49×61=2989, which disconnects the viser
-    # websocket on connect.
+    # Snap-to-training-cam controls. With transforms_train.json: one dropdown of
+    # unique camera_index values + a time slider, rather than one entry per frame
+    # (thousands of dropdown entries break the viser websocket on connect).
     gui_train_cam = None              # legacy cameras.json dropdown
     gui_train_cam_text = None         # fallback text input
     gui_train_cam_idx = None          # unique camera_index dropdown
@@ -580,13 +542,6 @@ def main():
                 hint=(f"Type a training camera img_name and press Enter. "
                       f"Dropdown disabled (have {len(train_cam_names)} cams)."),
             )
-    gui_ksigma = server.gui.add_slider(
-        "Sort k·σ clamp", min=0.0, max=3.0, step=0.1, initial_value=0.0,
-        hint="Per-tile max-response sort: how far t* may deviate from centre depth, "
-             "in units of σ along the view ray. 0 = stock 3DGS centre sort (default; "
-             "popping is controlled by the aniso regulariser instead). "
-             ">0 re-enables the per-tile shift but can show blocky tile-edge artefacts.",
-    )
     gui_sun_alt = server.gui.add_slider(
         "Sun altitude (°)", min=-90.0, max=90.0, step=1.0, initial_value=90.0,
         hint="Sun elevation above horizon. 90 = straight up (legacy default), "
@@ -689,7 +644,6 @@ def main():
     gui_ngauss = server.gui.add_text("# Gaussians", initial_value=f"{P:,}")
     gui_ngauss.disabled = True
 
-    # Flag set when any input that affects the image changes.
     state = {
         "needs_render": True,
         "last_render_time": 0.0,
@@ -698,12 +652,8 @@ def main():
         "T_light": T_light,                # current cached T_light tensor
     }
 
-    # --- Video recorder ------------------------------------------------------
-    # Wall-clock-faithful capture of the FIRST client's rendered frames: the
-    # render loop is event-driven (only draws on changes), so the recorder
-    # duplicates the last frame to fill idle time. Frames are buffered in RAM
-    # (HxWx3 uint8; ~2.7 MB each at 1080p — minutes of footage are fine) and
-    # encoded once on stop, keeping the interactive loop light.
+    # Wall-clock-faithful capture of the FIRST client's rendered frames (the
+    # render loop only draws on changes, so idle time repeats the last frame).
     REC_FPS = 30
 
     class _Recorder:
@@ -725,14 +675,14 @@ def main():
                 return
             h, w = img_np.shape[:2]
             if self.size is None:
-                # Even dimensions required by H.264/mp4v chroma subsampling.
+                # H.264/mp4v chroma subsampling needs even dimensions.
                 self.size = (w - (w % 2), h - (h % 2))
             tw, th = self.size
             if (w, h) != (tw, th):
                 img_np = img_np[:th, :tw] if (w >= tw and h >= th) else None
                 if img_np is None:
                     return  # render size shrank mid-recording; skip frame
-            # Fill wall-clock gaps so playback timing matches what you saw.
+            # Fill wall-clock gaps so playback timing matches reality.
             target_n = max(1, int(round((time.time() - self.t_start) * REC_FPS)))
             last = img_np[:th, :tw]
             while len(self.frames) < target_n:
@@ -748,10 +698,8 @@ def main():
             os.makedirs("recordings", exist_ok=True)
             path = os.path.join(
                 "recordings", time.strftime("cloud_%Y%m%d_%H%M%S") + ".mp4")
-            # Prefer H.264 (avc1, browser/IM-playable); mp4v (MPEG-4 Part 2)
-            # only plays in desktop players. avc1 needs a system H.264 encoder;
-            # fall back to mp4v if absent. A writer can "open" yet silently
-            # produce a header-only file, so verify bytes after encoding.
+            # Prefer H.264 (avc1, broadly playable); mp4v is desktop-only. A writer
+            # can "open" yet produce a header-only file, so size is verified below.
             for codec in ("avc1", "mp4v"):
                 writer = cv2.VideoWriter(
                     path, cv2.VideoWriter_fourcc(*codec), REC_FPS, self.size)
@@ -802,7 +750,6 @@ def main():
         state["v_l"] = new_sun
         state["T_light"] = new_cache
         state["needs_render"] = True
-        # Move the arrow to follow the new direction.
         new_pos, new_wxyz = _sun_arrow_pose(new_sun)
         sun_arrow.position = new_pos
         sun_arrow.wxyz = new_wxyz
@@ -812,7 +759,6 @@ def main():
     gui_sun_az.on_update(_apply_sun)
 
     gui_mode.on_update(_mark_dirty)
-    gui_ksigma.on_update(_mark_dirty)
     gui_res.on_update(_mark_dirty)
     gui_bgcolor.on_update(_mark_dirty)
     gui_tonemap.on_update(_mark_dirty)
@@ -823,22 +769,18 @@ def main():
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
-        # Tell viser the world up axis BEFORE setting the pose: viser's
-        # default is +Z up, but our dataset (UE → OpenGL via convert_transforms.py)
-        # uses +Y up, matching the trained Gaussians. Without this, the camera
-        # axis is computed against the wrong "up" and the rendered image is
-        # tilted/flipped relative to train's periodic saves.
+        # Set viser's world up axis BEFORE the pose: viser defaults to +Z up, but
+        # the dataset (UE → OpenGL) and the trained Gaussians use +Y up (otherwise
+        # the view comes out tilted/flipped).
         client.camera.up_direction = (0.0, 1.0, 0.0)
         client.camera.position = default_cam_pos
         client.camera.look_at = default_cam_lookat
 
         @client.camera.on_update
         def _(_):
-            # When "Orbit-only" is on, snap look_at back to the cloud centre so
-            # the user can only orbit + zoom (no panning / free translation).
-            # viser's look_at setter is a no-op when the new value matches the
-            # current one within its tolerance, so assigning here converges in
-            # at most one extra frame without recursion.
+            # When "Orbit-only" is on, snap look_at back to the cloud centre (orbit
+            # + zoom only). viser's setter is a no-op when the value already
+            # matches, so assigning here converges without recursion.
             if gui_lock.value:
                 if not np.allclose(
                     np.asarray(client.camera.look_at, dtype=np.float32),
@@ -864,9 +806,8 @@ def main():
             print(f"[viewer] training cam '{sel}' not found")
             return
         pos, up, look_at, fov_y = _training_cam_to_viser_pose(cam)
-        # Snap-to needs the look_at to match the training camera's forward, so
-        # temporarily disable orbit-lock — otherwise the on_update callback
-        # would immediately drag look_at back to the cloud centre.
+        # Disable orbit-lock first: otherwise the camera on_update callback would
+        # immediately drag look_at back to the cloud centre, breaking the snap.
         gui_lock.value = False
         for c in server.get_clients().values():
             c.camera.up_direction = up
@@ -901,9 +842,8 @@ def main():
             c.camera.position = pos
             c.camera.look_at = look_at
             c.camera.fov = fov_y
-        # Also push the frame's v_l into the global sun state so T_light
-        # matches what training saw. Falls back to the slider value if the
-        # frame lacks sun_direction.
+        # Push the frame's v_l into the global sun state so T_light matches what
+        # training saw; falls back to the slider value if the frame lacks it.
         sd = frame.get("sun_direction")
         if sd is not None:
             new_sun = np.asarray(sd, dtype=np.float32)
@@ -936,12 +876,11 @@ def main():
         if gui_train_time is not None:
             gui_train_time.on_update(lambda _: _snap_to_cam_time())
 
-    # --- Render loop --------------------------------------------------------
     print(f"[viewer] Serving at http://localhost:{args.port}")
 
     def render_frame(cam, render_w, render_h, aspect=None):
         """Render one frame for `cam` at (render_w, render_h), honouring every
-        live GUI control (mode, tonemap, env, sky backdrop, bg colour, k_sigma).
+        live GUI control (mode, tonemap, env, sky backdrop, bg colour).
 
         Shared by the interactive loop and the still-capture button so their
         output is identical. `aspect` overrides the camera's horizontal FOV
@@ -954,7 +893,6 @@ def main():
             aspect = render_w / max(1, render_h)
         mini = viser_to_minicam(cam, render_w, render_h, z_near=z_near, z_far=z_far,
                                 v_l=current_sun, aspect=aspect)
-        pipe.k_sigma = float(gui_ksigma.value)
         _tm_on = bool(gui_tonemap.value)
         pipe.tonemap_learnable = _tm_on and tonemap_learnable
         pipe.tonemap_aces = _tm_on and not tonemap_learnable
@@ -975,8 +913,8 @@ def main():
         else:
             override = None
 
-        # Sky backdrop: sample the HDR cube along this view's rays and hand it to
-        # the rasterizer as a per-pixel background (cloud-over-sky in one pass).
+        # Sky backdrop: sample the HDR cube along this view's rays, as the
+        # rasterizer's per-pixel background.
         sky_image = None
         if sky_active:
             c2w_rot = _quat_wxyz_to_matrix(np.asarray(cam.wxyz, dtype=np.float32))
@@ -1031,9 +969,8 @@ def main():
     _last_canvas = {}
     while True:
         if not state["needs_render"]:
-            # Poll for window/canvas resizes (camera on_update doesn't always fire
-            # on resize): if any client's canvas pixel size changed, re-render so
-            # the render resolution tracks the new window size.
+            # Poll for canvas resizes (camera on_update doesn't always fire on
+            # resize): re-render when a client's canvas pixel size changed.
             for _cid, _cl in server.get_clients().items():
                 _cw, _ch = int(_cl.camera.image_width or 0), int(_cl.camera.image_height or 0)
                 if _last_canvas.get(_cid) != (_cw, _ch):
@@ -1041,10 +978,8 @@ def main():
                     state["needs_render"] = True
             if not state["needs_render"]:
                 if recorder.active:
-                    # While recording, idle frames still advance wall-clock time;
-                    # duplicate-fill happens inside recorder.add() on next render.
-                    # Re-render at the capture cadence so slow changes (e.g. sun
-                    # recompute) appear smoothly instead of as a single jump.
+                    # While recording, re-render at the capture cadence so idle
+                    # wall-clock time fills in steadily.
                     time.sleep(1.0 / REC_FPS)
                     state["needs_render"] = True
                     continue
@@ -1061,10 +996,8 @@ def main():
         first_client = True
         for client in clients.values():
             cam = client.camera
-            # Render at the client canvas's true pixel size (aspect follows the
-            # window, not locked to 1:1) so the image isn't upscaled/blurred by the
-            # browser. gui_res caps the LONGER side to bound cost on big windows;
-            # fall back to the slider value if the canvas size isn't known yet.
+            # Render at the canvas's true pixel size (aspect follows the window);
+            # gui_res caps the LONGER side.
             max_side = int(gui_res.value)
             cw, ch = int(cam.image_width or 0), int(cam.image_height or 0)
             if cw > 0 and ch > 0:

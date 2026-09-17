@@ -31,7 +31,6 @@ def get_expon_lr_func(
     function of lr_delay_mult, such that the initial learning rate is
     lr_init*lr_delay_mult at the beginning of optimization but will be eased back
     to the normal learning rate when steps>lr_delay_steps.
-    :param conf: config subtree 'lr' or similar
     :param max_steps: int, the number of steps during optimization.
     :return HoF which takes step as input
     """

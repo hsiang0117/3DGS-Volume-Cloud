@@ -1,22 +1,16 @@
 #!/usr/bin/env python
 """Reconstruct and plot the effective scattering phase function from a trained
-checkpoint, to test the "sharp forward peak + isotropic base" hypothesis.
+checkpoint.
 
 The renderer's angular term (stripping the transmittance factor T_eff, which is
 a per-Gaussian/per-light transmittance, NOT part of the phase function) is
 
     Phi(cos t) = sum_n w_n * HG(g * 0.5^n, cos t),     HG normalized by 1/4pi
 
-We evaluate this over cos(theta) in [-1, 1] using the population-mean learned
-weights w_n and mean g, and compare against:
-  (a) the fixed 0.5^n schedule with the same g  (what the model used before), and
+Evaluated over cos(theta) in [-1, 1] using the population-mean learned weights
+w_n and mean g, and compared against:
+  (a) the fixed 0.5^n schedule with the same g, and
   (b) a single HG(g)  (one lobe, no multi-octave).
-
-If the learned curve has a sharper forward peak AND a fatter isotropic tail than
-both baselines, that confirms octave 0 specializes the forward lobe while the
-energy-loaded high octaves provide a near-isotropic base — explaining why the
-learned g rose to ~0.63 without the effective phase becoming unrealistically
-forward-peaked.
 
 Outputs a PNG next to the PLY (and prints summary stats; no display needed).
 

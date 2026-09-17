@@ -2,18 +2,12 @@
 """Analyze the learned per-Gaussian multiple-scattering octave weights.
 
 Reads a trained point_cloud.ply, applies the softplus activation to the raw
-w_* columns (matching GaussianModel.get_w; legacy 'octave_weight_*' columns are
-also accepted), and reports the per-octave distribution against the fixed 0.5^n
+w_* columns (matching GaussianModel.get_w; 'octave_weight_*' columns are also
+accepted), and reports the per-octave distribution against the fixed 0.5^n
 baseline schedule.
 
-Key question this answers: did the model shift multiple-scattering energy toward
-octave 0 (the un-diluted g_eff = g term)? If so, that explains why the learned
-HG anisotropy g rose from ~0.24 (fixed schedule) to ~0.63 here — less energy in
-the high octaves means less g-isotropization (g_eff = g * 0.5^n) diluting the
-effective phase, so g itself can/must grow to represent the real forward lobe.
-
 Usage:
-    python tools/analyze_w.py <path/to/point_cloud.ply>
+    python tools/analyze_octave_weights.py <path/to/point_cloud.ply>
 """
 import sys
 import numpy as np
@@ -67,9 +61,7 @@ def main(path):
               f"{p10[n]:>7.4f} | {p50[n]:>7.4f} | {p90[n]:>7.4f} | {ratio:>10.3f}")
 
     # --- energy distribution across octaves (normalized) ---
-    # How is total scattering energy split across octaves? Compare the learned
-    # split to the fixed schedule's split. Energy shifting toward octave 0 is the
-    # signature that explains the g rise.
+    # Share of total scattering energy per octave, learned split vs fixed schedule.
     learned_frac = mean / mean.sum()
     fixed_frac = fixed / fixed.sum()
     print("\nEnergy fraction per octave (mean-weight share of total):")

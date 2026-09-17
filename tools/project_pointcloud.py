@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 """Project a point cloud into each training camera and render it as white dots
-on black, to visually check whether the init points3d.ply lands where the cloud
-actually appears in the training images.
+on black, to check whether the init points3d.ply lands where the cloud actually
+appears in the training images.
 
 Overlay each output PNG against the matching training image (same camera_index,
-same resolution) to see alignment / coverage — especially whether the cloud
-bottom is seeded with points.
+same resolution) to see alignment / coverage.
 
 Convention: transforms_*.json stores OpenGL/Blender c2w matrices (camera looks
 down -Z, +Y up, +X right), as produced by convert_transforms.py. We invert to
@@ -38,8 +37,8 @@ def main(ply_path, transforms_path, out_dir, dot_radius=1, max_cams=None):
         meta = json.load(f)
     fovx = meta["camera_angle_x"]
 
-    # One frame per camera_index (the point cloud is static; time_index doesn't
-    # change geometry, only sun — so any frame for a given cam works).
+    # One frame per camera_index (the point cloud is static; time_index changes
+    # only the sun, so any frame for a given cam works).
     frames_by_cam = {}
     for fr in meta["frames"]:
         ci = fr.get("camera_index", len(frames_by_cam))

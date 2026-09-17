@@ -1,8 +1,8 @@
 """Grouped test-set PSNR: held-out-sun group vs seen-sun (new-view) group.
 
 Reads source_path / T_light source / tonemap mode from the run's cfg_args (so it
-matches how the model was trained), auto-detects a Stage-2 env model (env sidecars),
-and reports PSNR for the held-out suns (relighting generalisation) vs the rest.
+matches how the model was trained), auto-detects an env model (env sidecars),
+and reports PSNR for the held-out suns vs the rest.
 Held-out suns are inferred from the split itself (time_index present in test but
 absent from train); iteration defaults to the newest checkpoint in the run.
 
@@ -46,14 +46,14 @@ tonemap_learnable = 'tonemap_learnable=True' in cfg
 
 g = GaussianModel()
 g.load_ply(ply)
-# Stage-2 env model carries env sidecars (env_net.pt / sky_transfer.npy) restored
-# by load_ply; turn on env_lighting so render reproduces the trained shading.
+# env model carries env sidecars (env_net.pt / sky_transfer.npy) restored by
+# load_ply; turn on env_lighting so render reproduces the trained shading.
 env_lighting = (g.env_net is not None) and (g._sky_transfer.numel() > 0)
 print(f'run={run} iter={iteration} | source_path={source_path}')
 print(f'T_light={"raster" if use_raster else "voxel"} | tonemap_aces={tonemap_aces} '
       f'| tonemap_learnable={tonemap_learnable} | env_lighting={env_lighting}')
 
-pipe = Namespace(k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
+pipe = Namespace(tlight_voxel=not use_raster, tlight_raster_res=raster_res,
                  tonemap_aces=tonemap_aces, tonemap_learnable=tonemap_learnable,
                  env_lighting=env_lighting, env_sh_order=g.env_sh_order)
 bg = torch.zeros(3, device='cuda')

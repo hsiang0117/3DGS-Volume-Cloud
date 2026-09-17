@@ -23,9 +23,7 @@ def psnr(img1, img2):
 def save_periodic_render(model_path, iteration, image_tensor, image_name=None):
     """Dump a single rendered frame to <model_path>/render_test/iter_NNNNNN[_<name>].png.
 
-    Intended for periodic visual sanity checks during long training runs,
-    keyed by iteration so a directory listing reads as a timeline. Tensor
-    is expected as (C, H, W) in [0, 1].
+    `image_tensor` is expected as (C, H, W) in [0, 1].
     """
     render_dir = os.path.join(model_path, "render_test")
     os.makedirs(render_dir, exist_ok=True)
@@ -35,10 +33,9 @@ def save_periodic_render(model_path, iteration, image_tensor, image_name=None):
     Image.fromarray(img8).save(render_path)
 
 
-# Module-level cache: lpips weight download is ~100 MB and one-time, so we
-# build the model once and reuse for every eval call. `None` after a failed
-# attempt → silent skip on subsequent calls so training never blocks on a
-# missing optional dep.
+# Module-level cache: the lpips weight download is one-time, so the model is
+# built once and reused for every eval call. `None` after a failed attempt →
+# silent skip on subsequent calls.
 _LPIPS_FN = None
 _LPIPS_TRIED = False
 
@@ -53,16 +50,15 @@ def get_lpips_fn(net: str = "vgg", device: str = "cuda"):
         return _LPIPS_FN
     _LPIPS_TRIED = True
     try:
-        import lpips  # noqa: F401  — lazy import; ~100 MB backbone download on first call
+        import lpips  # noqa: F401  — lazy import; backbone download on first call
     except ImportError:
         print("[lpips] package not installed; skipping LPIPS metric. "
               "`pip install lpips` to enable.")
         _LPIPS_FN = None
         return None
     try:
-        # LPIPS construction is noisy: a "Setting up [LPIPS]..." banner (stdout)
-        # plus torchvision 'pretrained'/'weights' deprecation warnings from the
-        # VGG backbone load. Silence both — one-time, purely cosmetic.
+        # Construction prints an LPIPS banner (stdout) and torchvision
+        # 'pretrained'/'weights' deprecation warnings; silence both.
         with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = lpips.LPIPS(net=net).to(device).eval()

@@ -54,7 +54,7 @@ if coeffs is not None:
           f'(canonical {list(GaussianModel.TONEMAP_CANONICAL)})')
 
 pipe = Namespace(
-                 k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
+                 tlight_voxel=not use_raster, tlight_raster_res=raster_res,
                  tonemap_aces=tonemap_aces, tonemap_learnable=tonemap_learnable)
 bg = torch.zeros(3, device='cuda')
 

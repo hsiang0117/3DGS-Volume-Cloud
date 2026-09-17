@@ -19,11 +19,10 @@ from PIL import Image
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 # ---------------------------------------------------------------------------
-# CPU-side decoded-image cache. PNG decoding costs ~30 ms per 1024² frame
-# (vs ~8 ms for the uint8 upload), so the raw uint8 array is decoded once and
-# kept in RAM. The GPU-side float tensor is still created and released per
-# step, so VRAM usage is unchanged. `image_cache_max` (ModelParams) caps the
-# number of cached frames (0 = unlimited); ~3 MB per 1024² RGB frame.
+# CPU-side decoded-image cache: the raw uint8 array is decoded once and kept in
+# RAM, while the GPU-side float tensor is still created and released per step,
+# so VRAM usage is unchanged. `image_cache_max` (ModelParams) caps the number
+# of cached frames (0 = unlimited, LRU eviction).
 # ---------------------------------------------------------------------------
 _DECODED_CACHE = OrderedDict()
 _DECODED_CACHE_LOCK = threading.Lock()
@@ -50,9 +49,8 @@ def _decoded_uint8(image_path, max_entries=0):
 class Camera(nn.Module):
     """Camera with lazy image loading.
 
-    Stores only path, target resolution and flags; the image tensor is
-    decoded on access (`original_image`) and GC'd when the consumer drops
-    it. Avoids holding all decoded images in GPU memory at scene-load time.
+    Stores path, target resolution and flags; the image tensor is decoded on
+    access (`original_image`) and cached until released.
     """
 
     def __init__(self, resolution, R, T, FoVx, FoVy, image_path,
@@ -87,8 +85,7 @@ class Camera(nn.Module):
         self.is_test_dataset = is_test_dataset
         self.is_test_view = is_test_view
 
-        # Width / height in *target* (post-resize) coords. Needed by
-        # camera_to_JSON / projection setup before any pixel access.
+        # Width / height in target (post-resize) coords.
         self.image_width = int(resolution[0])
         self.image_height = int(resolution[1])
 
@@ -112,14 +109,14 @@ class Camera(nn.Module):
         self.v_l = torch.from_numpy(np.asarray(v_l, dtype=np.float32)).to(self.data_device)
 
     # ------------------------------------------------------------------
-    # Lazy-loaded tensor. The GPU-side tensor is rebuilt per step and released
-    # via `Camera.release_loaded()`, so VRAM stays bounded by one image. The
-    # expensive PNG decode is NOT repeated: `_decoded_uint8` keeps the uint8
-    # array in RAM (bounded by ModelParams.image_cache_max, 0 = unlimited).
+    # Lazy-loaded tensor. The GPU tensor is rebuilt per step and released via
+    # `Camera.release_loaded()`, so VRAM stays bounded by one image; the PNG
+    # decode is not repeated because `_decoded_uint8` keeps the uint8 array in
+    # the CPU cache (bounded by ModelParams.image_cache_max, 0 = unlimited).
     #
-    # Load pipeline (minimises CPU work and PCIe bandwidth):
-    #   decoded uint8 array from the CPU cache (decode once)
-    #   torch.from_numpy(uint8).to(cuda)  — uint8 upload, 4× cheaper than fp32
+    # Load pipeline:
+    #   decoded uint8 array from the CPU cache
+    #   torch.from_numpy(uint8).to(cuda)
     #   F.interpolate on GPU to target resolution
     #   uint8 → fp32 / 255 on GPU (fused)
     # ------------------------------------------------------------------

@@ -38,7 +38,6 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool antialiasing,
-	const float k_sigma,
 	const bool record_front_tau,
 	const bool debug);
 

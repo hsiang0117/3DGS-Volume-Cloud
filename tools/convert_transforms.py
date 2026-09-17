@@ -4,15 +4,20 @@
 UE5 坐标系 (左手):  X=forward, Y=right, Z=up
 OpenGL/Blender 坐标系 (右手): X=right, Y=up, Z=-forward
 
-当前 transforms.json 中的 4x4 矩阵布局 (按 UE 世界轴排列):
+输入 transforms.json 中的 4x4 矩阵布局 (按 UE 世界轴排列):
     | fx  rx  ux  tx |      f=forward, r=right, u=up
     | fy  ry  uy  ty |      位置已经是米制
     | fz  rz  uz  tz |
     | 0   0   0   1  |
 
-转换后 OpenGL 相机矩阵:
+输出 OpenGL 相机矩阵:
     相机局部轴: X=right, Y=up, Z=-forward
-    世界轴映射: UE_X -> GL_X,  UE_Y -> -GL_Z (UE右手Y翻转),  UE_Z -> GL_Y
+    世界轴映射: GL_x = UE_y,  GL_y = UE_z,  GL_z = -UE_x
+
+输出缺省为同目录 transforms_train.json; 设了输出名 transforms_train.json 时,
+同时删除同目录的 transforms_train_full.json / transforms_test.json。
+
+用法: python convert_transforms.py <transforms.json> [output.json]
 """
 
 import json
@@ -52,15 +57,12 @@ def ue_to_opengl(mat):
     OpenGL 相机默认看向 -Z, UE 相机默认看向 +X,
     经过世界轴变换后 UE +X -> GL -Z, 恰好一致, 无需额外翻转。
     """
-    # 读取 UE 矩阵各列 (列主序理解: 列0=forward, 列1=right, 列2=up, 列3=pos)
-    # 但我们存的是行主序 mat[row][col]
-    # 提取列向量
+    # mat[row][col] 行主序: 列0=forward, 列1=right, 列2=up, 列3=pos
     col0 = [mat[0][0], mat[1][0], mat[2][0]]  # forward 轴
     col1 = [mat[0][1], mat[1][1], mat[2][1]]  # right 轴
     col2 = [mat[0][2], mat[1][2], mat[2][2]]  # up 轴
     pos  = [mat[0][3], mat[1][3], mat[2][3]]  # 位置
 
-    # 世界轴映射: GL_x = UE_y, GL_y = UE_z, GL_z = -UE_x
     def remap_vec(v):
         return [v[1], v[2], -v[0]]
 
@@ -70,9 +72,7 @@ def ue_to_opengl(mat):
     new_col2 = remap_world_vec_ue_to_gl(col2)  # UE up
     new_pos  = remap_world_vec_ue_to_gl(pos)
 
-    # 在 OpenGL 中相机局部轴: X=right, Y=up, Z=-forward
-    # UE 局部轴: col0=forward, col1=right, col2=up
-    # 所以 GL 列排列: col0_gl=right(UE_col1), col1_gl=up(UE_col2), col2_gl=-forward(-UE_col0)
+    # GL 列排列: col0_gl=right(UE_col1), col1_gl=up(UE_col2), col2_gl=-forward(-UE_col0)
     gl_col0 = new_col1                                    # right
     gl_col1 = new_col2                                    # up
     gl_col2 = [-new_col0[0], -new_col0[1], -new_col0[2]] # -forward
@@ -100,8 +100,7 @@ def convert_sun_direction(sun_dir_ue):
 def convert_transforms(input_path, output_path=None):
     input_path = Path(input_path)
     if output_path is None:
-        # Default straight to the training file the loader/split read, so the
-        # pipeline is just: generator -> convert -> split (no rename step).
+        # 缺省直接写 loader/split 读取的训练文件: generator -> convert -> split
         output_path = input_path.parent / "transforms_train.json"
     else:
         output_path = Path(output_path)
@@ -125,10 +124,8 @@ def convert_transforms(input_path, output_path=None):
     print(f"输入: {input_path}")
     print(f"输出: {output_path}")
 
-    # Writing a fresh FULL train set invalidates any prior split: remove the
-    # stale backup + test split so the next split_test_set.py re-derives from
-    # this new full set (otherwise its idempotent re-split clings to the old
-    # transforms_train_full.json and ignores this data).
+    # 写完新的完整训练集后删除过期切分: 否则 split_test_set.py 的幂等重切分会
+    # 一直沿用已有的 transforms_train_full.json, 忽略这份新数据。
     if output_path.name == "transforms_train.json":
         for stale in ("transforms_train_full.json", "transforms_test.json"):
             p = output_path.parent / stale

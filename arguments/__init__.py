@@ -32,9 +32,8 @@ class ParamGroup:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    # default=True bools need --no-<flag> to be disable-able from the
-                    # CLI; store_true would pin them True forever. BooleanOptionalAction
-                    # (py3.9+) generates both --<flag> and --no-<flag>.
+                    # BooleanOptionalAction emits both --<flag> and --no-<flag>, so
+                    # default-True flags stay disable-able from the CLI.
                     action = BooleanOptionalAction if value else "store_true"
                     group.add_argument("--" + key, default=value, action=action)
                 else:
@@ -54,13 +53,10 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        # Max number of decoded frames kept in the CPU image cache (LRU);
-        # 0 = unlimited. ~3 MB per 1024² RGB frame — caps RAM on huge datasets.
+        # Max decoded frames kept in the CPU image cache (LRU); 0 = unlimited.
         self.image_cache_max = 0
-        # transforms_test.json holds a real held-out split (tools/split_test_set.py).
-        # Keep True normally: eval=False makes the Blender loader merge test frames
-        # back into training, leaking the split and inflating metrics. Disable from
-        # the CLI with --no-eval if you really want full-data training.
+        # eval=True keeps transforms_test.json out of training; --no-eval merges
+        # the test frames back in for full-data training.
         self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -71,49 +67,31 @@ class ModelParams(ParamGroup):
 
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
-        # Per-tile max-response sort: max deviation of t* from centre depth, in
-        # units of σ along the view ray. ≤0 reverts to stock 3DGS centre-depth sort
-        # (kernel skips the t* shift). Disabled: it produced blocky tile-boundary
-        # artefacts; aniso pruning/penalising controls popping instead. CUDA path
-        # is dead at 0.0; set >0 to re-enable without a rebuild.
-        self.k_sigma = 0.0
-        # T_light source. Default: light-space rasterization (sun-camera shadow
-        # pass, record_front_tau CUDA channel + native lightpass backward) with the
-        # full shadow gradient (σ_t AND σ_d through scales/rotation). Avoids the voxel
-        # cache's needle shadows / chord bias / self-leak / bbox aliasing.
-        # --tlight_voxel falls back to the legacy 128^3 voxel cache (correct only for
-        # models trained pre-raster; the viewer reads cfg_args to match). store_true
-        # can't be disabled from the CLI, hence a fallback flag not tlight_raster=True.
+        # T_light source: light-space rasterization (sun-camera shadow pass,
+        # record_front_tau + native lightpass backward) with the full shadow
+        # gradient through σ_t and scales/rotation. --tlight_voxel selects the
+        # 128^3 voxel cache instead (a fallback flag rather than
+        # tlight_raster=True, because store_true cannot be turned off from the
+        # CLI); the viewer matches the source a model was trained with via
+        # cfg_args.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
-        # Output tonemap to match the GT's display space. UE's HighResScreenshot GT
-        # is filmic-tonemapped LDR while our physical shading is linear; fitting a
-        # nonlinear target with a linear model shows up as dynamic-range compression.
-        # When on, render() lifts the per-Gaussian radiance clamp (HDR) and applies
-        # the fixed Narkowicz ACES approximation to the final image, so loss and
-        # metrics compare in the GT's own space. Default True (current baseline output
-        # space). Disable from the CLI with --no-tonemap_aces for a truly-linear GT
-        # (then tonemap must be OFF; see tonemap_learnable note).
+        # Apply the fixed Narkowicz ACES curve to the final image so loss and
+        # metrics live in the GT's display space; render() lifts the per-Gaussian
+        # radiance clamp to HDR in this mode. Disable with --no-tonemap_aces for a
+        # truly-linear GT.
         self.tonemap_aces = True
-        # Learnable output tonemap (opt-in alternative to fixed ACES): same Narkowicz
-        # rational form but its 4 coeffs (a,b,c,d) are optimised (e pinned), so the
-        # model fits the GT's true display curve instead of a fixed approximation,
-        # absorbing residual curve-mismatch for any filmic GT (not just UE). Implies
-        # the HDR clamp like tonemap_aces and takes precedence over it when on.
-        # Default OFF: Narkowicz is already a good enough fit for UE filmic, so the
-        # extra DoF doesn't pay; kept as insurance for a different filmic engine whose
-        # curve drifts from Narkowicz. (For a truly-linear HDR GT use tonemap OFF, NOT
-        # learnable — the Narkowicz family cannot represent identity.)
+        # Learnable variant of the same Narkowicz curve: (a,b,c,d) are optimised
+        # (e pinned). Takes precedence over --tonemap_aces when on; for a
+        # truly-linear GT turn tonemapping off instead, since this family cannot
+        # represent identity.
         self.tonemap_learnable = False
-        # --- Stage 2: environment lighting (frozen geometry + global sky) ---
-        # When on (set by --stage2), render adds the atmospheric env term on top of
-        # the frozen Stage-1 sun shading:
+        # Stage 2 environment lighting: adds a global atmospheric term on top of
+        # the frozen Stage-1 sun shading,
         #     L = T_sun(v_l) ⊙ sun_term  +  ω · Σ_lm E_lm(v_l) · V_lm
-        # T_sun (RGB ≤1, sun atmospheric transmittance — expresses low-sun dimming/
-        # reddening) and E_lm (sky radiance SH) are GLOBAL functions of v_l (a
-        # small MLP, no per-Gaussian colour DOF); V_lm is the precomputed per-Gaussian
-        # achromatic sky-visibility transfer. Persists to cfg_args so the viewer
-        # auto-detects. Default OFF — Stage 1 behaviour unchanged.
+        # T_sun and E_lm are global functions of v_l; V_lm is the precomputed
+        # per-Gaussian sky-visibility transfer. Enabled by --stage2 and persisted
+        # to cfg_args so the viewer auto-detects it.
         self.env_lighting = False
         self.env_sh_order = 2          # SH order for sky radiance E_lm and visibility V_lm (SH2 = 9 coeffs)
         self.env_transfer_dirs = 48    # # hemisphere directions sampled for the V_lm precompute
@@ -129,21 +107,16 @@ class OptimizationParams(ParamGroup):
         self.omega_lr = 0.0025
         self.sigma_t_lr = 0.025
         self.g_lr = 0.0025
-        # LR for per-Gaussian multiple-scattering octave weights (softplus, >=0).
-        # Same order as g; tune down if the weights overfit per-view.
+        # LR for per-Gaussian multiple-scattering octave weights (softplus, >= 0).
         self.w_lr = 0.0025
-        # LR for the 4 global learnable tonemap coeffs (only used with
-        # --tonemap_learnable). Higher than the per-Gaussian LRs because it's a
-        # handful of scalars seen by every pixel of every frame; decays to 0.1x.
+        # LR for the 4 global learnable tonemap coeffs (only with
+        # --tonemap_learnable); decays to 0.1x over the schedule.
         self.tonemap_lr = 1e-3
         # Monotonicity penalty on the learnable tonemap (only with
-        # --tonemap_learnable). softplus already guarantees positivity / no
-        # poles; this is a cheap insurance that f stays non-decreasing on [0,8]
-        # so highlights never invert. Hinge on negative slope, like lambda_aniso.
+        # --tonemap_learnable): hinge on negative slope over [0,8].
         self.lambda_tonemap_mono = 1e-2
         # LR for the Stage-2 environment net (global T_sun + E_lm MLP of v_l),
-        # only used with --stage2. Lives in its own Adam (isolated from densify/prune
-        # like the tonemap optimizer); decays to 0.1x over the schedule.
+        # only with --stage2; own Adam, decays to 0.1x over the schedule.
         self.env_lr = 1e-3
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
@@ -151,56 +124,38 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_scale = 0.1
         # Anisotropy penalty (log-ratio form): zero below `aniso_ratio_max`,
-        # quadratic in log-ratio above. Cloud is an isotropic medium; long
-        # ellipsoids cause depth-sort popping.
-        #
-        # Keep λ small. Bounding aniso and keeping PSNR high are in tension: λ=0.05
-        # collapses PSNR to ~25 (regularizer dominates fit), λ=0.001 gives PSNR ~43
-        # with aniso largely unbounded — cloud structure (wisps, layers) genuinely
-        # benefits from elongated Gaussians at current capacity. For aggressive aniso
-        # bounding prefer split-on-densify (`densify_split_aniso_max`) over loss reg.
-        #
-        # aniso p99 does NOT converge — it grows monotonically while unconstrained
-        # (λ=0 throughout gives p99=183). Hence λ=0.001 with the regulariser run for
-        # the FULL schedule (aniso_until_iter = iterations) so a persistent constraint
-        # drives p99 to a plateau rather than letting it grow in the back half.
+        # quadratic in the log-ratio above.
         self.lambda_aniso = 0.001
         self.aniso_ratio_max = 5.0
-        # Run the aniso regulariser for the whole schedule. A persistent constraint
-        # is needed because aniso p99 grows monotonically once the reg switches off.
-        # Watch for uniform shrinkage (scale mean dropping) as a side effect.
+        # Iteration up to which the aniso regulariser runs (set to `iterations`
+        # to keep it active for the whole schedule).
         self.aniso_until_iter = 30_000
         self.densification_interval = 100
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 1e-4
         self.densify_scale_grad_threshold = 1e-6
-        # Adaptive density threshold: take top `densify_top_frac` of grads each
-        # round so growth doesn't stall when grads decay late in training.
+        # Adaptive density threshold: take the top `densify_top_frac` of position
+        # gradients as each round's threshold.
         self.densify_adaptive = True
         self.densify_top_frac = 0.005          # top 0.5%
         self.densify_grad_min = 5e-5           # absolute floor
-        # A Gaussian is pruned iff mean Σ(α·T) over visible frames falls below
-        # this threshold. 1e-4 ≈ 0.01% of one fully-opaque pixel, very lenient
-        # — main role is to remove "ghost" Gaussians, not active ones.
+        # Prune threshold on the mean Σ(α·T) a Gaussian contributes over the
+        # frames it is visible in.
         self.contribution_threshold = 1e-4
         self.prune_min_visible_frames = 5      # require at least 5 visible frames before judging
         self.resurrect_interval = 3000         # every N iters, reset bottom σ_t
         self.resurrect_fraction = 0.05         # 5% of points
-        # How often to clear the contribution accumulator so the running mean
-        # tracks current model state. Independent of densify_until_iter; keeps
-        # working post-densify. Set ≤0 to never reset (not recommended).
+        # Clear the contribution accumulator every N iterations so the running
+        # mean tracks the current model; ≤ 0 never resets.
         self.contribution_reset_interval = 1000
-        # How often to run the prune pass after densify_until_iter has stopped
-        # the regular path. 1000 = drop bad ellipsoids about as often as we
-        # reset accumulator stats. 0 to disable.
+        # Interval of the extra prune pass run inside the densify window;
+        # 0 disables.
         self.post_densify_prune_interval = 1000
-        # Needle surgery: every `needle_split_interval` iters, split Gaussians with
-        # aniso ratio > `needle_split_ratio` into two children along the major axis
-        # (appearance-conserving, ratio halves). A structural hard ceiling on the
-        # aniso tail that the soft regulariser cannot hold. 0 disables. Runs through
-        # the whole schedule (also post-densify).
+        # Needle surgery: every `needle_split_interval` iterations, split Gaussians
+        # whose max/min scale ratio exceeds `needle_split_ratio` into two children
+        # along the major axis; 0 disables.
         self.needle_split_interval = 1000
         self.needle_split_ratio = 30.0
-        self.needle_split_until_iter = 29_000   # stop before final settle/eval
+        self.needle_split_until_iter = 29_000   # last iteration surgery runs on
         super().__init__(parser, "Optimization Parameters")

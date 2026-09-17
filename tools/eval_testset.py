@@ -1,11 +1,11 @@
-"""Standalone test-set eval for an existing run — reuses train.py's exact
-eval computation (training_report's test loop) on a saved checkpoint.
+"""Standalone test-set eval for an existing run — applies train.py's exact
+eval computation (training_report's test loop) to a saved checkpoint.
 
 train.py only runs / persists the test metrics when the final iteration is in
 --test_iterations; this script runs that same pass on demand and writes the
 same metrics.json. Reads source_path / T_light / tonemap / env from the run's
 cfg_args so rendering matches how the model was trained. Test cameras come from
-the dataset's transforms_test.json (e.g. the 36 held-out interleaved views).
+the dataset's transforms_test.json.
 
 Usage:
     python tools/eval_testset.py output/<run> [iteration]
@@ -45,7 +45,7 @@ raster_res = int(mres.group(1)) if mres else 512
 g = GaussianModel()
 g.load_ply(ply)
 env_lighting = (g.env_net is not None) and (g._sky_transfer.numel() > 0)
-pipe = Namespace(k_sigma=0.0, tlight_voxel=not use_raster, tlight_raster_res=raster_res,
+pipe = Namespace(tlight_voxel=not use_raster, tlight_raster_res=raster_res,
                  tonemap_aces="tonemap_aces=True" in cfg,
                  tonemap_learnable="tonemap_learnable=True" in cfg,
                  env_lighting=env_lighting, env_sh_order=g.env_sh_order)
@@ -59,7 +59,7 @@ cams = cameraList_from_camInfos(cam_infos, 1.0, Namespace(resolution=-1, data_de
 if not cams:
     print("no test cameras found (transforms_test.json empty/missing)"); sys.exit(1)
 
-# --- SAME eval computation as training_report (train.py:495-517) ---------
+# --- SAME eval computation as training_report in train.py ----------------
 lpips_fn = get_lpips_fn()
 l1_test = psnr_test = ssim_test = 0.0
 lpips_test = 0.0; lpips_count = 0

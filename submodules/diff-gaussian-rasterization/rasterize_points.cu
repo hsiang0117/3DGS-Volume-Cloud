@@ -55,7 +55,6 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool antialiasing,
-	const float k_sigma,
 	const bool record_front_tau,
 	const bool debug)
 {
@@ -79,15 +78,12 @@ RasterizeGaussiansCUDA(
 
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
 
-  // Per-Gaussian Σ(α·T) over all visible pixels — used by the physical
-  // densify/prune logic in train.py to spot Gaussians with negligible image
-  // contribution (regardless of opacity).
+  // Per-Gaussian Σ(α·T) over all visible pixels, for densify/prune in train.py.
   torch::Tensor gauss_contribution = torch::zeros({P}, float_opts);
 
-  // Light-space shadow pass buffers: per-Gaussian alpha*T-weighted sum of
-  // the optical depth accumulated in front of the Gaussian, plus the weight
-  // sum. Only allocated to size P when record_front_tau is requested
-  // (requires use_analytic_tau); consumed as T_light = exp(-sum/wsum).
+  // Light-space shadow pass buffers: per-Gaussian alpha*T-weighted sum of the
+  // optical depth in front of it, plus the weight sum. Size P only when
+  // record_front_tau is set (requires tau_precomp); T_light = exp(-sum/wsum).
   const bool do_front_tau = record_front_tau && tau_precomp.numel() > 0;
   torch::Tensor tau_front_sum = torch::zeros({do_front_tau ? P : 0}, float_opts);
   torch::Tensor tau_front_wsum = torch::zeros({do_front_tau ? P : 0}, float_opts);
@@ -139,7 +135,6 @@ RasterizeGaussiansCUDA(
 		do_front_tau ? tau_front_sum.contiguous().data<float>() : nullptr,
 		do_front_tau ? tau_front_wsum.contiguous().data<float>() : nullptr,
 		antialiasing,
-		k_sigma,
 		radii.contiguous().data<int>(),
 		debug);
   }

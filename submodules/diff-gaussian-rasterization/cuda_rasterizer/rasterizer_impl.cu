@@ -67,24 +67,16 @@ __global__ void checkFrustum(int P,
 
 // Generates one key/value pair for all Gaussian / tile overlaps.
 // Run once per Gaussian (1:N mapping).
-// The depth half of the key is the per-tile max-response depth t* of this
-// Gaussian along the tile's centre ray, from precomputed Σ_v^-1 and
-// q = Σ_v^-1 μ_v. Fixes alpha-blend order flips across tiles for elongated
-// ellipsoids that stock 3DGS centre-depth sorting produces.
+// The key is | tile ID | centre depth |: every tile this Gaussian overlaps gets
+// the same depth, so ordering is per-tile and identical to upstream 3DGS.
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
 	const float* depths,
-	const float* sigma_v_inv,
-	const float* q_view,
-	const float* sigma_d,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
-	int W, int H,
-	float tan_fovx, float tan_fovy,
-	float k_sigma,
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -100,71 +92,16 @@ __global__ void duplicateWithKeys(
 
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-		const float Sxx = sigma_v_inv[idx * 6 + 0];
-		const float Sxy = sigma_v_inv[idx * 6 + 1];
-		const float Sxz = sigma_v_inv[idx * 6 + 2];
-		const float Syy = sigma_v_inv[idx * 6 + 3];
-		const float Syz = sigma_v_inv[idx * 6 + 4];
-		const float Szz = sigma_v_inv[idx * 6 + 5];
-		const float qx = q_view[idx * 3 + 0];
-		const float qy = q_view[idx * 3 + 1];
-		const float qz = q_view[idx * 3 + 2];
-		const float fallback_depth = depths[idx];
-		const float sd = sigma_d[idx];
-		// Cap how far per-tile t* may shift from centre depth, in units of
-		// σ along the view ray. k_sigma is caller-supplied (see
-		// GaussianRasterizationSettings.k_sigma); ≤0 disables the per-tile
-		// shift (stock 3DGS centre-depth sort). Small values (~1.5) keep
-		// near-isotropic Gaussians matching stock order (no tile-boundary
-		// popping); elongated ellipsoids (large σ) still shift correctly,
-		// preserving the long-axis sort fix.
-		const float dev_max = k_sigma * sd;
-
-		const float inv_W = 1.0f / (float)W;
-		const float inv_H = 1.0f / (float)H;
+		// Sort key uses a float→uint32 bit-cast, monotonic only for non-negative
+		// floats, so depth is clamped to 1e-4.
+		const float depth_for_key = fmaxf(depths[idx], 1e-4f);
 
 		// For each tile that the bounding rect overlaps, emit a
-		// key/value pair. The key is |  tile ID  |  per-tile depth  |.
+		// key/value pair. The key is |  tile ID  |  centre depth  |.
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				// Tile-centre pixel.
-				float px = (float)x * BLOCK_X + 0.5f * BLOCK_X;
-				float py = (float)y * BLOCK_Y + 0.5f * BLOCK_Y;
-				// Pixel → view-space direction. v.z = 1, so no need to normalise:
-				// t* is scale-invariant in v.
-				float vx = (2.0f * px * inv_W - 1.0f) * tan_fovx;
-				float vy = (2.0f * py * inv_H - 1.0f) * tan_fovy;
-
-				// numerator = v · q = v · (Σ_v^-1 μ_v).
-				float vq = vx * qx + vy * qy + qz;
-				// denominator = v^T Σ_v^-1 v.
-				float vSv = Sxx * vx * vx + Syy * vy * vy + Szz
-				          + 2.0f * (Sxy * vx * vy + Sxz * vx + Syz * vy);
-				float t_star = vq / fmaxf(vSv, 1e-20f);
-
-				// Sort key uses float→uint32 bit-cast, monotonic only for
-				// non-negative floats. Clamp away near-plane / behind-camera
-				// numerics; fall back to centre depth on degeneracy.
-				// k_sigma ≤ 0 skips the per-tile shift (stock 3DGS sort).
-				float depth_for_key;
-				if (k_sigma > 0.0f && vSv > 1e-20f && t_star > 0.0f)
-				{
-					// Clamp t* deviation from centre depth to ±k_sigma·σ:
-					// small/isotropic Gaussians stay near centre depth (stock
-					// order), long ellipsoids (large σ) shift correctly.
-					float dev = t_star - fallback_depth;
-					if (dev > dev_max) dev = dev_max;
-					else if (dev < -dev_max) dev = -dev_max;
-					depth_for_key = fallback_depth + dev;
-				}
-				else
-				{
-					depth_for_key = fallback_depth;
-				}
-				depth_for_key = fmaxf(depth_for_key, 1e-4f);
-
 				uint64_t key = y * grid.x + x;
 				key <<= 32;
 				key |= *((uint32_t*)&depth_for_key);
@@ -232,9 +169,6 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
-	obtain(chunk, geom.sigma_v_inv, P * 6, 128);
-	obtain(chunk, geom.q_view, P * 3, 128);
-	obtain(chunk, geom.sigma_d, P, 128);
 	return geom;
 }
 
@@ -292,7 +226,6 @@ int CudaRasterizer::Rasterizer::forward(
 	float* tau_front_sum,
 	float* tau_front_wsum,
 	bool antialiasing,
-	float k_sigma,
 	int* radii,
 	bool debug)
 {
@@ -347,9 +280,6 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.cov3D,
 		geomState.rgb,
 		geomState.conic_opacity,
-		geomState.sigma_v_inv,
-		geomState.q_view,
-		geomState.sigma_d,
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered,
@@ -374,16 +304,10 @@ int CudaRasterizer::Rasterizer::forward(
 		P,
 		geomState.means2D,
 		geomState.depths,
-		geomState.sigma_v_inv,
-		geomState.q_view,
-		geomState.sigma_d,
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		width, height,
-		tan_fovx, tan_fovy,
-		k_sigma,
 		tile_grid)
 	CHECK_CUDA(, debug)
 

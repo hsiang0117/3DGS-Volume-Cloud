@@ -172,9 +172,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
-	float* sigma_v_inv,
-	float* q_view,
-	float* sigma_d,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
@@ -258,64 +255,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rgb[idx * C + 2] = result.z;
 	}
 
-	// Precompute helper data for per-tile depth sorting of elongated Gaussians:
-	// duplicateWithKeys derives a per-tile max-response depth from Σ_v^-1 and
-	// q = Σ_v^-1 · μ_v (avoids the order flips of a shared centre depth).
-	// depths[] keeps the centre depth for the per-pixel invdepth output.
-	{
-		glm::mat3 Wv = glm::mat3(
-			viewmatrix[0], viewmatrix[4], viewmatrix[8],
-			viewmatrix[1], viewmatrix[5], viewmatrix[9],
-			viewmatrix[2], viewmatrix[6], viewmatrix[10]);
-		glm::mat3 Sigma_w = glm::mat3(
-			cov3D[0], cov3D[1], cov3D[2],
-			cov3D[1], cov3D[3], cov3D[4],
-			cov3D[2], cov3D[4], cov3D[5]);
-		glm::mat3 Sigma_v = Wv * Sigma_w * glm::transpose(Wv);
+	// Centre depth: the tile sort key, also sampled as 1/z for the invdepth output.
+	depths[idx] = p_view.z;
 
-		// 3x3 symmetric inverse via cofactor / determinant.
-		float a = Sigma_v[0][0], b = Sigma_v[0][1], c = Sigma_v[0][2];
-		float                    e = Sigma_v[1][1], f = Sigma_v[1][2];
-		float                                       g = Sigma_v[2][2];
-		float cof_a = e * g - f * f;
-		float cof_b = c * f - b * g;
-		float cof_c = b * f - c * e;
-		float cof_e = a * g - c * c;
-		float cof_f = b * c - a * f;
-		float cof_g = a * e - b * b;
-		float det = a * cof_a + b * cof_b + c * cof_c;
-		float inv_det = 1.0f / (det + 1e-20f);
-		float Sxx = cof_a * inv_det, Sxy = cof_b * inv_det, Sxz = cof_c * inv_det;
-		float                         Syy = cof_e * inv_det, Syz = cof_f * inv_det;
-		float                                                  Szz = cof_g * inv_det;
-
-		sigma_v_inv[idx * 6 + 0] = Sxx;
-		sigma_v_inv[idx * 6 + 1] = Sxy;
-		sigma_v_inv[idx * 6 + 2] = Sxz;
-		sigma_v_inv[idx * 6 + 3] = Syy;
-		sigma_v_inv[idx * 6 + 4] = Syz;
-		sigma_v_inv[idx * 6 + 5] = Szz;
-
-		// q = Σ_v^-1 · μ_v.
-		q_view[idx * 3 + 0] = Sxx * p_view.x + Sxy * p_view.y + Sxz * p_view.z;
-		q_view[idx * 3 + 1] = Sxy * p_view.x + Syy * p_view.y + Syz * p_view.z;
-		q_view[idx * 3 + 2] = Sxz * p_view.x + Syz * p_view.y + Szz * p_view.z;
-
-		// 1σ extent of the Gaussian along the camera-to-centre ray:
-		// σ_d = sqrt(d̂ · Σ_v · d̂), with d̂ = μ_v / |μ_v|.
-		float len_mu = sqrt(p_view.x * p_view.x + p_view.y * p_view.y + p_view.z * p_view.z) + 1e-8f;
-		float dx = p_view.x / len_mu, dy = p_view.y / len_mu, dz = p_view.z / len_mu;
-		float sd2 = Sigma_v[0][0] * dx * dx + Sigma_v[1][1] * dy * dy + Sigma_v[2][2] * dz * dz
-		          + 2.0f * (Sigma_v[0][1] * dx * dy + Sigma_v[0][2] * dx * dz + Sigma_v[1][2] * dy * dz);
-		sigma_d[idx] = sqrtf(fmaxf(sd2, 0.0f));
-
-		// Keep centre depth for the per-pixel invdepth output.
-		depths[idx] = p_view.z;
-	}
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
-	// Inverse 2D covariance and a packed scalar in one float4. The scalar is
-	// opacity, or a precomputed tau scale when tau_precomp is provided.
+	// Inverse 2D covariance and a packed scalar in one float4: opacity, or a
+	// precomputed tau scale when tau_precomp is provided.
 	const float packed_input = (tau_precomp != nullptr) ? tau_precomp[idx] : opacities[idx];
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, packed_input * h_convolution_scaling };
 
@@ -379,9 +325,8 @@ renderCUDA(
 
 	float expected_invdepth = 0.0f;
 
-	// Analytic optical depth accumulated along this pixel's ray (light-space
-	// shadow pass). Tracked separately from T as the exact sum of tau_pixel,
-	// unaffected by the 0.99 alpha clamp.
+	// Analytic optical depth accumulated along this pixel's ray: the exact sum
+	// of tau_pixel, tracked separately from T.
 	float tau_accum = 0.0f;
 
 	// Iterate over batches until all done or range is complete
@@ -449,17 +394,13 @@ renderCUDA(
 			if(invdepth)
 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
 
-			// Per-Gaussian image contribution: total light flux this Gaussian
-			// projects onto valid pixels. Used by physical densify/prune to
-			// find Gaussians that contribute nothing to the image regardless
-			// of opacity.
+			// Per-Gaussian image contribution: sum of alpha*T over all pixels this
+			// Gaussian touches.
 			if (gauss_contribution)
 				atomicAdd(&gauss_contribution[collected_id[j]], alpha * T);
 
-			// Light-space shadow pass: optical depth accumulated IN FRONT of
-			// this Gaussian (before its own tau), weighted by alpha*T so pixels
-			// where it is visible from the light dominate its mean. Consumed as
-			// T_light = exp(-sum/wsum) on the Python side.
+			// Light-space shadow pass: optical depth in front of this Gaussian
+			// (before its own tau), alpha*T-weighted. T_light = exp(-sum/wsum).
 			if (tau_front_sum)
 			{
 				const float w = alpha * T;
@@ -484,15 +425,14 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 		{
-			// Per-pixel background (e.g. a sky cubemap sampled per ray) when
-			// bg_image is provided; otherwise the constant bg_color. Linear
-			// alpha-over: out = Σ(cloud·α·T) + T_final·bg.
+			// Per-pixel bg_image row when provided, else the constant bg_color.
+			// Linear alpha-over: out = Σ(cloud·α·T) + T_final·bg.
 			const float bg = bg_image ? bg_image[ch * H * W + pix_id] : bg_color[ch];
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg;
 		}
 
 		if (invdepth)
-		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
+		invdepth[pix_id] = expected_invdepth;
 	}
 }
 
@@ -559,9 +499,6 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
-	float* sigma_v_inv,
-	float* q_view,
-	float* sigma_d,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
@@ -591,9 +528,6 @@ void FORWARD::preprocess(int P, int D, int M,
 		cov3Ds,
 		rgb,
 		conic_opacity,
-		sigma_v_inv,
-		q_view,
-		sigma_d,
 		grid,
 		tiles_touched,
 		prefiltered,
