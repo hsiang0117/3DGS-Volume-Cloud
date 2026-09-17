@@ -16,7 +16,7 @@
 
 | 参数 | 含义 | 激活 |
 |---|---|---|
-| `σ_t` | 消光系数(1/m,总光学质量) | softplus, clamp 5 |
+| `σ_t` | 消光截面(长度²,消光系数的体积积分) | softplus, clamp 5 |
 | `ω` | 散射反照率(RGB) | sigmoid |
 | `g` | Henyey-Greenstein 相函数各向异性因子 | 0.8·tanh,前向散射 |
 | `w_n` | 6 阶多次散射八度能量权重(可学习,Frostbite/Wrenninge 八度近似) | softplus |
@@ -48,7 +48,7 @@ T_light = 每个高斯沿太阳方向的"前方遮挡透射率"。默认实现�
 
 ### 针手术(结构性 aniso 控制,默认开启)
 
-软正则压不住的高各向异性尾巴由 `split_needles` 结构性重写:每 1000 迭代,ratio>30 的高斯增肥薄轴 ×2(ratio 减半)、σ_t/3.2 守恒消光质量、沿主轴劈成两子。等效硬上限,不与光度梯度拔河。
+软正则压不住的高各向异性尾巴由 `split_needles` 结构性重写:每 1000 迭代,ratio>30 的高斯增肥薄轴 ×2(ratio 减半)、σ_t/3.2 近似守恒消光截面、沿主轴劈成两子。等效硬上限,不与光度梯度拔河。
 
 ### 物理化的致密化与维护
 
@@ -79,9 +79,9 @@ L = T_sun(v_l) ⊙ [Stage 1 太阳项]  +  ω · Σ_lm E_lm(v_l) · V_lm(x)
 
 ## 数据集
 
-UE5 渲染的体积云(WDAS cloud VDB),73 个半球相机 × 多太阳方向,NeRF-synthetic transforms 格式 + 逐帧 `sun_direction`。
+UE5 渲染的体积云(WDAS cloud VDB),73 个相机(球冠布置:极点 + 六圈,天顶角 0°–135°)× 多太阳方向,NeRF-synthetic transforms 格式 + 逐帧 `sun_direction`。
 
-**现行数据集 `data/CloudDatasetUniform`**:60 个 Fibonacci 均匀半球太阳 × 轮转 1/3 相机 = 1458 帧;train 1306 / test 152,其中 **4 个太阳方向整体 held-out**(96 帧)作为 relighting 泛化测试。方向均匀覆盖是几何阴影梯度健康工作的前提(方向有偏的数据集会让垂直方向的延展逃逸监督)。
+**现行数据集 `data/CloudDatasetUniform`**:60 个 Fibonacci 均匀半球太阳 × 轮转 1/3 相机(每太阳 24–25 视角、每相机 20 太阳)= 1460 帧;train 1308 / test 152,其中 **4 个太阳方向整体 held-out**(96 帧)作为 relighting 泛化测试。方向均匀覆盖是几何阴影梯度健康工作的前提(方向有偏的数据集会让垂直方向的延展逃逸监督)。
 
 **Stage 2 的 env-on 数据集**(如 `CloudDatasetUniform_envon`):**同位姿、同太阳、同曝光**,只把 UE 的 SkyAtmosphere 天空亮度因子设 0(背景纯黑、保留大气对云的打光)重采一遍 → 云带环境光、背景黑。位姿/split 与 env-off 一致,可复用同一套 `--held-out-suns`。
 
@@ -163,7 +163,6 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
 | `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间。store_true 无法从命令行关闭,真·线性 GT 数据需改源码 |
 | `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`),保留作换其他 filmic 引擎的保险;开启时优先于固定 ACES |
-| `--k_sigma` | 0.0 | per-tile max-response 深度排序偏移(σ 单位);0 = stock 中心深度排序。曾用于治 popping,因块状伪影弃用,CUDA 路径保留 |
 
 #### 环境光(Stage 2)
 
@@ -297,11 +296,35 @@ pip install -r requirements.txt
 torch/torchvision 用 PyTorch index 的 cu128 wheel;`submodules/` 下三个 CUDA 扩展
 (`diff-gaussian-rasterization` 含本项目的 analytic-tau / record_front_tau /
 lightpass-backward 通道、`simple-knn`、`fused-ssim`)是本地编译,需 CUDA 工具链。
-**改动 CUDA kernel 或更换 torch 后需重新编译**:
+
+### 编译 CUDA 扩展
+
+**改动 CUDA kernel 或更换 torch 后需重新编译**。三个要点:
+
+- **`--no-build-isolation`**:`setup.py` 在构建期 `import torch`,而 pip 的隔离构建环境里没有 torch;
+- **`--force-reinstall --no-deps`**:包版本恒为 `0.0.0`,不加这个 pip 会判定"已满足"而直接跳过,编译结果装不进去;
+- **Windows 还需选对 MSVC toolset**:CUDA 12.8 的 `host_config.h` 要求 `_MSC_VER < 1950`(即 MSVC 19.4x 及以下),而 VS2026 默认的 14.50 恰好是 1950、会被直接拒绝 —— 用 `vcvarsall.bat x64 -vcvars_ver=14.44` 显式选并排安装的 14.44,不要用 `-allow-unsupported-compiler` 绕过版本检查。
+
+```powershell
+# Windows(PowerShell)。<VS> 形如 D:\Program Files\Microsoft Visual Studio\2026\Community
+cmd /c "call `"<VS>\VC\Auxiliary\Build\vcvarsall.bat`" x64 -vcvars_ver=14.44 && set" `
+  | % { if ($_ -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2] -EA 0 } }
+$env:DISTUTILS_USE_SDK = "1"
+.\.venv\Scripts\python.exe -m pip install --no-build-isolation --force-reinstall --no-deps `
+  ./submodules/diff-gaussian-rasterization
+```
 
 ```shell
-pip install ./submodules/diff-gaussian-rasterization
+# Linux:上面 Windows 相关的坑都不存在(编译器版本由 gcc/nvcc 组合决定)
+pip install --no-build-isolation --force-reinstall --no-deps ./submodules/diff-gaussian-rasterization
 ```
+
+`simple-knn`、`fused-ssim` 同理,把路径换掉即可(两者改动频率低,只在换 torch 时重编)。
+
+> 两个 Windows 排查提示:① 默认 toolset 本来就 ≤ 14.44 时 `-vcvars_ver` 可省略;
+> ② 若终端把控制台代码页设成了 65001(UTF-8),torch 探测 MSVC 版本时会因 `cl.exe`
+> 输出 UTF-8 中文、而它固定按 `'oem'`(cp936)解码而报 `UnicodeDecodeError`,先
+> `chcp 936` 即可 —— 这不是工具链问题。
 
 ## 致谢
 
