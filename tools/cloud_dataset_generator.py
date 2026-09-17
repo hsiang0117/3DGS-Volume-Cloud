@@ -1,8 +1,13 @@
 """
 UE5 体积云数据集采集脚本(在 UE 编辑器内执行)。
 
-均匀太阳数据集:60 个 Fibonacci 均匀半球太阳 × 轮转 1/3 相机 ≈ 1458 帧
-(方向均匀覆盖,消除方向有偏导致的 aniso 逃逸)。输出目录见文件底部 OUTPUT_DIR。
+三种模式:
+  - 缺省(均匀太阳):n_suns 个 Fibonacci 均匀半球太阳 × 轮转 1/stride 相机 → DEFAULT_OUTPUT_DIR;
+  - --single-sun:单个固定太阳 × 全部相机 → D:/CloudDatasetZenith
+    (可 --sun-elevation/--sun-azimuth 改方向、--camera-stride 抽稀);
+  - --single-sun-testset:同一太阳 × 交错 held-out 机位 → D:/CloudDatasetZenith_test
+    (默认天顶环 30/50/70 = 训练环中点、方位偏移 +15°,与训练视角零重合;
+     可 --zenith-rings/--azimuth-offset 调整)。
 
 执行方式(任选其一):
   A. UE 底部 Output Log 命令行,左侧下拉切到 "Cmd" 模式,输入:
@@ -31,7 +36,7 @@ from pathlib import Path
 
 
 def disable_background_throttle():
-    """关闭编辑器后台 CPU 节流——失焦时截图任务会永久挂起(踩过的坑)。"""
+    """关闭编辑器后台 CPU 节流(失焦时截图任务会挂起)。"""
     try:
         eps = unreal.load_object(None, "/Script/UnrealEd.Default__EditorPerformanceSettings")
         eps.set_editor_property("throttle_cpu_when_not_foreground", False)
@@ -86,9 +91,7 @@ class CloudDatasetGenerator:
         self.current_time_idx = -1
         self.tick_handle = None
         self.total_camera_count = 0
-        # Max wait for a HighResShot PNG to land before retrying. Generous so
-        # cold-start frames (shader/PSO compile, volumetric first-frame cost) are
-        # not falsely timed out.
+        # Max wait for a HighResShot PNG to land before retrying.
         self.capture_file_timeout_seconds = 20.0
         self.max_retries = 10              # timed-out frames requeue (to tail) up to this many times
         self.expected_frames = 0           # set when the queue is built; checked at completion
@@ -187,13 +190,12 @@ class CloudDatasetGenerator:
 
     def find_vdb_cloud(self):
         """查找VDB云模型"""
-        # 这里需要您手动将 wdas_cloud.vdb 导入到 UE5 项目中
-        # 脚本将尝试查找已存在的云 Actor
+        # 这里需要您手动将 wdas_cloud.vdb 导入到 UE5 项目中;脚本只查找已存在的云 Actor
 
         cloud_actor = None
         all_actors = self.editor_actor_subsystem.get_all_level_actors()
 
-        # 查找包含 "cloud" 或 "wdas" 的 Actor
+        # 按名称含 "HeterogeneousVolume" 的 Actor 查找
         for actor in all_actors:
             actor_name = actor.get_name()
             if "HeterogeneousVolume" in actor_name:
@@ -478,17 +480,14 @@ class CloudDatasetGenerator:
                     return
 
                 if meta.get("is_warmup", False):
-                    # Warmup timed out (coldest first frame). Drop it — do NOT
-                    # requeue as a real frame (would duplicate the held job).
+                    # 预热超时:直接丢弃,不要当作真帧重排队
                     unreal.log_warning("预热截图超时，跳过本次预热")
                     self._clear_pending_capture()
                     return
 
                 retry = int(meta.get("retry", 0))
                 if retry < self.max_retries:
-                    # Requeue at the TAIL (not the head): retry after the pipeline
-                    # is warm, instead of burning attempts while still cold. This
-                    # is what guarantees the full set is eventually captured.
+                    # 重排在队尾(不是队首):等渲染管线热起来后再重试
                     unreal.log_warning(
                         f"截图超时，排到队尾重试: cam{meta['cam_idx']:02d}, frame {meta['time_idx']:04d}, retry={retry + 1}/{self.max_retries}"
                     )
@@ -532,8 +531,7 @@ class CloudDatasetGenerator:
             unreal.log(f"\n处理太阳 time_idx={self.current_time_idx}")
             self.set_sun_direction(d)
 
-        # 首批截图先做几次预热（丢弃），让渲染管线热起来再采真帧——冷启动帧
-        # 渲染最慢，是超时丢帧的主因。
+        # 首批截图先做几次预热（丢弃），让渲染管线热起来再采真帧
         if self.warmup_done < self.warmup_target:
             self.warmup_done += 1
             self.capture_queue.insert(0, job)
@@ -613,9 +611,6 @@ class CloudDatasetGenerator:
     def generate_uniform_suns(self, n_suns, min_elevation_deg=8.0, max_elevation_deg=85.0):
         """
         Fibonacci 螺旋在半球上生成 n 个均匀分布的太阳方向(UE 坐标,指向太阳)。
-
-        全方位均匀覆盖,消除"某个方向几乎所有太阳都与之垂直"的 aniso
-        逃逸条件(方向有偏的数据集会让垂直方向的延展缺方位角监督)。
         """
         z_lo = math.sin(math.radians(min_elevation_deg))
         z_hi = math.sin(math.radians(max_elevation_deg))
@@ -636,7 +631,7 @@ class CloudDatasetGenerator:
         均匀太阳数据集:n_suns 个 Fibonacci 半球太阳 × 轮转 1/stride 相机。
 
         独立的完整数据集:time_index 从 0 开始,输出目录应指向一个全新位置。
-        transforms 写 transforms.json(标准名,后续直接走 convert_transforms.py)。
+        位姿写 transforms.json(标准名,后续走 tools/convert_transforms.py)。
         """
         unreal.log("=" * 60)
         unreal.log(f"开始生成均匀太阳数据集: {n_suns} 太阳 × 1/{camera_stride} 相机")
@@ -677,16 +672,16 @@ class CloudDatasetGenerator:
         unreal.log("脚本已进入异步采集流程，完成后会自动输出完成日志")
 
     def generate_single_sun_dataset(self, sun_toward_ue=(0.0, 0.0, 1.0), camera_stride=1):
-        """单个固定太阳 × 全部相机的数据集(用于与原版 3DGS 的单光照重建对比)。
+        """单个固定太阳 × 全部相机的数据集。
 
         与 generate_uniform_dataset 共用同一套相机位姿、场景配置与异步截图机制,
         只是把太阳固定成一个显式方向、并默认用全部相机(camera_stride=1)。
         默认 sun_toward_ue=(0,0,1) 即 UE 天顶(elevation 90°,光线垂直向下)。
-        所有帧 time_index 都是 0,便于当作单光照数据集训练。
+        所有帧 time_index 都是 0。
 
         重要:env-off/env-on 由 UE 场景状态决定(SkyAtmosphere 是否贡献光照),
         本脚本不切换。务必在与 CloudDatasetUniform(env-off)完全相同的场景状态下运行,
-        否则显示空间不一致,和已训模型无法公平对比。
+        否则两套数据的显示空间不一致。
         """
         unreal.log("=" * 60)
         unreal.log(f"开始生成单太阳数据集: sun_toward_ue={tuple(sun_toward_ue)} × 全部相机 (1/{camera_stride})")
@@ -757,7 +752,7 @@ class CloudDatasetGenerator:
 
     def generate_single_sun_testset(self, sun_toward_ue=(0.0, 0.0, 1.0),
                                     zenith_rings=(30, 50, 70), azimuth_offset_deg=15.0):
-        """单太阳 × 交错 held-out 测试机位(新视角泛化评测,与训练 73 视角零重合)。
+        """单太阳 × 交错 held-out 测试机位(与训练视角零重合)。
 
         太阳方向、场景配置、异步截图机制与 generate_single_sun_dataset 完全一致,
         只是相机换成 calculate_interleaved_test_positions 给出的交错机位。
@@ -797,7 +792,7 @@ class CloudDatasetGenerator:
 def main_uniform(output_directory="D:/CloudDatasetUniform", n_suns=60, camera_stride=3):
     """均匀太阳数据集入口:n_suns 个 Fibonacci 半球太阳 × 轮转 1/stride 相机。
 
-    默认 60 太阳 × 1/3 相机 ≈ 1458 帧 → D:/CloudDatasetUniform。
+    默认 n_suns=60、camera_stride=3 → D:/CloudDatasetUniform。
     完成后 transforms.json 在输出目录,走 tools/convert_transforms.py 转 OpenGL。
     """
     disable_background_throttle()
@@ -815,12 +810,12 @@ def _elevation_azimuth_to_ue(elevation_deg, azimuth_deg):
 
 def main_single_sun(output_directory="D:/CloudDatasetZenith",
                     elevation_deg=90.0, azimuth_deg=0.0, camera_stride=1):
-    """单太阳 × 全相机数据集入口(与原版 3DGS 单光照重建对比用)。
+    """单太阳 × 全相机数据集入口。
 
-    默认 elevation=90°(天顶)、全部 73 相机 → D:/CloudDatasetZenith。
+    默认 elevation=90°(天顶)、全部相机 → D:/CloudDatasetZenith。
     ⚠️ 必须在与 CloudDatasetUniform 相同的 env-off 场景状态下运行。
     完成后 transforms.json 在输出目录,走 tools/convert_transforms.py 转 OpenGL,
-    再按机位切 train/test 供原版 3DGS 与本方法同数据训练对比。
+    再切 train/test。
     """
     disable_background_throttle()
     global ACTIVE_GENERATOR
@@ -832,13 +827,15 @@ def main_single_sun(output_directory="D:/CloudDatasetZenith",
 def main_single_sun_testset(output_directory="D:/CloudDatasetZenith_test",
                             elevation_deg=90.0, azimuth_deg=0.0,
                             zenith_rings=(30, 50, 70), azimuth_offset_deg=15.0):
-    """单太阳交错 held-out 测试集入口(新视角泛化评测用)。
+    """单太阳交错 held-out 测试集入口。
 
-    默认:太阳天顶 90°、天顶角环 {30,50,70}、方位偏移 +15° → 36 张,与训练 73
-    视角零重合 → D:/CloudDatasetZenith_test。
+    默认:太阳天顶 90°、天顶角环 {30,50,70}、方位偏移 +15°,与训练视角零重合
+    → D:/CloudDatasetZenith_test。
     ⚠️ 必须在与 CloudDatasetZenith 相同的 env-off 场景状态下运行。
+    CLI:py cloud_dataset_generator.py --single-sun-testset -o D:/CloudDatasetZenith_test
+        (可选 --zenith-rings "30,50,70" / --azimuth-offset 15.0 / --sun-elevation / --sun-azimuth)
     完成后 transforms.json 走 tools/convert_transforms.py 转 OpenGL,再用
-    tools/compare_vs_3dgs.py 对两方模型评测。
+    tools/eval_testset.py 评测。
     """
     disable_background_throttle()
     global ACTIVE_GENERATOR
@@ -850,8 +847,8 @@ def main_single_sun_testset(output_directory="D:/CloudDatasetZenith_test",
 
 # 缺省输出目录(可被命令行 -o/--output 覆盖)。
 # **env-off 与 env-on 必须指向不同目录**,否则后一次采集会覆盖前一次的图:
-#   env-off(SkyAtmosphere 不可视)→ "D:/CloudDatasetUniform"      (Stage 1,已采)
-#   env-on (SkyAtmosphere 可视)  → "D:/CloudDatasetUniform_envon"(Stage 2)
+#   env-off(SkyAtmosphere 不可视)→ "D:/CloudDatasetUniform"
+#   env-on (SkyAtmosphere 可视)  → "D:/CloudDatasetUniform_envon"
 # 几何确定性:同一 generator 同参数 → 相机位姿与太阳方向完全一致,两套 transforms 可互换。
 DEFAULT_OUTPUT_DIR = "D:/CloudDatasetUniform"
 
@@ -864,11 +861,23 @@ if __name__ == "__main__":
     ap.add_argument("--camera-stride", type=int, default=3, help="轮转 1/stride 相机(单太阳模式默认 1=全部)")
     ap.add_argument("--single-sun", action="store_true",
                     help="单太阳 × 全相机模式(与原版 3DGS 单光照对比);默认天顶 90°、全部相机")
+    ap.add_argument("--single-sun-testset", action="store_true",
+                    help="单太阳交错 held-out 测试集模式(36 个零重合机位);默认天顶 90°、环 {30,50,70}、方位偏移 +15°")
     ap.add_argument("--sun-elevation", type=float, default=90.0, help="单太阳仰角(度),默认 90=天顶")
     ap.add_argument("--sun-azimuth", type=float, default=0.0, help="单太阳方位角(度),天顶时无关紧要")
+    ap.add_argument("--zenith-rings", type=str, default="30,50,70",
+                    help="测试集天顶角环,逗号分隔(度);默认 30,50,70 = 训练环中点")
+    ap.add_argument("--azimuth-offset", type=float, default=15.0,
+                    help="测试集方位角偏移(度);默认 +15 = 与训练方位角错开半个间隔")
     # UE 的 py 命令可能注入自身 argv,用 parse_known_args 避免未知参数报错
     cli, _ = ap.parse_known_args()
-    if cli.single_sun:
+    if cli.single_sun_testset:
+        rings = tuple(float(x) for x in str(cli.zenith_rings).replace(" ", "").split(",") if x)
+        out = cli.output if cli.output != DEFAULT_OUTPUT_DIR else "D:/CloudDatasetZenith_test"
+        main_single_sun_testset(out,
+                                elevation_deg=cli.sun_elevation, azimuth_deg=cli.sun_azimuth,
+                                zenith_rings=rings, azimuth_offset_deg=cli.azimuth_offset)
+    elif cli.single_sun:
         stride = cli.camera_stride if cli.camera_stride and cli.camera_stride > 0 else 1
         # 单太阳模式默认全相机:除非用户显式传了 >1 的 stride,否则用 1
         if "--camera-stride" not in __import__("sys").argv:
