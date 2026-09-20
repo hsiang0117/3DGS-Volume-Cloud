@@ -34,8 +34,11 @@ class EnvNet(nn.Module):
         T_sun(v_l) = exp( − m(θ) · softplus(raw_tau) ),   θ = sun zenith angle
 
     m(θ) is the Kasten-Young air mass (fixed geometric function, not learned) and
-    softplus keeps τ≥0 so T_sun∈(0,1]; it depends on the zenith angle only. E_lm
-    (additive sky in-scatter SH) comes from a small MLP over v_l."""
+    softplus keeps τ≥0, so the exponential alone lies in (0,1]. The returned
+    T_sun is that exponential MULTIPLIED by a smoothstep horizon gate, so its
+    range is [0,1]: it reaches exactly 0 once the sun is at or below the horizon.
+    It depends on the zenith angle only. E_lm (additive sky in-scatter SH) comes
+    from a small MLP over v_l."""
     # Near-neutral zenith optical depth init (R,G,B): small, τ_B>τ_R (faint Rayleigh tilt).
     TAU_INIT = (0.02, 0.04, 0.07)
 
@@ -212,8 +215,10 @@ class GaussianModel:
     @property
     def get_tonemap_coeffs(self):
         """(a, b, c, d) positive tonemap coefficients (softplus of raw). `e` is
-        the pinned constant TONEMAP_E. Empty tensor if no tonemap param exists
-        (e.g. a model trained without --tonemap_learnable)."""
+        the pinned constant TONEMAP_E. Returns None if no tonemap param exists
+        (e.g. a model trained without --tonemap_learnable) — callers must test
+        `is None`, since an empty tensor would be truthy-by-identity and would
+        be taken for a valid coefficient set."""
         if self._tonemap.numel() == 0:
             return None
         return torch.nn.functional.softplus(self._tonemap)
@@ -247,7 +252,9 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        # Physical parameter init (raw): σ_t = 0.1 gives τ_center = σ_t·√(2π)·s ≈ 0.25·s.
+        # Physical parameter init (raw): σ_t = 0.1 gives τ_center = σ_t·√(2π)·s ≈ 0.25·s
+        # (isotropic s; τ_center = mass·ℓ with mass = σ_t·(2π)^(3/2)·∏s and
+        # ℓ = 1/(2π·∏s·√Σ(d_i/s_i)²) — the (2π)^(3/2) and ∏s cancel, leaving ∝ s).
         sigma_t_init = torch.full((P, 1), 0.1, dtype=torch.float, device="cuda")
         sigma_t_raw = self._softplus_inverse(sigma_t_init)
         omega_raw = inverse_sigmoid(torch.full((P, 3), 0.8, dtype=torch.float, device="cuda"))
@@ -656,7 +663,10 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
-            # Some parameter groups are global (not per-point) and should not be extended.
+            # Defensive only: every caller (clone / split / needle surgery)
+            # supplies all seven per-point keys, and the optimizer holds exactly
+            # those seven groups, so this branch does not currently trigger.
+            # It guards a future global parameter added to this optimizer.
             if group["name"] not in tensors_dict:
                 optimizable_tensors[group["name"]] = group["params"][0]
                 continue
@@ -929,16 +939,18 @@ class GaussianModel:
 
         Density growth: stock xyz/scale-grad-driven clone+split.
 
-        Pruning: image-contribution prune in place of the opacity threshold. A
-        Gaussian is removed iff:
-          - it was visible at all (contribution_denom > some min), AND
-          - its mean contribution Σ(α·T) per visible frame is below
-            `opt.contribution_threshold`, AND
-          - it is not in a grace period (prune_grace == 0).
+        Pruning: image-contribution prune in place of the opacity threshold. Two
+        channels are OR'd, both gated by the grace period (`prune_grace == 0`):
+          A. contribution — visible at least `opt.prune_min_visible_frames` times
+             (so the mean below is meaningful) AND mean contribution Σ(α·T) per
+             visible frame below `opt.contribution_threshold`.
+          B. dead point — not visible to a single camera in the current
+             accumulator window. This channel is deliberately NOT gated by the
+             visible-frames minimum: a never-visible Gaussian has no mean to
+             judge, and requiring visibility of it would keep it forever.
+        A Gaussian therefore does NOT have to have been visible to be removed.
 
-        Resurrection: every `opt.resurrect_interval` iterations, reset the σ_t of the
-        bottom `opt.resurrect_fraction` of Gaussians (by mean contribution) toward the
-        initialisation value and grant another grace period.
+        Resurrection lives in tick_post_densify_maintenance(), not here.
         """
         # 1. Density growth (stock path, with adaptive threshold)
         denom_g = self.denom.clamp(min=1)
@@ -988,7 +1000,9 @@ class GaussianModel:
 
         Channel B — dead point: grace expired and not visible to a single camera in
             the current accumulator window (outside every frustum, or culled by the
-            rasterizer before it deposits a pixel).
+            rasterizer before it deposits a pixel). Unlike channel A it is NOT gated
+            by `opt.prune_min_visible_frames` — a never-visible Gaussian has no mean
+            contribution to threshold, so requiring visibility would never remove it.
         """
         if self.get_xyz.shape[0] == 0:
             return 0

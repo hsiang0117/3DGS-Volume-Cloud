@@ -71,9 +71,9 @@ class PipelineParams(ParamGroup):
         # record_front_tau + native lightpass backward) with the full shadow
         # gradient through σ_t and scales/rotation. --tlight_voxel selects the
         # 128^3 voxel cache instead (a fallback flag rather than
-        # tlight_raster=True, because store_true cannot be turned off from the
-        # CLI); the viewer matches the source a model was trained with via
-        # cfg_args.
+        # tlight_raster=True, so the DEFAULT is expressed by an absent flag and
+        # old cfgs without the key still resolve to raster); the viewer matches
+        # the source a model was trained with via cfg_args.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
         # Apply the fixed Narkowicz ACES curve to the final image so loss and
@@ -90,8 +90,10 @@ class PipelineParams(ParamGroup):
         # the frozen Stage-1 sun shading,
         #     L = T_sun(v_l) ⊙ sun_term  +  ω · Σ_lm E_lm(v_l) · V_lm
         # T_sun and E_lm are global functions of v_l; V_lm is the precomputed
-        # per-Gaussian sky-visibility transfer. Enabled by --stage2 and persisted
-        # to cfg_args so the viewer auto-detects it.
+        # per-Gaussian sky-visibility transfer. Enabled by --stage2. NOTE: it is
+        # written to cfg_args but no reader consumes it — the viewer and the eval
+        # scripts detect a Stage-2 model from the PLY's env sidecars instead
+        # (env.json + env_net.pt + sky_transfer.npy). Kept for provenance only.
         self.env_lighting = False
         self.env_sh_order = 2          # SH order for sky radiance E_lm and visibility V_lm (SH2 = 9 coeffs)
         self.env_transfer_dirs = 48    # # hemisphere directions sampled for the V_lm precompute
@@ -127,8 +129,10 @@ class OptimizationParams(ParamGroup):
         # quadratic in the log-ratio above.
         self.lambda_aniso = 0.001
         self.aniso_ratio_max = 5.0
-        # Iteration up to which the aniso regulariser runs (set to `iterations`
-        # to keep it active for the whole schedule).
+        # Iteration up to which the aniso regulariser runs, EXCLUSIVE: the
+        # consumer is `if iteration < aniso_until_iter`, so with the default
+        # 30_000 the last regularised iteration is 29_999 and iteration 30_000
+        # is NOT penalised. To cover an N-iteration run, set this to N + 1.
         self.aniso_until_iter = 30_000
         self.densification_interval = 100
         self.densify_from_iter = 500
@@ -143,7 +147,11 @@ class OptimizationParams(ParamGroup):
         # Prune threshold on the mean Σ(α·T) a Gaussian contributes over the
         # frames it is visible in.
         self.contribution_threshold = 1e-4
-        self.prune_min_visible_frames = 5      # require at least 5 visible frames before judging
+        # Gates ONLY the contribution channel below: mean Σ(α·T) is judged after
+        # this many visible frames. The dead-point channel (never visible in the
+        # window) is deliberately not gated by it — such a Gaussian has no mean
+        # to threshold, so requiring visibility would never remove it.
+        self.prune_min_visible_frames = 5
         self.resurrect_interval = 3000         # every N iters, reset bottom σ_t
         self.resurrect_fraction = 0.05         # 5% of points
         # Clear the contribution accumulator every N iterations so the running

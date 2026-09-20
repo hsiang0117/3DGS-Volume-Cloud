@@ -34,7 +34,7 @@
 UE 的 HighResScreenshot GT 是 **filmic-tonemapped LDR**,而物理着色在**线性空间**。用线性模型拟合非线性目标会表现为动态范围压缩。默认开启 **固定 Narkowicz ACES** 曲线:着色端放宽 per-高斯辐亮度 clamp 到 HDR、图像端套 ACES,使 loss 与全部指标都在 GT 自己的空间比较。
 
 - `--tonemap_learnable`(可选,默认关):把 ACES 的 4 个系数(a,b,c,d)变可学习(e 钉死),自适应 GT 的真实显示曲线,保留为**换其他 filmic 引擎**的保险;系数存进 PLY 同目录 `tonemap.json`,viewer/eval 自动读取。
-- **若 GT 是真·线性 HDR**(无 tonemap):应**关闭** tonemap(源码翻 `tonemap_aces=False`),而非用 learnable——Narkowicz 族无法表示 identity。物理模型本身线性、与渲染器无关;部署回 UE 实时渲染时输出**线性辐亮度**让 UE 自己 tonemap,**勿重复套 ACES**。
+- **若 GT 是真·线性 HDR**(无 tonemap):应**关闭** tonemap(命令行传 `--no-tonemap_aces`),而非用 learnable——Narkowicz 族无法表示 identity。物理模型本身线性、与渲染器无关;部署回 UE 实时渲染时输出**线性辐亮度**让 UE 自己 tonemap,**勿重复套 ACES**。
 
 ### 光源视角自阴影(T_light,默认路径)
 
@@ -85,41 +85,44 @@ UE5 渲染的体积云(WDAS cloud VDB),73 个相机(球冠布置:极点 + 六圈
 
 **Stage 2 的 env-on 数据集**(如 `CloudDatasetUniform_envon`):**同位姿、同太阳、同曝光**,只把 UE 的 SkyAtmosphere 天空亮度因子设 0(背景纯黑、保留大气对云的打光)重采一遍 → 云带环境光、背景黑。位姿/split 与 env-off 一致,可复用同一套 `--held-out-suns`。
 
-采集管线(`tools/`):
+数据集在磁盘上的形态(`data/CloudDatasetUniform/`,共 4 个 JSON + 73 个 `camXX/` + 初始点云):
 
-```
-tools/cloud_dataset_generator.py   # UE 编辑器内执行;均匀太阳数据集(-o 指定输出目录)
-tools/convert_transforms.py        # UE 左手系 → OpenGL 右手系(含 sun_direction)
-tools/split_test_set.py            # test split(幂等):--held-out-suns 整太阳 / --per-cam 逐相机
-```
+| 文件 | 内容 |
+|---|---|
+| `transforms.json` | UE 左手系原始输出(采集产物,训练不用) |
+| `transforms_train_full.json` | 全集 1460 帧的 OpenGL 右手系备份(**重切 split 的唯一依据,勿删**) |
+| `transforms_train.json` | 训练集 1308 帧 |
+| `transforms_test.json` | 测试集 152 帧 |
 
-UE 内一行启动(自动关后台 CPU 节流——否则失焦时截图永不落盘):
+划分口径:test = **4 个整太阳方向**(`time_index ∈ {7,22,37,52}`,各 24 帧 = 96 帧)
++ 其余 56 个太阳各 1 个未见视角(56 帧)= 152 帧。
+`transforms_train_full.json` 保留全集,因此**任何 split 都可从它重切**(幂等,不会丢帧)。
 
-```
-py "D:/3DGS-Volume-Cloud/tools/cloud_dataset_generator.py" -o D:/CloudDatasetUniform
-```
+> 重采(只换曝光/光照、相机位姿与太阳方向不变)时,位姿与 split 完全一致,可直接
+> 复用现有 transforms_train/test.json、只替换 cam*/images/,无需重切。
 
-采集后处理(从 UE 输出到可训练数据集):
+采集与切分管线(`tools/`):
 
 ```shell
-# 1. generator 在 UE 输出目录写出 transforms.json(UE 左手坐标系)+ cam*/images/*.png
-#    (transforms.json 是唯一产物;目录里若有旧的 transforms_opengl.json 是上次 convert 的残留)
+# 1. [UE 编辑器内执行] 采集:均匀太阳数据集,输出 transforms.json + camXX/images/*.png
+#    自动关闭后台 CPU 节流——否则失焦时截图永不落盘
+py "<repo>/tools/cloud_dataset_generator.py" -o D:/CloudDatasetUniform
 
-# 2. UE → OpenGL 转换,缺省直接写成训练全集 transforms_train.json
+# 2. UE 左手系 → OpenGL 右手系(含 sun_direction),缺省写成训练全集 transforms_train.json;
+#    写新全集时会清除过期的 transforms_train_full.json / transforms_test.json
 python tools/convert_transforms.py D:/CloudDatasetUniform/transforms.json
-#    (缺省输出同目录 transforms_train.json;写新全集时会清除过期的
-#     transforms_train_full.json / transforms_test.json,避免下一步从旧备份重切)
-#    若数据集要进 repo:把 D:/CloudDatasetUniform 整个拷到 data/ 再切
 
 # 3. 划分 held-out 测试集(整太阳 relighting 泛化 + 每太阳 1 帧):
 python tools/split_test_set.py --data D:/CloudDatasetUniform --held-out-suns 7,22,37,52 --per-sun 1
 #    → 备份全集到 transforms_train_full.json,写 transforms_train.json(train)+ transforms_test.json(test)
-#    train.py 默认 --eval 不并回 test
-#    (旧 CloudDataset 的 per-camera 切分:省略 --held-out-suns,用 --per-cam 2)
+#    (幂等:重跑不会丢帧。旧 CloudDataset 的 per-camera 切分:省略 --held-out-suns,用 --per-cam 2)
 ```
 
-> 重采(只换曝光/光照、相机位姿与太阳方向不变)时,位姿与 split 完全一致,可直接
-> 复用现有 transforms_train/test.json、只替换 cam*/images/,无需重转重切。
+> ⚠️ **诊断与天空采集脚本仍不在仓库内**(原 `tools/` 下**尚未恢复**的 6 个):
+> `residual_buckets.py`、`penumbra_residual.py`、`analyze_octave_weights.py`、
+> `plot_phase_function.py`、`project_pointcloud.py`、`ue_capture_sky_backdrop.py`。
+> 采集 / 转换 / 切分 / 评测均已可用,训练与查看不受影响;
+> 若要复跑残差诊断或多散射八度分析,需从 git 历史(或本地备份)取回这批脚本。
 
 ## 使用
 
@@ -129,8 +132,8 @@ python tools/split_test_set.py --data D:/CloudDatasetUniform --held-out-suns 7,2
 # Stage 1 — 默认:raster T_light + 完整几何梯度 + 针手术 + 固定 ACES tonemap
 python train.py -s data/CloudDatasetUniform
 
-# 旧体素 T_light 路径
-python train.py -s data/CloudDataset --tlight_voxel
+# 旧体素 T_light 路径(与 raster 之前训练的模型配套;数据路径按需改)
+python train.py -s data/CloudDatasetUniform --tlight_voxel
 
 # 可学习 tonemap(默认关,换 filmic 引擎时的保险)
 python train.py -s data/CloudDatasetUniform --tonemap_learnable
@@ -153,7 +156,7 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `-r, --resolution` | -1 | 训练分辨率;-1 = 原始(宽 >1.6K 时自动缩到 1.6K),1/2/4/8 = 对应降采样 |
 | `-w, --white_background` | False | 白色训练背景(默认黑) |
 | `--data_device` | cuda | 图像缓存设备;显存紧张可设 cpu |
-| `--eval` | **True** | test split 不并入训练。store_true 无法从命令行关闭,如需全量训练改源码 |
+| `--eval` | **True** | test split 不并入训练。默认 True 的 bool 用 `BooleanOptionalAction` 注册,可用 **`--no-eval`** 把 test split 并回训练(即全量训练),无需改源码 |
 
 #### 渲染管线(PipelineParams)
 
@@ -161,7 +164,7 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 |---|---|---|
 | `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化 + 完整几何梯度);与 raster 之前训练的模型配套 |
 | `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
-| `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间。store_true 无法从命令行关闭,真·线性 GT 数据需改源码 |
+| `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间。真·线性 GT 数据用 **`--no-tonemap_aces`** 关闭(默认 True 的 bool 走 `BooleanOptionalAction`),无需改源码 |
 | `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`),保留作换其他 filmic 引擎的保险;开启时优先于固定 ACES |
 
 #### 环境光(Stage 2)
@@ -221,7 +224,7 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--contribution_threshold` | 1e-4 | 贡献度剪枝阈值:mean Σ(α·T) 低于此值剪除(替代 stock 的 opacity 阈值) |
-| `--prune_min_visible_frames` | 5 | 至少在 N 帧可见才参与剪枝判定 |
+| `--prune_min_visible_frames` | 5 | **仅约束贡献通道**:至少在 N 帧可见才用平均 Σ(α·T) 判定剪枝。另一条"死点"通道(当前窗口内一帧都没被看到)剪枝时**不受此值保护**——从未被看见的高斯没有可判定的均值,若也要求可见就永远剪不掉 |
 | `--contribution_reset_interval` | 1000 | 贡献度累计器清零周期(保持统计反映当前模型) |
 | `--resurrect_interval` | 3000 | 每 N 迭代把贡献度最低的一批 σ_t 重置回 0.1(替代 stock reset_opacity)。**仅 densify 期间生效**——settle 期运行会与剪枝形成净销毁回路 |
 | `--resurrect_fraction` | 0.05 | 每次 resurrect 的点数占比 |
@@ -249,9 +252,18 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 ### 评估
 
 ```shell
-# 分组评估:held-out 太阳组 vs 已见太阳新视角组(T_light 源自动从 cfg_args 读取)
-python tools/eval_test_groups.py output/<run>
+# 训练内评测:`--eval` 默认开启,末次迭代在 test split 上写 metrics.json(PSNR/SSIM/LPIPS)
+
+# 对已保存的 checkpoint 独立复算同一套指标(与 train.py 的 test 循环逐行等价):
+python tools/eval_testset.py output/<run> [iteration]     # iteration 缺省=最新
+
+# 分组评估:held-out 太阳组 vs 已见太阳新视角组(T_light 源从 cfg_args 自动读取)
+python tools/eval_test_groups.py output/<run> [iteration]
 ```
+
+两个脚本都从 `cfg_args` 还原 `source_path` / T_light 源 / tonemap 模式,并由 PLY 的 sidecar
+自动判断是否启用环境光。注意它们按 `resolution=-1`、黑底加载相机;若某 run 用非默认
+`-r/--resolution` 或 `-w` 训练,独立复算的分辨率口径会与训练内评测不同。
 
 ### 交互 Viewer
 
@@ -264,18 +276,7 @@ python viewer.py --ply output/<run>/.../point_cloud.ply --sky_dir data/sky_backd
 
 基于 viser:实时改变太阳方向(relighting)、可视化通道(RGB / T_light / σ_t / depth)、可调背景色、snap 到训练相机。`--tlight auto|voxel|raster` 控制阴影源(auto 读训练 run 的 cfg_args)。加载 Stage 2 模型时自动检测 env sidecar 并开启环境光(太阳滑块同时驱动 `T_sun` + `E_lm`,可勾选框 A/B 开关)。
 
-**天空背景(`--sky_dir`,可选,纯展示)**:给定一组 per-太阳高度的 HDR cubemap(由 `tools/ue_capture_sky_backdrop.py` 从 UE 采集,见下),viewer 把云合成到真实天空前而非纯色底。太阳**高度**滑块选 cube、**方位**滑块旋转它(SkyAtmosphere 绕天顶轴旋转对称,唯一破对称的太阳随之转)。合成在 **rasterizer 内一趟完成**(逐像素 `bg_image` 线性 over + 单次 tonemap),"Sky backdrop" 勾选框开关,`Sky exposure`(默认 3.35)/`Sky warmth`(默认 0.09)对齐 UE 视口观感。**纯 viewer 展示,不进训练、不碰冻结的 albedo**;诊断通道保持纯色底。
-
-### 工具
-
-```shell
-tools/analyze_octave_weights.py    # 多次散射八度权重分析
-tools/plot_phase_function.py       # 有效相函数重建
-tools/project_pointcloud.py        # 初始点云-图像对齐快检
-tools/residual_buckets.py          # 有符号残差分桶(GT 亮度 × 深度覆盖)+ held-out 太阳 PSNR
-tools/penumbra_residual.py         # 残差按逐像素 T_light(阴影深度)分桶 × GT 亮度 cross-tab
-tools/ue_capture_sky_backdrop.py   # [UE 内运行] 采集 viewer 天空背景:per-太阳高度 6 面 HDR cube
-```
+**天空背景(`--sky_dir`,可选,纯展示)**:给定一组 per-太阳高度的 HDR cubemap(见下),viewer 把云合成到真实天空前而非纯色底。太阳**高度**滑块选 cube、**方位**滑块旋转它(SkyAtmosphere 绕天顶轴旋转对称,唯一破对称的太阳随之转)。合成在 **rasterizer 内一趟完成**(逐像素 `bg_image` 线性 over + 单次 tonemap),"Sky backdrop" 勾选框开关,`Sky exposure`(默认 3.35)/`Sky warmth`(默认 0.09)对齐 UE 视口观感。**纯 viewer 展示,不进训练、不碰冻结的 albedo**;诊断通道保持纯色底。
 
 ## 已知限制
 
@@ -283,7 +284,7 @@ tools/ue_capture_sky_backdrop.py   # [UE 内运行] 采集 viewer 天空背景:p
 - **光源近似**:光源空间阴影采用远距离透视相机近似平行太阳光;云体范围较大或太阳方向接近地平线时,该近似可能引入误差。
 - **多次散射近似**:六阶 HG 八度展开是实时外观模型,并非严格能量守恒的多重散射解,在半影与光学厚度较大的区域可能留有残差。
 - **Stage 1 数据集是刻意 env-off 的控制变量设计**:UE 场景只有云 + 单方向太阳,背景纯黑,无天空/大气环境光。注意 env-off 控制掉的是**环境光**,但 UE 体积管线仍计算**云内多次散射**——模型的六阶 octave 近似即用于拟合该效应。
-- **残差诊断(tools/residual_buckets.py / penumbra_residual.py)**:近受光半影处存在轻微偏亮残差,主要来自单次散射项与 HG 前向散射,优先级低。
+- **残差诊断结论(脚本已移除)**:近受光半影处存在轻微偏亮残差,主要来自单次散射项与 HG 前向散射,优先级低。结论来自已移除的诊断脚本。
 
 ## 环境
 

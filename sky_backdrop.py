@@ -2,10 +2,12 @@
 Sky backdrop for the viewer: a per-sun-elevation HDR cubemap sampled per camera
 ray to replace the flat background behind the cloud.
 
-Assets (tools/ue_capture_sky_backdrop.py): one 6-face cube per sun elevation
-0..90 deg, all captured at a fixed sun azimuth. The sky is azimuthally symmetric
-except for the sun, so the cube for round(sun_altitude) is rotated at runtime to
-put the captured sun at the viewer's sun azimuth.
+Assets (captured from UE; the capture script is no longer in this repo): one
+6-face cube per sun elevation, spanning the range recorded in `sky.json`
+(`alt_min`..`alt_max`, shipped asset 0..84 deg), all captured at a fixed sun
+azimuth. The sky is azimuthally symmetric except for the sun, so the cube for
+round(sun_altitude) is rotated at runtime to put the captured sun at the
+viewer's sun azimuth.
 
 Frames
   Capture (UE world): left-handed, +Z up, +X forward; the sun glow is on the +X
@@ -85,6 +87,11 @@ class SkyBackdrop:
         self._cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
         self._lru = lru
         # Stack of per-face (forward, right, up) basis vectors, aligned with self.faces.
+        # CONVENTION: this hard-codes that the capture put the sun at +X (px) —
+        # see the module docstring. The manifest's sun_azimuth_deg records the UE
+        # light's travel yaw, not the sun's position, so it cannot be used to
+        # validate this table automatically; a re-capture at a different light
+        # yaw therefore needs _FACE_BASIS (and the docstring) re-derived by hand.
         b = np.array([_FACE_BASIS[f] for f in self.faces], dtype=np.float32)  # (6,3,3)
         self._F = torch.as_tensor(b[:, 0], device=device)   # (6,3)
         self._R = torch.as_tensor(b[:, 1], device=device)
@@ -208,7 +215,8 @@ def _dump_equirect(sky: "SkyBackdrop", alt: int, out_png: str, w: int = 1024,
 
 if __name__ == "__main__":
     import sys
-    d = sys.argv[1] if len(sys.argv) > 1 else r"D:\3DGS-Volume-Cloud\data\sky_backdrop"
+    d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "sky_backdrop")
     sky = SkyBackdrop(d)
     print("meta:", {k: sky.meta[k] for k in ("format", "ext", "alt_min", "alt_max", "sun_azimuth_deg")})
     for a, expo in [(2, 6.0), (20, 2.0), (60, 1.0), (88, 1.0)]:

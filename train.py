@@ -111,8 +111,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         iter_end.record()
 
-        # Release the just-decoded image/alpha tensors; cameras lazy-load (see
-        # scene/cameras.py) and would otherwise hold them until next reuse.
+        # Release the just-decoded image tensor; cameras lazy-load (see
+        # scene/cameras.py) and would otherwise hold it until next reuse.
+        # release_loaded() drops the CPU cache entry (_loaded_rgb) only.
         if hasattr(viewpoint_cam, "release_loaded"):
             viewpoint_cam.release_loaded()
 
