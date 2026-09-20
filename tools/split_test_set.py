@@ -37,7 +37,7 @@ from collections import defaultdict
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data/CloudDataset")
+    ap.add_argument("--data", default="data/CloudDatasetUniform")
     ap.add_argument("--held-out-suns", default=None,
                     help="comma-separated time_index values held out ENTIRELY as a "
                          "relighting test (enables sun-stratified mode). e.g. 7,22,37,52")

@@ -851,6 +851,10 @@ def main_single_sun_testset(output_directory="D:/CloudDatasetZenith_test",
 #   env-on (SkyAtmosphere 可视)  → "D:/CloudDatasetUniform_envon"
 # 几何确定性:同一 generator 同参数 → 相机位姿与太阳方向完全一致,两套 transforms 可互换。
 DEFAULT_OUTPUT_DIR = "D:/CloudDatasetUniform"
+# Shared by argparse and the single-sun dispatch below: in single-sun mode this
+# value doubles as the "not overridden" sentinel (single-sun defaults to ALL
+# cameras, i.e. stride 1). Keeping one constant prevents the two from drifting.
+DEFAULT_CAMERA_STRIDE = 3
 
 if __name__ == "__main__":
     import argparse
@@ -858,7 +862,9 @@ if __name__ == "__main__":
     ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR,
                     help="输出目录(env-off / env-on / 单太阳 各用不同目录)")
     ap.add_argument("--n-suns", type=int, default=60, help="Fibonacci 半球太阳数(均匀模式)")
-    ap.add_argument("--camera-stride", type=int, default=3, help="轮转 1/stride 相机(单太阳模式默认 1=全部)")
+    ap.add_argument("--camera-stride", type=int, default=DEFAULT_CAMERA_STRIDE,
+                    help="轮转 1/stride 相机(均匀模式默认 %(default)s)。单太阳模式默认全相机(stride=1);"
+                         "若要抽稀,需显式传一个不同于默认值的 stride,如 --camera-stride 2")
     ap.add_argument("--single-sun", action="store_true",
                     help="单太阳 × 全相机模式(与原版 3DGS 单光照对比);默认天顶 90°、全部相机")
     ap.add_argument("--single-sun-testset", action="store_true",
@@ -878,10 +884,11 @@ if __name__ == "__main__":
                                 elevation_deg=cli.sun_elevation, azimuth_deg=cli.sun_azimuth,
                                 zenith_rings=rings, azimuth_offset_deg=cli.azimuth_offset)
     elif cli.single_sun:
-        stride = cli.camera_stride if cli.camera_stride and cli.camera_stride > 0 else 1
-        # 单太阳模式默认全相机:除非用户显式传了 >1 的 stride,否则用 1
-        if "--camera-stride" not in __import__("sys").argv:
-            stride = 1
+        # 单太阳模式默认全相机:默认值 3 是"未覆盖"的哨兵,只有用户显式传入
+        # 非默认值才做轮转。用 argparse 的默认值判断,不要查 sys.argv ——
+        # "--camera-stride=2" 这种等号写法是单个 token,字符串成员测试会漏掉它,
+        # 导致显式指定的 stride 被静默丢弃。
+        stride = cli.camera_stride if cli.camera_stride != DEFAULT_CAMERA_STRIDE else 1
         main_single_sun(cli.output if cli.output != DEFAULT_OUTPUT_DIR else "D:/CloudDatasetZenith",
                         elevation_deg=cli.sun_elevation, azimuth_deg=cli.sun_azimuth, camera_stride=stride)
     else:
