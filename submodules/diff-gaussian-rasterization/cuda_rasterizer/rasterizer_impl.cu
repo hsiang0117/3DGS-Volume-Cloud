@@ -226,8 +226,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* tau_front_sum,
 	float* tau_front_wsum,
 	bool antialiasing,
-	int32_t* tau_front_touch,
-	int32_t* ray_cut,
+	float* tau_front_TG_sum,
+	float* tau_front_G_sum,
 	int* radii,
 	bool debug)
 {
@@ -354,8 +354,8 @@ int CudaRasterizer::Rasterizer::forward(
 		gauss_contribution,
 		tau_front_sum,
 		tau_front_wsum,
-		tau_front_touch,
-		ray_cut), debug)
+		tau_front_TG_sum,
+		tau_front_G_sum), debug)
 
 	return num_rendered;
 }

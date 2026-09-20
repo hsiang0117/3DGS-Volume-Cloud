@@ -56,10 +56,10 @@ namespace CudaRasterizer
 			float* tau_front_sum,
 			float* tau_front_wsum,
 			bool antialiasing,
-			// Light-pass classification probes (see forward.cu / forward.h).
+			// Light-pass measurement probes (see forward.cu / forward.h).
 			// Placed after antialiasing so no defaulted parameter follows them.
-			int32_t* tau_front_touch,
-			int32_t* ray_cut,
+			float* tau_front_TG_sum,
+			float* tau_front_G_sum,
 			int* radii = nullptr,
 			bool debug = false);
 

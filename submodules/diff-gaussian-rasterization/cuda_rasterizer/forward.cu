@@ -292,8 +292,8 @@ renderCUDA(
 	float* __restrict__ gauss_contribution,
 	float* __restrict__ tau_front_sum,
 	float* __restrict__ tau_front_wsum,
-	int32_t* __restrict__ tau_front_touch,
-	int32_t* __restrict__ ray_cut)
+	float* __restrict__ tau_front_TG_sum,
+	float* __restrict__ tau_front_G_sum)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -367,15 +367,25 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-			// Light-pass coverage probe: this pixel actually processed this
-			// splat (it is inside the ellipse), so record that the Gaussian was
-			// reached. Must sit BEFORE the alpha<1/255 gate below — that gate is
-			// exactly what makes a "too faint to matter" occlusion numerically
-			// indistinguishable from "no occlusion" in tau_front_wsum.
-			if (tau_front_touch)
-				atomicAdd(&tau_front_touch[collected_id[j]], 1);
-
 			const float G = exp(power);
+
+			// Light-pass measurement probe: record the light actually arriving
+			// at this splat, BEFORE the alpha<1/255 gate and the early-out can
+			// discard it. T here is the pixel's transmittance of everything in
+			// front of this Gaussian (gated-out front splats cost < 0.4% each),
+			// so (TG_sum / G_sum) is the footprint-weighted front transmittance
+			// even when the splat is too faint to ever reach tau_front_wsum.
+			// Dead rays never get here (`done` exits the loop), so G_sum == 0
+			// for an on-screen Gaussian means every covering pixel was cut by
+			// an occluder in front — see classify_T_light on the host side.
+			// G > 0 skips only zero-response (underflowed) pixels, which are
+			// by construction far outside the 3-sigma footprint.
+			if (tau_front_TG_sum && G > 0.0f)
+			{
+				atomicAdd(&tau_front_TG_sum[collected_id[j]], T * G);
+				atomicAdd(&tau_front_G_sum[collected_id[j]], G);
+			}
+
 			float alpha;
 			float tau_pixel = 0.0f;
 			if (use_analytic_tau)
@@ -395,11 +405,6 @@ renderCUDA(
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
-				// This pixel stops here: everything later in this tile is fully
-				// occluded along THIS ray. Flagged so the host side can tell a
-				// genuinely buried Gaussian from one nothing ever reached.
-				if (ray_cut)
-					ray_cut[pix_id] = 1;
 				done = true;
 				continue;
 			}
@@ -472,8 +477,8 @@ void FORWARD::render(
 	float* gauss_contribution,
 	float* tau_front_sum,
 	float* tau_front_wsum,
-	int32_t* tau_front_touch,
-	int32_t* ray_cut)
+	float* tau_front_TG_sum,
+	float* tau_front_G_sum)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -493,8 +498,8 @@ void FORWARD::render(
 		gauss_contribution,
 		tau_front_sum,
 		tau_front_wsum,
-		tau_front_touch,
-		ray_cut);
+		tau_front_TG_sum,
+		tau_front_G_sum);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

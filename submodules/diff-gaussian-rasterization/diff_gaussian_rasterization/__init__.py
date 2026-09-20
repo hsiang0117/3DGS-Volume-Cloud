@@ -162,14 +162,14 @@ def rasterize_lightpass(means3D, tau_precomp, scales, rotations, raster_settings
 
     Runs the analytic-tau rasterizer from a sun camera with record_front_tau
     (means3D/scales/rotations are consumed pre-detached) and returns
-    (tau_light_sum, tau_light_wsum, radii, tau_front_touch, ray_cut). Callers
-    turn the first two into T_light = exp(-sum/wsum); `radii` are the per-Gaussian
-    light-space screen radii. `tau_front_touch` counts, per Gaussian, the pixels
-    that actually reached it, and `ray_cut` flags pixels whose ray terminated
-    early — together they separate "fully occluded" from "nothing ever reached
-    it", which the weighted sum alone cannot express. Gradient flows to
-    tau_precomp only, via the dedicated CUDA lightpass backward; blend weights
-    stay frozen.
+    (tau_light_sum, tau_light_wsum, radii, tau_front_TG_sum, tau_front_G_sum).
+    Callers turn the first two into T_light = exp(-sum/wsum); `radii` are the
+    per-Gaussian light-space screen radii. TG_sum/G_sum accumulate T*G and G
+    over the pixels that reached each splat alive (before the alpha gate), so
+    TG/G is the measured front transmittance for splats too faint for wsum,
+    and G_sum == 0 with a nonzero radius means every covering pixel was
+    terminated by an occluder in front. Gradient flows to tau_precomp only,
+    via the dedicated CUDA lightpass backward; blend weights stay frozen.
     """
     return _RasterizeLightpass.apply(means3D, tau_precomp, scales, rotations, raster_settings)
 
@@ -212,17 +212,17 @@ class _RasterizeLightpass(torch.autograd.Function):
         )
         (num_rendered, _, radii, geomBuffer, binningBuffer, imgBuffer,
          _, _, tau_light_sum, tau_light_wsum,
-         tau_front_touch, ray_cut) = _C.rasterize_gaussians(*args)
+         tau_front_TG_sum, tau_front_G_sum) = _C.rasterize_gaussians(*args)
 
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(tau_precomp, geomBuffer, binningBuffer, imgBuffer)
-        ctx.mark_non_differentiable(tau_light_wsum, tau_front_touch, ray_cut)
-        return tau_light_sum, tau_light_wsum, radii, tau_front_touch, ray_cut
+        ctx.mark_non_differentiable(tau_light_wsum, tau_front_TG_sum, tau_front_G_sum)
+        return tau_light_sum, tau_light_wsum, radii, tau_front_TG_sum, tau_front_G_sum
 
     @staticmethod
     def backward(ctx, grad_tau_light_sum, _grad_wsum, _grad_radii,
-                 _grad_touch, _grad_ray_cut):
+                 _grad_TG_sum, _grad_G_sum):
         tau_precomp, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
         raster_settings = ctx.raster_settings
         dL_dtau = _C.rasterize_lightpass_backward(

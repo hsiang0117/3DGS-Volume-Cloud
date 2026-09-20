@@ -88,13 +88,12 @@ RasterizeGaussiansCUDA(
   torch::Tensor tau_front_sum = torch::zeros({do_front_tau ? P : 0}, float_opts);
   torch::Tensor tau_front_wsum = torch::zeros({do_front_tau ? P : 0}, float_opts);
 
-  // Light-pass classification probes (see forward.cu). Per-Gaussian count of
-  // pixels that reached the splat, and a per-pixel flag marking rays that
-  // terminated early. Host side uses them to tell "fully occluded" apart from
-  // "nothing ever reached it" — tau_front_wsum alone conflates the two.
-  auto int_opts_p = means3D.options().dtype(torch::kInt32);
-  torch::Tensor tau_front_touch = torch::zeros({do_front_tau ? P : 0}, int_opts_p);
-  torch::Tensor ray_cut = torch::zeros({do_front_tau ? H * W : 0}, int_opts_p);
+  // Light-pass measurement probes (see forward.cu): per-Gaussian sums of T*G
+  // and G over pixels that reached the splat alive. Host side turns them into
+  // the measured front transmittance for splats too faint for tau_front_wsum,
+  // and G_sum == 0 (with a nonzero radius) into "fully occluded from the sun".
+  torch::Tensor tau_front_TG_sum = torch::zeros({do_front_tau ? P : 0}, float_opts);
+  torch::Tensor tau_front_G_sum = torch::zeros({do_front_tau ? P : 0}, float_opts);
 
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -143,12 +142,12 @@ RasterizeGaussiansCUDA(
 		do_front_tau ? tau_front_sum.contiguous().data<float>() : nullptr,
 		do_front_tau ? tau_front_wsum.contiguous().data<float>() : nullptr,
 		antialiasing,
-		do_front_tau ? tau_front_touch.contiguous().data<int32_t>() : nullptr,
-		do_front_tau ? ray_cut.contiguous().data<int32_t>() : nullptr,
+		do_front_tau ? tau_front_TG_sum.contiguous().data<float>() : nullptr,
+		do_front_tau ? tau_front_G_sum.contiguous().data<float>() : nullptr,
 		radii.contiguous().data<int>(),
 		debug);
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution, tau_front_sum, tau_front_wsum, tau_front_touch, ray_cut);
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution, tau_front_sum, tau_front_wsum, tau_front_TG_sum, tau_front_G_sum);
 }
 
 torch::Tensor

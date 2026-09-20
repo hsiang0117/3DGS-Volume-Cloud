@@ -69,12 +69,13 @@ namespace FORWARD
 		float* gauss_contribution,
 		float* tau_front_sum,
 		float* tau_front_wsum,
-		// Light pass only (null on the camera pass): per-Gaussian count of
-		// pixels that reached the splat, and per-pixel flag set when a ray
-		// terminated early. Together they separate "fully occluded" from
-		// "nothing ever reached it", which tau_front_wsum alone cannot express.
-		int32_t* tau_front_touch,
-		int32_t* ray_cut);
+		// Light pass only (null on the camera pass): per-Gaussian sums of
+		// T*G and G over pixels that reached the splat alive, accumulated
+		// before the alpha gate. TG/G is the measured front transmittance for
+		// splats too faint for tau_front_wsum; G == 0 with a nonzero radius
+		// means every covering pixel was terminated by an occluder in front.
+		float* tau_front_TG_sum,
+		float* tau_front_G_sum);
 }
 
 

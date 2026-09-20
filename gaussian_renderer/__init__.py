@@ -221,51 +221,58 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
     # Outside no_grad: the lightpass autograd Function carries gradient from
     # tau_light_sum into tau_v_l (σ_t/scales/rotations).
     (tau_light_sum, tau_light_wsum, sun_radii,
-     tau_front_touch, ray_cut) = rasterize_lightpass(
+     tau_front_TG_sum, tau_front_G_sum) = rasterize_lightpass(
         means3D, tau_v_l.view(-1), scales, rotations, sun_settings)
 
     covered = tau_light_wsum > 1e-8
     tau_light = tau_light_sum / tau_light_wsum.clamp(min=1e-8)
     T_light = torch.exp(-tau_light)
     # wsum == 0 has TWO causes and they need opposite answers:
-    #   (A) genuinely buried — every covering pixel terminated early
-    #       (test_T < 1e-4), so a real occluder is in front  -> darken;
-    #   (B) too faint — every covering pixel skipped the splat at the
-    #       `alpha < 1/255` gate, which happens BEFORE tau_front_wsum is
-    #       accumulated. Nothing meaningful is in front      -> stay lit.
-    # tau_front_wsum alone cannot tell them apart (both are 0), so the kernel
-    # also returns `tau_front_touch` (pixels that reached the splat) and
-    # `ray_cut` (pixels whose ray terminated early). See classify_T_light.
+    #   (A) genuinely buried — every covering pixel terminated (test_T < 1e-4)
+    #       at an occluder IN FRONT of this Gaussian, so no pixel ever reached
+    #       it: TG_sum == G_sum == 0 while radii > 0        -> darken;
+    #   (B) too faint — covering pixels reached the splat alive but the
+    #       alpha < 1/255 gate (before the wsum accumulation) dropped them.
+    #       TG_sum/G_sum then holds the MEASURED footprint-weighted front
+    #       transmittance at the splat                        -> use it.
+    # G_sum > 0 is the exact alive-reached test: dead rays exit the kernel
+    # loop before the probe, and every on-screen Gaussian is visited by every
+    # alive pixel of its overlapping tiles, so G_sum == 0 with radii > 0 can
+    # only mean "cut off everywhere". See classify_T_light.
     T_light = classify_T_light(covered, T_light, sun_radii,
-                               tau_front_touch, ray_cut)
+                               tau_front_TG_sum, tau_front_G_sum)
 
     return T_light.unsqueeze(-1)
 
 
-def classify_T_light(covered, T_light, radii, touch, ray_cut,
-                     tau_occluded=1e-4):
+def classify_T_light(covered, T_light, radii, front_TG_sum, front_G_sum,
+                    tau_occluded=1e-4, g_eps=1e-12):
     """Resolve per-Gaussian solar transmittance from the light-pass outputs.
 
     Truth table (COVERED and NOT-COVERED are complementary, so this collapses
     to two branches):
 
-      covered                                           -> exp(-tau_front)
-      not covered, touched, some ray cut, has footprint -> tau_occluded
-      otherwise (culled, sub-pixel, or too faint)       -> 1.0
-
-    The middle row is why the two probes exist: `touched` alone would confuse
-    "occluded" with "too faint to be accumulated", and `ray_cut` supplies the
-    positive evidence that something really did block the light.
+      covered                                 -> exp(-tau_front_sum/wsum)
+      not covered, G_sum > 0                  -> front_TG_sum / front_G_sum
+                                                 (measured front transmittance:
+                                                  covers "too faint", "rays
+                                                  terminated AT the splat", and
+                                                  every mix of the two)
+      not covered, G_sum == 0, radii > 0      -> tau_occluded  (buried: every
+                                                 covering pixel was cut by an
+                                                 occluder in front)
+      otherwise (culled / off-frustum)       -> 1.0
     """
     covered = covered.bool()
-    touched = touch > 0
-    any_cut = bool((ray_cut > 0).any().item())
-    buried = (~covered) & (radii > 0) & touched & any_cut
+    reached = front_G_sum > g_eps
+    T_measured = (front_TG_sum / front_G_sum.clamp(min=g_eps)).clamp(0.0, 1.0)
+    buried = (~covered) & (~reached) & (radii > 0)
     return torch.where(
         covered,
         T_light,
-        torch.where(buried, torch.full_like(T_light, tau_occluded),
-                    torch.ones_like(T_light)),
+        torch.where(reached, T_measured,
+                    torch.where(buried, torch.full_like(T_light, tau_occluded),
+                                torch.ones_like(T_light))),
     )
 
 
