@@ -56,11 +56,16 @@ namespace CudaRasterizer
 			float* tau_front_sum,
 			float* tau_front_wsum,
 			bool antialiasing,
+			// Light-pass classification probes (see forward.cu / forward.h).
+			// Placed after antialiasing so no defaulted parameter follows them.
+			int32_t* tau_front_touch,
+			int32_t* ray_cut,
 			int* radii = nullptr,
 			bool debug = false);
 
 		// Backward of the record_front_tau light pass: dL/d(tau_front_sum) ->
-		// dL/d(tau_precomp) of occluders, replaying the saved buffers.
+		// dL/d(con_o.w), the packed scalar, of occluders; replays the saved
+		// buffers. Equals dL/d(tau_precomp) only while antialiasing is off.
 		static void lightpassBackward(
 			const int P, const int R,
 			const int width, const int height,

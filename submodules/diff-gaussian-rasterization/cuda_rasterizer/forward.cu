@@ -291,7 +291,9 @@ renderCUDA(
 	float* __restrict__ invdepth,
 	float* __restrict__ gauss_contribution,
 	float* __restrict__ tau_front_sum,
-	float* __restrict__ tau_front_wsum)
+	float* __restrict__ tau_front_wsum,
+	int32_t* __restrict__ tau_front_touch,
+	int32_t* __restrict__ ray_cut)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -325,8 +327,10 @@ renderCUDA(
 
 	float expected_invdepth = 0.0f;
 
-	// Analytic optical depth accumulated along this pixel's ray: the exact sum
-	// of tau_pixel, tracked separately from T.
+	// Analytic optical depth accumulated along this pixel's ray, tracked
+	// separately from T. NOT the ray's exact optical depth: `tau_accum +=
+	// tau_pixel` sits after the `alpha < 1/255` skip and after the early-out on
+	// test_T, so it sums only the splats that survive both.
 	float tau_accum = 0.0f;
 
 	// Iterate over batches until all done or range is complete
@@ -363,6 +367,14 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
+			// Light-pass coverage probe: this pixel actually processed this
+			// splat (it is inside the ellipse), so record that the Gaussian was
+			// reached. Must sit BEFORE the alpha<1/255 gate below — that gate is
+			// exactly what makes a "too faint to matter" occlusion numerically
+			// indistinguishable from "no occlusion" in tau_front_wsum.
+			if (tau_front_touch)
+				atomicAdd(&tau_front_touch[collected_id[j]], 1);
+
 			const float G = exp(power);
 			float alpha;
 			float tau_pixel = 0.0f;
@@ -383,6 +395,11 @@ renderCUDA(
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
+				// This pixel stops here: everything later in this tile is fully
+				// occluded along THIS ray. Flagged so the host side can tell a
+				// genuinely buried Gaussian from one nothing ever reached.
+				if (ray_cut)
+					ray_cut[pix_id] = 1;
 				done = true;
 				continue;
 			}
@@ -454,7 +471,9 @@ void FORWARD::render(
 	float* depth,
 	float* gauss_contribution,
 	float* tau_front_sum,
-	float* tau_front_wsum)
+	float* tau_front_wsum,
+	int32_t* tau_front_touch,
+	int32_t* ray_cut)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -473,7 +492,9 @@ void FORWARD::render(
 		depth,
 		gauss_contribution,
 		tau_front_sum,
-		tau_front_wsum);
+		tau_front_wsum,
+		tau_front_touch,
+		ray_cut);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

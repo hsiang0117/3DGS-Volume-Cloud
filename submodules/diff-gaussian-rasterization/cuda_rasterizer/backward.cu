@@ -414,7 +414,8 @@ __global__ void preprocessCUDA(
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot,
-	float* dL_dopacity)
+	float* /* dL_dopacity: unused here — the packed-input gradient is written by
+	                   the render kernel, not by this preprocess kernel */)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -467,6 +468,9 @@ renderCUDA(
 	const float* __restrict__ dL_invdepths,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
+	// Exactly one of these two receives the packed-input gradient, chosen by
+	// use_analytic_tau below: dL_dtau in the analytic branch, dL_dopacity in the
+	// classic one. (The same parameter name in preprocessCUDA is unused there.)
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dtau,
 	float* __restrict__ dL_dcolors,
@@ -728,12 +732,19 @@ void BACKWARD::preprocess(
 //
 // Blend weights w are frozen (footprint-shape effects); the only gradient
 // path is through tau_accum:
-//     dL/d(tau_precomp_i) = sum_pixels  G_i(p) * S_i(p),
+//     dL/d(con_o.w_i) = sum_pixels  G_i(p) * S_i(p),
 //     S_i(p) = sum_{j behind i, recorded at p}  w_j * gsum_j,
 // where gsum_j is the incoming dL/d(tau_front_sum[j]). S accumulates in a
 // single back-to-front replay: when Gaussian i is visited S holds the sum
 // over Gaussians behind it; apply G_i * S, then fold i's own w_i * gsum_i
 // into S.
+// NOTE: this returns the gradient w.r.t. the PACKED scalar con_o.w, not w.r.t.
+// tau_precomp. The forward stores con_o.w = tau_precomp * h_convolution_scaling
+// (forward.cu), and the MAIN backward path folds that factor in via
+// computeCov2DCUDA — this kernel has no equivalent step. The two agree only
+// while antialiasing is off (h_convolution_scaling == 1), which is the case at
+// both call sites today. Enabling antialiasing on a light pass without adding
+// the scaling here would silently bias the light-pass gradient.
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 lightpassBackwardCUDA(
 	const uint2* __restrict__ ranges,

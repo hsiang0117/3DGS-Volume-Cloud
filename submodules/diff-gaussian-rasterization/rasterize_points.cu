@@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& bg_image,
@@ -88,6 +88,14 @@ RasterizeGaussiansCUDA(
   torch::Tensor tau_front_sum = torch::zeros({do_front_tau ? P : 0}, float_opts);
   torch::Tensor tau_front_wsum = torch::zeros({do_front_tau ? P : 0}, float_opts);
 
+  // Light-pass classification probes (see forward.cu). Per-Gaussian count of
+  // pixels that reached the splat, and a per-pixel flag marking rays that
+  // terminated early. Host side uses them to tell "fully occluded" apart from
+  // "nothing ever reached it" — tau_front_wsum alone conflates the two.
+  auto int_opts_p = means3D.options().dtype(torch::kInt32);
+  torch::Tensor tau_front_touch = torch::zeros({do_front_tau ? P : 0}, int_opts_p);
+  torch::Tensor ray_cut = torch::zeros({do_front_tau ? H * W : 0}, int_opts_p);
+
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
@@ -135,10 +143,12 @@ RasterizeGaussiansCUDA(
 		do_front_tau ? tau_front_sum.contiguous().data<float>() : nullptr,
 		do_front_tau ? tau_front_wsum.contiguous().data<float>() : nullptr,
 		antialiasing,
+		do_front_tau ? tau_front_touch.contiguous().data<int32_t>() : nullptr,
+		do_front_tau ? ray_cut.contiguous().data<int32_t>() : nullptr,
 		radii.contiguous().data<int>(),
 		debug);
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution, tau_front_sum, tau_front_wsum);
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, gauss_contribution, tau_front_sum, tau_front_wsum, tau_front_touch, ray_cut);
 }
 
 torch::Tensor

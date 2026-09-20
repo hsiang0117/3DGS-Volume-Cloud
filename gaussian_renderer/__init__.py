@@ -17,6 +17,12 @@ from utils.general_utils import build_rotation
 from utils.graphics_utils import getProjectionMatrix
 
 
+# One-shot latch for the "learnable tonemap requested but tonemap.json missing"
+# warning below: render() runs once per frame, so an unlatched print would flood
+# an eval run with 150+ identical lines.
+_WARNED_MISSING_TONEMAP = False
+
+
 def normalized_gaussian_line_integral(scales, dirs_local):
     """
     Center-line integral of a normalized 3D Gaussian along a unit direction.
@@ -214,20 +220,53 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
 
     # Outside no_grad: the lightpass autograd Function carries gradient from
     # tau_light_sum into tau_v_l (σ_t/scales/rotations).
-    tau_light_sum, tau_light_wsum, sun_radii = rasterize_lightpass(
+    (tau_light_sum, tau_light_wsum, sun_radii,
+     tau_front_touch, ray_cut) = rasterize_lightpass(
         means3D, tau_v_l.view(-1), scales, rotations, sun_settings)
 
     covered = tau_light_wsum > 1e-8
     tau_light = tau_light_sum / tau_light_wsum.clamp(min=1e-8)
     T_light = torch.exp(-tau_light)
-    # wsum==0 with a valid on-screen footprint (radii>0) means every covering
-    # pixel early-terminated (T < 1e-4) before reaching this Gaussian, so it is
-    # fully shadowed; culled Gaussians stay unlit-neutral at T=1.
-    buried = (~covered) & (sun_radii > 0)
-    T_light = torch.where(buried, torch.full_like(T_light, 1e-4), T_light)
-    T_light = torch.where(covered | buried, T_light, torch.ones_like(T_light))
+    # wsum == 0 has TWO causes and they need opposite answers:
+    #   (A) genuinely buried — every covering pixel terminated early
+    #       (test_T < 1e-4), so a real occluder is in front  -> darken;
+    #   (B) too faint — every covering pixel skipped the splat at the
+    #       `alpha < 1/255` gate, which happens BEFORE tau_front_wsum is
+    #       accumulated. Nothing meaningful is in front      -> stay lit.
+    # tau_front_wsum alone cannot tell them apart (both are 0), so the kernel
+    # also returns `tau_front_touch` (pixels that reached the splat) and
+    # `ray_cut` (pixels whose ray terminated early). See classify_T_light.
+    T_light = classify_T_light(covered, T_light, sun_radii,
+                               tau_front_touch, ray_cut)
 
     return T_light.unsqueeze(-1)
+
+
+def classify_T_light(covered, T_light, radii, touch, ray_cut,
+                     tau_occluded=1e-4):
+    """Resolve per-Gaussian solar transmittance from the light-pass outputs.
+
+    Truth table (COVERED and NOT-COVERED are complementary, so this collapses
+    to two branches):
+
+      covered                                           -> exp(-tau_front)
+      not covered, touched, some ray cut, has footprint -> tau_occluded
+      otherwise (culled, sub-pixel, or too faint)       -> 1.0
+
+    The middle row is why the two probes exist: `touched` alone would confuse
+    "occluded" with "too faint to be accumulated", and `ray_cut` supplies the
+    positive evidence that something really did block the light.
+    """
+    covered = covered.bool()
+    touched = touch > 0
+    any_cut = bool((ray_cut > 0).any().item())
+    buried = (~covered) & (radii > 0) & touched & any_cut
+    return torch.where(
+        covered,
+        T_light,
+        torch.where(buried, torch.full_like(T_light, tau_occluded),
+                    torch.ones_like(T_light)),
+    )
 
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, override_color = None, precomputed_T_light=None, bg_image=None):
@@ -379,7 +418,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # coeffs, e pinned); tonemap_aces -> fixed Narkowicz constants. Either means
     # HDR-linear shading, so the per-Gaussian clamp is lifted to 16.
     tonemap_learn = bool(getattr(pipe, "tonemap_learnable", False)) and pc.get_tonemap_coeffs is not None
-    tonemap_on = tonemap_learn or bool(getattr(pipe, "tonemap_aces", False))
+    tonemap_aces = bool(getattr(pipe, "tonemap_aces", False))
+    # A run configured with --tonemap_learnable --no-tonemap_aces whose
+    # tonemap.json sidecar is missing would otherwise go SILENTLY LINEAR here,
+    # changing the output space that metrics are computed in. Fall back to the
+    # fixed curve instead, and say so: it is a graceful degradation, not a
+    # faithful evaluation of the trained model.
+    if (bool(getattr(pipe, "tonemap_learnable", False)) and pc.get_tonemap_coeffs is None
+            and not tonemap_aces):
+        global _WARNED_MISSING_TONEMAP
+        if not _WARNED_MISSING_TONEMAP:
+            _WARNED_MISSING_TONEMAP = True
+            print("[render] pipe requests the learnable tonemap but the model has no "
+                  "tonemap.json coeffs; falling back to fixed Narkowicz ACES — metrics "
+                  "below are NOT a faithful evaluation of the trained tonemap. "
+                  "(reported once per process)")
+        tonemap_aces = True
+    tonemap_on = tonemap_learn or tonemap_aces
     if override_color is not None:
         colors_precomp = override_color
     elif tonemap_on:

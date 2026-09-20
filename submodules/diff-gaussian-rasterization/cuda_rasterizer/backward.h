@@ -21,8 +21,9 @@
 namespace BACKWARD
 {
 	// Backward of the light-space front-tau recording: propagates
-	// dL/d(tau_front_sum) into dL/d(tau_precomp) of all occluders in front,
-	// with blend weights frozen.
+	// dL/d(tau_front_sum) into dL/d(con_o.w) — the packed scalar — of all
+	// occluders in front, with blend weights frozen. See the definition in
+	// backward.cu: con_o.w == tau_precomp only while antialiasing is off.
 	void lightpass(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,

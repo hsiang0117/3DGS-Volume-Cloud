@@ -68,7 +68,13 @@ namespace FORWARD
 		float* depth,
 		float* gauss_contribution,
 		float* tau_front_sum,
-		float* tau_front_wsum);
+		float* tau_front_wsum,
+		// Light pass only (null on the camera pass): per-Gaussian count of
+		// pixels that reached the splat, and per-pixel flag set when a ray
+		// terminated early. Together they separate "fully occluded" from
+		// "nothing ever reached it", which tau_front_wsum alone cannot express.
+		int32_t* tau_front_touch,
+		int32_t* ray_cut);
 }
 
 

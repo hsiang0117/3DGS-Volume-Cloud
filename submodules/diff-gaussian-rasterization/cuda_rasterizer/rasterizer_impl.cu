@@ -226,6 +226,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* tau_front_sum,
 	float* tau_front_wsum,
 	bool antialiasing,
+	int32_t* tau_front_touch,
+	int32_t* ray_cut,
 	int* radii,
 	bool debug)
 {
@@ -351,7 +353,9 @@ int CudaRasterizer::Rasterizer::forward(
 		depth,
 		gauss_contribution,
 		tau_front_sum,
-		tau_front_wsum), debug)
+		tau_front_wsum,
+		tau_front_touch,
+		ray_cut), debug)
 
 	return num_rendered;
 }
@@ -443,7 +447,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const bool use_analytic_tau = tau_precomp != nullptr;
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
-	// opacity and RGB of Gaussians from per-pixel loss gradients.
+	// the packed input (OPACITY, or TAU when use_analytic_tau) and RGB of
+	// Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(BACKWARD::render(
