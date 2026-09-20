@@ -217,7 +217,9 @@ def _load_train_transforms(ply_path: str) -> tuple[dict | None, str | None]:
                 candidates.append(os.path.join(m.group(1), "transforms_train.json"))
         except Exception:
             pass
-    candidates.append("data/CloudDataset/transforms_train.json")
+    # Last-resort fallback only; the cfg_args source_path above is tried first
+    # and this repo always writes it. Point at the dataset actually in-repo.
+    candidates.append("data/CloudDatasetUniform/transforms_train.json")
     for p in candidates:
         if p and os.path.exists(p):
             try:
@@ -267,15 +269,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ply", required=True, help="Path to trained .ply (point_cloud.ply).")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--width", type=int, default=1024, help="Render resolution width.")
-    parser.add_argument("--height", type=int, default=768, help="Render resolution height.")
+    parser.add_argument("--width", type=int, default=None,
+                        help="Initial value of the 'Max render size' slider (cap on the rendered "
+                             "longer side). The render itself matches the browser canvas, so this "
+                             "only seeds the slider; omit to use the built-in default.")
+    parser.add_argument("--height", type=int, default=768,
+                        help="Unused: the viewport follows the browser canvas aspect and is capped "
+                             "by the 'Max render size' slider. Accepted for compatibility.")
     parser.add_argument("--bg", choices=["black", "white"], default="black")
     parser.add_argument("--cameras_json", default=None,
-                        help="Optional explicit path to cameras.json (auto-located next to PLY by default).")
+                        help="Optional explicit path to cameras.json. By default it is looked up "
+                             "in the RUN directory — the third level above the PLY "
+                             "(<run>/point_cloud/iteration_N/point_cloud.ply), which is where "
+                             "Scene writes it — not beside the PLY itself.")
     parser.add_argument("--tlight", choices=["auto", "voxel", "raster"], default="auto",
                         help="T_light source. 'auto' (default) reads the training run's cfg_args "
-                             "next to the PLY and matches what the model was trained with; "
-                             "'voxel' = 128^3 grid cache, 'raster' = light-space shadow pass.")
+                             "(same RUN directory as above) and matches what the model was "
+                             "trained with; 'voxel' = 128^3 grid cache, "
+                             "'raster' = light-space shadow pass.")
     parser.add_argument("--tonemap", choices=["auto", "on", "off"], default="auto",
                         help="Output tonemap. 'auto' (default) reads tonemap_aces / tonemap_learnable "
                              "from the run's cfg_args and uses the curve the model was trained with "
@@ -284,7 +295,9 @@ def main():
                              "bright / low-contrast without it.")
     parser.add_argument("--sky_dir", default=None,
                         help="Optional directory of captured HDR sky cubemaps "
-                             "(sky.json + sky_alt*_*.exr from tools/ue_capture_sky_backdrop.py). "
+                             "(sky.json manifest + sky_alt*_*.exr faces, linear "
+                             "SceneColorHDR, captured from UE at one 6-face cube "
+                             "per sun elevation). "
                              "Enables the 'Sky backdrop' checkbox: the flat background is replaced "
                              "by the per-sun-elevation sky, composited behind the cloud.")
     parser.add_argument("--sky_exposure", type=float, default=3.35,
@@ -297,7 +310,12 @@ def main():
 
     # T_light source (must match the model's training-time shadow field), from
     # cfg_args: tlight_voxel=True -> voxel; else tlight_raster=True -> raster.
-    use_raster_tlight = args.tlight == "raster"
+    # With NO cfg_args we must fall back to the PROJECT defaults, not to an
+    # arbitrary legacy branch: arguments.PipelineParams has tlight_voxel=False
+    # (light-space raster is the trained default path) and tonemap_aces=True.
+    # Seed with the project default, then let cfg_args override it; `voxel` is
+    # only ever selected by an explicit flag or by a cfg that says so.
+    use_raster_tlight = True
     tlight_raster_res = 512
     # Tonemap: cfg flags say whether a curve was trained and which kind; learnable
     # coeffs are confirmed after load_ply (tonemap.json sidecar).
@@ -313,25 +331,46 @@ def main():
                 with open(cfg_path) as f:
                     cfg = f.read()
             except Exception as e:
-                print(f"[viewer] cfg_args unreadable ({e}); using defaults.")
+                print(f"[viewer] cfg_args unreadable ({e}); falling back to the PROJECT "
+                      f"defaults for T_light / tonemap — pass --tlight and --tonemap "
+                      f"explicitly if this model was not trained with them.")
         else:
-            print("[viewer] No cfg_args found next to PLY; using defaults.")
-    if args.tlight == "auto":
+            print(f"[viewer] No cfg_args in {run_dir}; falling back to the PROJECT "
+                  f"defaults for T_light / tonemap — pass --tlight and --tonemap "
+                  f"explicitly if this model was not trained with them.")
+    if args.tlight == "voxel":
+        use_raster_tlight = False  # explicit flag always wins
+    elif args.tlight == "auto":
         if cfg is not None:
             if "tlight_voxel" in cfg:
                 use_raster_tlight = "tlight_voxel=True" not in cfg
             else:
                 use_raster_tlight = "tlight_raster=True" in cfg
-            m = re.search(r"tlight_raster_res=(\d+)", cfg)
-            if m:
-                tlight_raster_res = int(m.group(1))
-        else:
-            use_raster_tlight = False  # no cfg -> voxel
+        # else: keep the project default already set above (raster). Do NOT fall
+        # back to the voxel cache — that is a legacy path, not the default, and
+        # silently choosing it renders a shadow field the model never saw.
+    # Raster shadow resolution is a property of the SOURCE, not of "auto":
+    # whenever the raster pass is used (default, cfg, or an explicit
+    # --tlight raster), take the resolution the model was trained with.
+    # Purely informational when raster is not used.
     if cfg is not None:
-        # These flags only appear in cfg_args of tonemapped runs; absence means
-        # a linear-space model.
+        m = re.search(r"tlight_raster_res=(\d+)", cfg)
+        if m:
+            v = int(m.group(1))
+            if 64 <= v <= 4096:
+                tlight_raster_res = v
+            else:
+                print(f"[viewer] ignoring implausible tlight_raster_res={v} from "
+                      f"cfg_args; using {tlight_raster_res}^2.")
+    if cfg is not None:
+        # Every PipelineParams is persisted, so a linear-space run records
+        # tonemap_aces=False rather than omitting the flag; only a legacy
+        # cfg_args can predate them.
         cfg_tonemap_aces = "tonemap_aces=True" in cfg
         cfg_tonemap_learnable = "tonemap_learnable=True" in cfg
+    elif args.tonemap == "auto":
+        # No cfg: use the project default (ACES on), not "no tonemap".
+        cfg_tonemap_aces = True
     print(f"[viewer] T_light source: {'raster' if use_raster_tlight else 'voxel'}"
           f"{f' ({tlight_raster_res}^2)' if use_raster_tlight else ''}")
 
@@ -342,9 +381,17 @@ def main():
     print(f"[viewer] Loaded {P} Gaussians.")
 
     # A learnable model is only usable if load_ply restored its tonemap.json
-    # coeffs; otherwise fall back to the fixed-ACES flag.
+    # coeffs; otherwise fall back to the fixed-ACES curve — the config asked for
+    # a curve, and ACES is a closer stand-in than no tonemap at all.
     has_learnable = gaussians.get_tonemap_coeffs is not None
     tonemap_learnable = cfg_tonemap_learnable and has_learnable
+    if (cfg_tonemap_learnable and not has_learnable
+            and forced_tonemap is not False):
+        if not cfg_tonemap_aces:
+            print("[viewer] cfg asks for the learnable tonemap but tonemap.json is "
+                  "missing; falling back to fixed Narkowicz ACES "
+                  "(override with --tonemap off / --tonemap on).")
+        cfg_tonemap_aces = True
     if forced_tonemap is None:
         tonemap_on = tonemap_learnable or cfg_tonemap_aces
     else:
@@ -358,13 +405,25 @@ def main():
     else:
         print(f"[viewer] Output tonemap: linear (clamp)")
 
-    # Stage-2 environment lighting: enabled iff load_ply restored the env sidecars
-    # (env_net.pt + sky_transfer.npy). The sun slider then drives T_sun + E_lm;
-    # V_lm is the sun-independent precomputed transfer.
+    # Stage-2 environment lighting: enabled iff load_ply restored ALL THREE env
+    # sidecars (env.json + env_net.pt + sky_transfer.npy) — the restore in
+    # GaussianModel.load_ply gates on all three. The sun slider then drives
+    # T_sun + E_lm; V_lm is the sun-independent precomputed transfer.
     has_env = env_on = (gaussians.env_net is not None) and (gaussians._sky_transfer.numel() > 0)
-    print(f"[viewer] Environment lighting: ON (SH{gaussians.env_sh_order}, "
-          f"V_lm {tuple(gaussians._sky_transfer.shape)})" if has_env
-          else "[viewer] Environment lighting: none (Stage-1 model)")
+    if has_env:
+        print(f"[viewer] Environment lighting: ON (SH{gaussians.env_sh_order}, "
+              f"V_lm {tuple(gaussians._sky_transfer.shape)})")
+    else:
+        # Do not assert "Stage-1" outright: a Stage-2 run whose sidecars are
+        # incomplete lands here too, and calling that a Stage-1 model would
+        # contradict what the run actually is.
+        sidecar_dir = os.path.dirname(os.path.abspath(args.ply))
+        present = [n for n in ("env.json", "env_net.pt", "sky_transfer.npy")
+                   if os.path.exists(os.path.join(sidecar_dir, n))]
+        partial = f" — but {len(present)}/3 env sidecars are present here " \
+                  f"({', '.join(present)}); this looks like a Stage-2 run with " \
+                  f"incomplete sidecars, so env is OFF." if present else ""
+        print(f"[viewer] Environment lighting: none (Stage-1 model){partial}")
 
     initial_sun = _spherical_to_dir(altitude_deg=90.0, azimuth_deg=0.0)  # straight up
     print(f"[viewer] Precomputing T_light (sun={initial_sun.tolist()}) ...")
@@ -554,7 +613,8 @@ def main():
              "Changes auto-recompute T_light (~0.5s lag).",
     )
     gui_res = server.gui.add_slider(
-        "Max render size", min=256, max=3840, step=32, initial_value=max(args.width, 1920),
+        "Max render size", min=256, max=3840, step=32,
+        initial_value=max(args.width, 1920) if args.width is not None else 1920,
         hint="Upper bound on the rendered longer-side resolution. The render matches "
              "the browser canvas's true pixel size (aspect follows the window), capped "
              "here to bound GPU cost on large windows. Lower it if the frame rate drops.",
