@@ -238,6 +238,8 @@ def main():
             raise ValueError('Learnable tonemap requested, but coefficients failed to load')
         pipe = argparse.Namespace(tlight_voxel=cfg.get('tlight_voxel', False),
                                   tlight_raster_res=cfg.get('tlight_raster_res', 512),
+                                  tlight_tau_filter=cfg.get('tlight_tau_filter', False),
+                                  tlight_full_grad=cfg.get('tlight_full_grad', False),
                                   tonemap_aces=cfg.get('tonemap_aces', False),
                                   tonemap_learnable=cfg.get('tonemap_learnable', False),
                                   env_lighting=use_env, env_sh_order=model.env_sh_order)

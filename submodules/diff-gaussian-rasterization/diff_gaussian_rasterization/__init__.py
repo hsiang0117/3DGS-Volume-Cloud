@@ -89,6 +89,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
             raster_settings.antialiasing,
             raster_settings.record_front_tau,
+            raster_settings.light_tau_filter,
             raster_settings.debug
         )
 
@@ -157,26 +158,30 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         return grads
 
-def rasterize_lightpass(means3D, tau_precomp, scales, rotations, raster_settings):
+def rasterize_lightpass(means3D, tau_precomp, scales, rotations, raster_settings, full_grad=False):
     """Light-space shadow pass with a differentiable tau path.
 
     Runs the analytic-tau rasterizer from a sun camera with record_front_tau
-    (means3D/scales/rotations are consumed pre-detached) and returns
+    and returns
     (tau_light_sum, tau_light_wsum, radii, tau_front_TG_sum, tau_front_G_sum).
     Callers turn the first two into T_light = exp(-sum/wsum); `radii` are the
     per-Gaussian light-space screen radii. TG_sum/G_sum accumulate T*G and G
     over the pixels that reached each splat alive (before the alpha gate), so
     TG/G is the measured front transmittance for splats too faint for wsum,
     and G_sum == 0 with a nonzero radius means every covering pixel was
-    terminated by an occluder in front. Gradient flows to tau_precomp only,
-    via the dedicated CUDA lightpass backward; blend weights stay frozen.
+    terminated by an occluder in front. By default, only tau_precomp receives
+    the partial front-tau derivative with blend weights frozen. full_grad=True
+    differentiates S/W, TG/G, blend weights, tau, and projected geometry,
+    holding framing, sorting, discrete support, and classification fixed.
     """
-    return _RasterizeLightpass.apply(means3D, tau_precomp, scales, rotations, raster_settings)
+    if raster_settings.antialiasing:
+        raise ValueError("Light-pass experiments require camera AA disabled")
+    return _RasterizeLightpass.apply(means3D, tau_precomp, scales, rotations, raster_settings, full_grad)
 
 
 class _RasterizeLightpass(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, means3D, tau_precomp, scales, rotations, raster_settings):
+    def forward(ctx, means3D, tau_precomp, scales, rotations, raster_settings, full_grad):
         device = means3D.device
         dtype = means3D.dtype
         P = means3D.shape[0]
@@ -207,7 +212,8 @@ class _RasterizeLightpass(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.antialiasing,
-            True,   # record_front_tau: always on for this pass, not read from settings
+            True,   # record_front_tau
+            raster_settings.light_tau_filter,
             raster_settings.debug,
         )
         (num_rendered, _, radii, geomBuffer, binningBuffer, imgBuffer,
@@ -216,15 +222,29 @@ class _RasterizeLightpass(torch.autograd.Function):
 
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(tau_precomp, geomBuffer, binningBuffer, imgBuffer)
-        ctx.mark_non_differentiable(tau_light_wsum, tau_front_TG_sum, tau_front_G_sum)
+        ctx.full_grad = bool(full_grad)
+        ctx.save_for_backward(tau_precomp, geomBuffer, binningBuffer, imgBuffer, means3D, scales, rotations, radii)
+        ctx.mark_non_differentiable(radii)
+        if not full_grad:
+            ctx.mark_non_differentiable(tau_light_wsum, tau_front_TG_sum, tau_front_G_sum)
         return tau_light_sum, tau_light_wsum, radii, tau_front_TG_sum, tau_front_G_sum
 
     @staticmethod
     def backward(ctx, grad_tau_light_sum, _grad_wsum, _grad_radii,
                  _grad_TG_sum, _grad_G_sum):
-        tau_precomp, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        tau_precomp, geomBuffer, binningBuffer, imgBuffer, means3D, scales, rotations, radii = ctx.saved_tensors
         raster_settings = ctx.raster_settings
+        if ctx.full_grad:
+            gradients = [grad_tau_light_sum, _grad_wsum, _grad_TG_sum, _grad_G_sum]
+            gradients = [torch.zeros_like(tau_precomp) if g is None else g.contiguous() for g in gradients]
+            gm, gt, gs, gr = _C.rasterize_lightpass_backward_full(
+                means3D, tau_precomp, scales, rotations, radii,
+                raster_settings.viewmatrix, raster_settings.projmatrix, raster_settings.campos,
+                raster_settings.tanfovx, raster_settings.tanfovy,
+                raster_settings.image_height, raster_settings.image_width,
+                *gradients, geomBuffer, ctx.num_rendered, binningBuffer, imgBuffer,
+                raster_settings.light_tau_filter, raster_settings.debug)
+            return gm, gt, gs, gr, None, None
         dL_dtau = _C.rasterize_lightpass_backward(
             tau_precomp,
             grad_tau_light_sum.contiguous(),
@@ -236,7 +256,7 @@ class _RasterizeLightpass(torch.autograd.Function):
             imgBuffer,
             raster_settings.debug,
         )
-        return None, dL_dtau, None, None, None
+        return None, dL_dtau, None, None, None, None
 
 
 class GaussianRasterizationSettings(NamedTuple):
@@ -262,6 +282,7 @@ class GaussianRasterizationSettings(NamedTuple):
     # sky backdrop sets this so the rasterizer composites cloud-over-sky in one
     # pass. None -> constant `bg` (training path, unchanged). Forward-only.
     bg_image : torch.Tensor = None
+    light_tau_filter : bool = False
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

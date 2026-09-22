@@ -46,6 +46,8 @@ g = GaussianModel()
 g.load_ply(ply)
 env_lighting = (g.env_net is not None) and (g._sky_transfer.numel() > 0)
 pipe = Namespace(tlight_voxel=not use_raster, tlight_raster_res=raster_res,
+                 tlight_tau_filter="tlight_tau_filter=True" in cfg,
+                 tlight_full_grad="tlight_full_grad=True" in cfg,
                  tonemap_aces="tonemap_aces=True" in cfg,
                  tonemap_learnable="tonemap_learnable=True" in cfg,
                  env_lighting=env_lighting, env_sh_order=g.env_sh_order)

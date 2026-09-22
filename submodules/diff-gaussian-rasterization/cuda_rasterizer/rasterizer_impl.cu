@@ -164,6 +164,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
+	obtain(chunk, geom.light_filter_scale, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
@@ -177,6 +178,8 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	ImageState img;
 	obtain(chunk, img.accum_alpha, N, 128);
 	obtain(chunk, img.n_contrib, N, 128);
+	obtain(chunk, img.n_probed, N, 128);
+	obtain(chunk, img.accum_tau, N, 128);
 	obtain(chunk, img.ranges, N, 128);
 	return img;
 }
@@ -228,6 +231,7 @@ int CudaRasterizer::Rasterizer::forward(
 	bool antialiasing,
 	float* tau_front_TG_sum,
 	float* tau_front_G_sum,
+	bool light_tau_filter,
 	int* radii,
 	bool debug)
 {
@@ -285,7 +289,9 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered,
-		antialiasing
+		antialiasing,
+		light_tau_filter,
+		geomState.light_filter_scale
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
@@ -355,7 +361,9 @@ int CudaRasterizer::Rasterizer::forward(
 		tau_front_sum,
 		tau_front_wsum,
 		tau_front_TG_sum,
-		tau_front_G_sum), debug)
+		tau_front_G_sum,
+		tau_front_sum ? imgState.n_probed : nullptr,
+		tau_front_sum ? imgState.accum_tau : nullptr), debug)
 
 	return num_rendered;
 }
@@ -389,6 +397,7 @@ void CudaRasterizer::Rasterizer::lightpassBackward(
 		imgState.n_contrib,
 		grad_tau_front_sum,
 		dL_dtau), debug);
+	CHECK_CUDA(BACKWARD::scaleLightTauGradient(P, geomState.light_filter_scale, dL_dtau), debug);
 }
 
 // Produce necessary gradients for optimization, corresponding
@@ -504,4 +513,31 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot,
 		antialiasing), debug);
+}
+
+void CudaRasterizer::Rasterizer::lightpassBackwardFull(
+    int P, int R, int width, int height,
+    const float* means, const float* tau, const float* scales, const float* rotations,
+    const int* radii, const float* view, const float* proj, const float* campos,
+    float tan_fovx, float tan_fovy,
+    char* geom_buffer, char* binning_buffer, char* image_buffer,
+    const float* gs, const float* gw, const float* gtg, const float* gg,
+    float* dmean2D, float* dconic, float* dtau, float* dmeans,
+    float* dcov, float* dscale, float* drot, bool light_tau_filter, bool debug)
+{
+    GeometryState geom = GeometryState::fromChunk(geom_buffer, P);
+    BinningState bin = BinningState::fromChunk(binning_buffer, R);
+    ImageState img = ImageState::fromChunk(image_buffer, width * height);
+    const dim3 grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+    const dim3 block(BLOCK_X, BLOCK_Y, 1);
+    CHECK_CUDA(BACKWARD::lightpassFull(grid, block, img.ranges, bin.point_list,
+        width, height, geom.means2D, geom.conic_opacity, img.accum_alpha,
+        img.n_contrib, img.n_probed, img.accum_tau, gs, gw, gtg, gg,
+        (float3*)dmean2D, (float4*)dconic, dtau), debug);
+    CHECK_CUDA(BACKWARD::preprocess(P, 0, 0, (const float3*)means, radii,
+        nullptr, geom.clamped, tau, (const glm::vec3*)scales, (const glm::vec4*)rotations,
+        1.0f, geom.cov3D, view, proj, width/(2.0f*tan_fovx), height/(2.0f*tan_fovy),
+        tan_fovx, tan_fovy, (const glm::vec3*)campos, (const float3*)dmean2D,
+        dconic, nullptr, dtau, (glm::vec3*)dmeans, nullptr, dcov, nullptr,
+        (glm::vec3*)dscale, (glm::vec4*)drot, false, light_tau_filter, true), debug);
 }

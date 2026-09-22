@@ -42,7 +42,7 @@ T_light = 每个高斯沿太阳方向的"前方遮挡透射率"。默认实现�
 
 - 远距窄 FOV 透视相机伪装方向光太阳(视差 <2%,免改 EWA 雅可比);
 - CUDA `record_front_tau` 通道:深度序遍历中,每高斯记录其前方累积 τ 的 α·T 加权均值(整个向阳 footprint 上的能量加权,而非中心点采样);
-- **原生可微 backward**(`lightpassBackwardCUDA`):back-to-front 重放 + 运行和,把 dL/dτ_light 传播给前方所有遮挡者;完整几何梯度(σ_t 和 σ_d 经 scale/rotation)默认开启;
+- **原生可微 backward**:默认保留旧的部分梯度(τ 路径,权重与光照足迹冻结);`--tlight_full_grad` 补齐权重、归一化、弱密度备用透射率及投影位置/尺度/旋转的连续梯度。太阳相机构图、排序、覆盖与阈值分支仍视为常量;
 - 深埋高斯(early-termination 导致 wsum=0)显式映射为全阴影,防反转;
 - `--tlight_voxel` 回退到旧的 128³ 体素缓存路径(与 raster 之前训练的模型配套;viewer 的 `--tlight auto` 读 cfg_args 自动匹配)。
 
@@ -129,7 +129,7 @@ python tools/split_test_set.py --data D:/CloudDatasetUniform --held-out-suns 7,2
 ### 训练
 
 ```shell
-# Stage 1 — 默认:raster T_light + 完整几何梯度 + 针手术 + 固定 ACES tonemap
+# Stage 1 — 默认:raster T_light + 部分光照梯度 + 针手术 + 固定 ACES tonemap
 python train.py -s data/CloudDatasetUniform
 
 # 旧体素 T_light 路径(与 raster 之前训练的模型配套;数据路径按需改)
@@ -162,8 +162,10 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化 + 完整几何梯度);与 raster 之前训练的模型配套 |
+| `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化;完整连续梯度由 --tlight_full_grad 控制);与 raster 之前训练的模型配套 |
 | `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
+| `--tlight_tau_filter` | False | 光照实验:保留最小像素足迹,通过幅值补偿保持理想二维 τ 积分;不影响相机主 pass |
+| `--tlight_full_grad` | False | 光照实验:固定构图和离散分支,补齐光照估计器的连续梯度 |
 | `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间。真·线性 GT 数据用 **`--no-tonemap_aces`** 关闭(默认 True 的 bool 走 `BooleanOptionalAction`),无需改源码 |
 | `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`),保留作换其他 filmic 引擎的保险;开启时优先于固定 ACES |
 

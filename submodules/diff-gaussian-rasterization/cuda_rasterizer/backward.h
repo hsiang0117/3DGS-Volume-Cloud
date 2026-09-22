@@ -36,6 +36,16 @@ namespace BACKWARD
 		const float* grad_tau_front_sum,
 		float* dL_dtau);
 
+	void scaleLightTauGradient(int P, const float* filter_scale, float* grad_tau);
+	void lightpassFull(
+		const dim3 grid, dim3 block, const uint2* ranges, const uint32_t* point_list,
+		int W, int H, const float2* means2D, const float4* conic_opacity,
+		const float* final_T, const uint32_t* n_contrib,
+		const uint32_t* n_probed, const float* final_tau,
+		const float* grad_sum, const float* grad_wsum,
+		const float* grad_TG, const float* grad_G,
+		float3* dL_dmean2D, float4* dL_dconic, float* dL_dtau);
+
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
@@ -84,7 +94,9 @@ namespace BACKWARD
 		float* dL_dsh,
 		glm::vec3* dL_dscale,
 		glm::vec4* dL_drot,
-		bool antialiasing);
+		bool antialiasing,
+		bool light_tau_filter = false,
+		bool exact_light = false);
 }
 
 #endif

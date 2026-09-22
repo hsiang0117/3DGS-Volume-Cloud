@@ -47,7 +47,9 @@ namespace FORWARD
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered,
-		bool antialiasing);
+		bool antialiasing,
+		bool light_tau_filter,
+		float* light_filter_scale);
 
 	// Main rasterization method.
 	void render(
@@ -75,7 +77,9 @@ namespace FORWARD
 		// splats too faint for tau_front_wsum; G == 0 with a nonzero radius
 		// means every covering pixel was terminated by an occluder in front.
 		float* tau_front_TG_sum,
-		float* tau_front_G_sum);
+		float* tau_front_G_sum,
+		uint32_t* n_probed,
+		float* final_tau);
 }
 
 

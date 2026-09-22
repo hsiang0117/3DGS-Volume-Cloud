@@ -68,14 +68,17 @@ class ModelParams(ParamGroup):
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
         # T_light source: light-space rasterization (sun-camera shadow pass,
-        # record_front_tau + native lightpass backward) with the full shadow
-        # gradient through σ_t and scales/rotation. --tlight_voxel selects the
+        # record_front_tau + native lightpass backward). Optional full continuous
+        # light gradients are controlled below. --tlight_voxel selects the
         # 128^3 voxel cache instead (a fallback flag rather than
         # tlight_raster=True, so the DEFAULT is expressed by an absent flag and
         # old cfgs without the key still resolve to raster); the viewer matches
         # the source a model was trained with via cfg_args.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
+        # Independent light-pass experiments; old checkpoints keep legacy behavior.
+        self.tlight_tau_filter = False
+        self.tlight_full_grad = False
         # Apply the fixed Narkowicz ACES curve to the final image so loss and
         # metrics live in the GT's display space; render() lifts the per-Gaussian
         # radiance clamp to HDR in this mode. Disable with --no-tonemap_aces for a

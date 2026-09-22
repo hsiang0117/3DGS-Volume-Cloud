@@ -60,6 +60,7 @@ namespace CudaRasterizer
 			// Placed after antialiasing so no defaulted parameter follows them.
 			float* tau_front_TG_sum,
 			float* tau_front_G_sum,
+			bool light_tau_filter,
 			int* radii = nullptr,
 			bool debug = false);
 
@@ -75,6 +76,17 @@ namespace CudaRasterizer
 			const float* grad_tau_front_sum,
 			float* dL_dtau,
 			bool debug = false);
+
+		// Complete continuous VJP with framing, sorting and discrete gates fixed.
+		static void lightpassBackwardFull(
+			int P, int R, int width, int height,
+			const float* means, const float* tau, const float* scales, const float* rotations,
+			const int* radii, const float* view, const float* proj, const float* campos,
+			float tan_fovx, float tan_fovy,
+			char* geom_buffer, char* binning_buffer, char* image_buffer,
+			const float* grad_sum, const float* grad_wsum, const float* grad_TG, const float* grad_G,
+			float* dmean2D, float* dconic, float* dtau, float* dmeans,
+			float* dcov, float* dscale, float* drot, bool light_tau_filter, bool debug);
 
 		static void backward(
 			const int P, int D, int M, int R,

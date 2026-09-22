@@ -175,12 +175,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
-	bool antialiasing)
+	bool antialiasing,
+	bool light_tau_filter,
+	float* light_filter_scale)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
 
+	light_filter_scale[idx] = 1.0f;
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
 	radii[idx] = 0;
@@ -222,6 +225,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	if(antialiasing)
 		h_convolution_scaling = sqrt(max(0.000025f, det_cov / det_cov_plus_h_cov)); // max for numerical stability
+
+	// Keep the minimum pixel footprint but preserve the ideal 2D tau integral.
+	// This is independent of the camera AA flag. No floor that injects mass.
+	if (light_tau_filter)
+		h_convolution_scaling = sqrtf(fmaxf(0.0f, det_cov) / det_cov_plus_h_cov);
+	light_filter_scale[idx] = h_convolution_scaling;
 
 	// Invert covariance (EWA algorithm)
 	const float det = det_cov_plus_h_cov;
@@ -293,7 +302,9 @@ renderCUDA(
 	float* __restrict__ tau_front_sum,
 	float* __restrict__ tau_front_wsum,
 	float* __restrict__ tau_front_TG_sum,
-	float* __restrict__ tau_front_G_sum)
+	float* __restrict__ tau_front_G_sum,
+	uint32_t* __restrict__ n_probed,
+	float* __restrict__ final_tau)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -323,6 +334,7 @@ renderCUDA(
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
+	uint32_t last_probe = 0;
 	float C[CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
@@ -382,6 +394,7 @@ renderCUDA(
 			// by construction far outside the 3-sigma footprint.
 			if (tau_front_TG_sum && G > 0.0f)
 			{
+				last_probe = contributor;
 				atomicAdd(&tau_front_TG_sum[collected_id[j]], T * G);
 				atomicAdd(&tau_front_G_sum[collected_id[j]], G);
 			}
@@ -445,6 +458,8 @@ renderCUDA(
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
+		if (n_probed) n_probed[pix_id] = last_probe;
+		if (final_tau) final_tau[pix_id] = tau_accum;
 		for (int ch = 0; ch < CHANNELS; ch++)
 		{
 			// Per-pixel bg_image row when provided, else the constant bg_color.
@@ -478,7 +493,9 @@ void FORWARD::render(
 	float* tau_front_sum,
 	float* tau_front_wsum,
 	float* tau_front_TG_sum,
-	float* tau_front_G_sum)
+	float* tau_front_G_sum,
+	uint32_t* n_probed,
+	float* final_tau)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -499,7 +516,9 @@ void FORWARD::render(
 		tau_front_sum,
 		tau_front_wsum,
 		tau_front_TG_sum,
-		tau_front_G_sum);
+		tau_front_G_sum,
+		n_probed,
+		final_tau);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -528,7 +547,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
-	bool antialiasing)
+	bool antialiasing,
+	bool light_tau_filter,
+	float* light_filter_scale)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -557,6 +578,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		grid,
 		tiles_touched,
 		prefiltered,
-		antialiasing
+		antialiasing,
+		light_tau_filter,
+		light_filter_scale
 		);
 }

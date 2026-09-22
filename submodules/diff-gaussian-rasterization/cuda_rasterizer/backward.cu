@@ -157,7 +157,9 @@ __global__ void computeCov2DCUDA(int P,
 	const float* dL_dinvdepth,
 	float3* dL_dmeans,
 	float* dL_dcov,
-	bool antialiasing)
+	bool antialiasing,
+	bool light_tau_filter,
+	bool exact_light)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -205,6 +207,7 @@ __global__ void computeCov2DCUDA(int P,
 	float c_xy = cov2D[0][1];
 	float c_yy = cov2D[1][1];
 	
+	const float raw_xx = c_xx, raw_xy = c_xy, raw_yy = c_yy;
 	constexpr float h_var = 0.3f;
 	float d_inside_root = 0.f;
 	if(antialiasing)
@@ -245,9 +248,25 @@ __global__ void computeCov2DCUDA(int P,
 		dL_dc_xy = dL_dz;
 	}
 	
+	if (light_tau_filter)
+	{
+		const float d0 = raw_xx * raw_yy - raw_xy * raw_xy;
+		const float d1 = c_xx * c_yy - c_xy * c_xy;
+		const float h = sqrtf(fmaxf(0.0f, d0) / d1);
+		const float gh = dL_dpacked_input[idx] * packed_inputs[idx];
+		dL_dpacked_input[idx] *= h;
+		if (d0 > 0.0f && h > 0.0f)
+		{
+			const float k = gh / (2.0f * h * d1 * d1);
+			dL_dc_xx += k * (raw_yy * d1 - d0 * c_yy);
+			dL_dc_yy += k * (raw_xx * d1 - d0 * c_xx);
+			dL_dc_xy += k * (-2.0f * raw_xy * (d1 - d0));
+		}
+	}
+
 	float denom = c_xx * c_yy - c_xy * c_xy;
 
-	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
+	float denom2inv = 1.0f / ((denom * denom) + (exact_light ? 0.0f : 0.0000001f));
 
 	if (denom2inv != 0)
 	{
@@ -675,7 +694,9 @@ void BACKWARD::preprocess(
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot,
-	bool antialiasing)
+	bool antialiasing,
+	bool light_tau_filter,
+	bool exact_light)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
 	// Somewhat long, thus it is its own kernel rather than being part of 
@@ -697,7 +718,9 @@ void BACKWARD::preprocess(
 		dL_dinvdepth,
 		(float3*)dL_dmean3D,
 		dL_dcov3D,
-		antialiasing);
+		antialiasing,
+		light_tau_filter,
+		exact_light);
 
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
@@ -900,4 +923,121 @@ void BACKWARD::render(
 		dL_dcolors,
 		dL_dinvdepths
 		);
+}
+
+// The partial-gradient control freezes all footprint/weight dependence. Its
+// scalar gradient must still account for the forward's tau amplitude scaling.
+__global__ void scaleLightTauGradientCUDA(int P, const float* scale, float* grad)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < P) grad[i] *= scale[i];
+}
+
+void BACKWARD::scaleLightTauGradient(int P, const float* scale, float* grad)
+{
+    scaleLightTauGradientCUDA<<<(P + 255) / 256, 256>>>(P, scale, grad);
+}
+
+// Reverse the exact recorded continuous operations on each surviving light ray:
+//   probe TG_i += T*G_i, Gsum_i += G_i  (even if alpha drops the splat)
+//   S_i += (alpha_i*T)*A, W_i += alpha_i*T
+//   A += packed_tau_i*G_i; T *= 1-alpha_i.
+// Sorting, tile membership, alpha/early-out branches and classification are
+// piecewise constant. A terminal/faint probe can follow the last blended splat;
+// n_probed is therefore separate from the camera's n_contrib.
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+lightpassFullBackwardCUDA(
+    const uint2* __restrict__ ranges, const uint32_t* __restrict__ point_list,
+    int W, int H, const float2* __restrict__ means2D,
+    const float4* __restrict__ conic_opacity,
+    const float* __restrict__ final_T, const uint32_t* __restrict__ n_contrib,
+    const uint32_t* __restrict__ n_probed, const float* __restrict__ final_tau,
+    const float* __restrict__ grad_sum, const float* __restrict__ grad_wsum,
+    const float* __restrict__ grad_TG, const float* __restrict__ grad_G,
+    float3* __restrict__ dL_dmean2D, float4* __restrict__ dL_dconic,
+    float* __restrict__ dL_dtau)
+{
+    auto block = cg::this_thread_block();
+    const uint2 pix = {block.group_index().x * BLOCK_X + block.thread_index().x,
+                      block.group_index().y * BLOCK_Y + block.thread_index().y};
+    const bool inside = pix.x < W && pix.y < H;
+    const uint32_t pid = W * pix.y + pix.x;
+    const uint2 range = ranges[block.group_index().y * ((W + BLOCK_X - 1) / BLOCK_X) + block.group_index().x];
+    const int count = range.y - range.x;
+    const int rounds = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint32_t last_blend = inside ? n_contrib[pid] : 0;
+    const uint32_t last_probe = inside ? n_probed[pid] : 0;
+    float T = inside ? final_T[pid] : 1.0f;
+    float A = inside ? final_tau[pid] : 0.0f;
+    float dT = 0.0f, dA = 0.0f;
+    int contributor = count;
+    __shared__ int ids[BLOCK_SIZE];
+    __shared__ float2 xy[BLOCK_SIZE];
+    __shared__ float4 conic[BLOCK_SIZE];
+    __shared__ float4 upstream[BLOCK_SIZE];
+    for (int batch = 0; batch < rounds; ++batch)
+    {
+        block.sync();
+        const int progress = batch * BLOCK_SIZE + block.thread_rank();
+        if (progress < count)
+        {
+            const int id = point_list[range.y - progress - 1];
+            ids[block.thread_rank()] = id;
+            xy[block.thread_rank()] = means2D[id];
+            conic[block.thread_rank()] = conic_opacity[id];
+            upstream[block.thread_rank()] = {grad_sum[id], grad_wsum[id], grad_TG[id], grad_G[id]};
+        }
+        block.sync();
+        if (!inside) continue;
+        for (int j = 0; j < min(BLOCK_SIZE, count - batch * BLOCK_SIZE); ++j)
+        {
+            --contributor;
+            if (contributor >= last_probe) continue;
+            const float dx = xy[j].x - float(pix.x), dy = xy[j].y - float(pix.y);
+            const float4 q = conic[j], g = upstream[j];
+            const float power = -0.5f * (q.x * dx * dx + q.z * dy * dy) - q.y * dx * dy;
+            if (power > 0.0f) continue;
+            const float G = expf(power);
+            if (G == 0.0f) continue;
+            const float tau = q.w * G;
+            const float exp_minus_tau = expf(-tau);
+            const float alpha_raw = 1.0f - exp_minus_tau;
+            const float alpha = min(0.99f, alpha_raw);
+            float dtau = 0.0f;
+            if (contributor < last_blend && alpha >= 1.0f / 255.0f)
+            {
+                T /= 1.0f - alpha;
+                A -= tau;
+                const float weight = alpha * T;
+                const float dweight = g.x * A + g.y;
+                const float dalpha = T * (dweight - dT);
+                dtau = dA + ((alpha_raw < 0.99f) ? dalpha * exp_minus_tau : 0.0f);
+                dA += g.x * weight;
+                dT = dT * (1.0f - alpha) + dweight * alpha;
+            }
+            // The pre-gate fallback probes also affect preceding occluders.
+            const float dG = dtau * q.w + g.z * T + g.w;
+            dT += g.z * G;
+            const int id = ids[j];
+            atomicAdd(dL_dtau + id, dtau * G);
+            const float dPower = dG * G;
+            atomicAdd(&dL_dmean2D[id].x, dPower * (-q.x * dx - q.y * dy) * (0.5f * W));
+            atomicAdd(&dL_dmean2D[id].y, dPower * (-q.z * dy - q.y * dx) * (0.5f * H));
+            atomicAdd(&dL_dconic[id].x, -0.5f * dPower * dx * dx);
+            // The reusable preprocess VJP stores half the symmetric off-diagonal.
+            atomicAdd(&dL_dconic[id].y, -0.5f * dPower * dx * dy);
+            atomicAdd(&dL_dconic[id].w, -0.5f * dPower * dy * dy);
+        }
+    }
+}
+
+void BACKWARD::lightpassFull(
+    const dim3 grid, dim3 block, const uint2* ranges, const uint32_t* point_list,
+    int W, int H, const float2* means2D, const float4* conic,
+    const float* final_T, const uint32_t* n_contrib, const uint32_t* n_probed,
+    const float* final_tau, const float* gs, const float* gw, const float* gtg, const float* gg,
+    float3* dmeans, float4* dconic, float* dtau)
+{
+    lightpassFullBackwardCUDA<<<grid, block>>>(ranges, point_list, W, H, means2D, conic,
+        final_T, n_contrib, n_probed, final_tau, gs, gw, gtg, gg, dmeans, dconic, dtau);
 }

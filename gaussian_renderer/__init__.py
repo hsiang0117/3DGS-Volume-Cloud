@@ -130,7 +130,7 @@ def compute_T_light_voxel(means3D, tau_v_l, scales, v_l, grid_res=128):
 
 
 def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
-                           v_l, image_size=512):
+                           v_l, image_size=512, tau_filter=False, full_grad=False):
     """
     Per-Gaussian sun transmittance via a light-space rasterization pass.
 
@@ -143,12 +143,13 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
     The sun is a DISTANT NARROW-FOV PERSPECTIVE camera (the rasterizer's EWA
     Jacobian is perspective-only).
 
-    Differentiable in tau_v_l ONLY (hence σ_t/scales/rotations through its
-    Python-side construction): the CUDA lightpass backward replays the sorted
-    buffers and pushes each Gaussian's dL/d(tau_light) onto the taus of all
-    occluders in front of it, with the blend weights frozen. Geometry inputs
-    (means3D/scales/rotations as splat shapes) are consumed detached: the sun
-    camera framing and footprints are treated as constants.
+    Legacy control (full_grad=False) differentiates tau_v_l with footprint
+    geometry, blend weights and fallback probes frozen. full_grad=True
+    differentiates all continuous recording/normalization/probe and projected
+    geometry paths. Sun-camera framing, sorted order, support and discrete
+    gates stay fixed in the VJP. tau_filter=True preserves the ideal 2D tau
+    integral while retaining the 0.3-pixel^2 sampling footprint; it does not
+    claim exact nonlinear transmittance filtering or continuous volume mixing.
 
     Returns:
         T_light: (P, 1) sun transmittance per Gaussian.
@@ -157,9 +158,10 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
     dtype = means3D.dtype
     P = means3D.shape[0]
 
-    means3D = means3D.detach()
-    scales = scales.detach()
-    rotations = rotations.detach()
+    if not full_grad:
+        means3D = means3D.detach()
+        scales = scales.detach()
+        rotations = rotations.detach()
 
     with torch.no_grad():
         v_l = v_l.reshape(3)
@@ -216,13 +218,14 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
             # Keep tau unscaled (no AA rescaling); distance along the sun IS
             # light-space order, so stock centre-depth sort is correct.
             antialiasing=False,
+            light_tau_filter=bool(tau_filter),
         )
 
     # Outside no_grad: the lightpass autograd Function carries gradient from
     # tau_light_sum into tau_v_l (σ_t/scales/rotations).
     (tau_light_sum, tau_light_wsum, sun_radii,
      tau_front_TG_sum, tau_front_G_sum) = rasterize_lightpass(
-        means3D, tau_v_l.view(-1), scales, rotations, sun_settings)
+        means3D, tau_v_l.view(-1), scales, rotations, sun_settings, full_grad=full_grad)
 
     covered = tau_light_wsum > 1e-8
     tau_light = tau_light_sum / tau_light_wsum.clamp(min=1e-8)
@@ -398,7 +401,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         T_light = compute_T_light_raster(
             means3D, tau_v_l, s, pc.get_rotation,
-            v_l, image_size=int(getattr(pipe, "tlight_raster_res", 512)))
+            v_l, image_size=int(getattr(pipe, "tlight_raster_res", 512)),
+            tau_filter=bool(getattr(pipe, "tlight_tau_filter", False)),
+            full_grad=bool(getattr(pipe, "tlight_full_grad", False)))
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):

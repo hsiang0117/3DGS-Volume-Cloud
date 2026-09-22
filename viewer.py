@@ -95,7 +95,7 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
 
 @torch.no_grad()
 def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
-                          use_raster: bool = False, raster_res: int = 512) -> torch.Tensor:
+                          use_raster: bool = False, raster_res: int = 512, tau_filter: bool = False) -> torch.Tensor:
     """Compute T_light for the given sun direction.
 
     Mirrors the per-Gaussian τ derivation inside render() so the cache matches
@@ -124,6 +124,7 @@ def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
             gaussians.get_rotation,
             v_l,
             image_size=raster_res,
+            tau_filter=tau_filter,
         )
         return T.view(-1, 1)
     return compute_T_light_voxel(
@@ -317,27 +318,28 @@ def main():
     # only ever selected by an explicit flag or by a cfg that says so.
     use_raster_tlight = True
     tlight_raster_res = 512
+    tlight_tau_filter = False
     # Tonemap: cfg flags say whether a curve was trained and which kind; learnable
     # coeffs are confirmed after load_ply (tonemap.json sidecar).
     forced_tonemap = {"on": True, "off": False}.get(args.tonemap, None)
     cfg_tonemap_aces = False
     cfg_tonemap_learnable = False
     cfg = None
-    if args.tlight == "auto" or args.tonemap == "auto":
-        run_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(args.ply))))
-        cfg_path = os.path.join(run_dir, "cfg_args")
-        if os.path.exists(cfg_path):
-            try:
-                with open(cfg_path) as f:
-                    cfg = f.read()
-            except Exception as e:
-                print(f"[viewer] cfg_args unreadable ({e}); falling back to the PROJECT "
-                      f"defaults for T_light / tonemap — pass --tlight and --tonemap "
-                      f"explicitly if this model was not trained with them.")
-        else:
-            print(f"[viewer] No cfg_args in {run_dir}; falling back to the PROJECT "
+    # Always load the trained raster filter/resolution, including explicit modes.
+    run_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(args.ply))))
+    cfg_path = os.path.join(run_dir, "cfg_args")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path) as f:
+                cfg = f.read()
+        except Exception as e:
+            print(f"[viewer] cfg_args unreadable ({e}); falling back to the PROJECT "
                   f"defaults for T_light / tonemap — pass --tlight and --tonemap "
                   f"explicitly if this model was not trained with them.")
+    else:
+        print(f"[viewer] No cfg_args in {run_dir}; falling back to the PROJECT "
+              f"defaults for T_light / tonemap — pass --tlight and --tonemap "
+              f"explicitly if this model was not trained with them.")
     if args.tlight == "voxel":
         use_raster_tlight = False  # explicit flag always wins
     elif args.tlight == "auto":
@@ -354,6 +356,7 @@ def main():
     # --tlight raster), take the resolution the model was trained with.
     # Purely informational when raster is not used.
     if cfg is not None:
+        tlight_tau_filter = "tlight_tau_filter=True" in cfg
         m = re.search(r"tlight_raster_res=(\d+)", cfg)
         if m:
             v = int(m.group(1))
@@ -430,7 +433,7 @@ def main():
     t0 = time.time()
     T_light = compute_T_light_cache(
         gaussians, torch.from_numpy(initial_sun).cuda(),
-        use_raster=use_raster_tlight, raster_res=tlight_raster_res,
+        use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter,
     ).detach()
     torch.cuda.synchronize()
     print(f"[viewer] T_light ready in {time.time() - t0:.2f}s. Shape = {tuple(T_light.shape)}")
@@ -804,7 +807,7 @@ def main():
         with torch.no_grad():
             new_cache = compute_T_light_cache(
                 gaussians, torch.from_numpy(new_sun).cuda(),
-                use_raster=use_raster_tlight, raster_res=tlight_raster_res,
+                use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter,
             ).detach()
         torch.cuda.synchronize()
         state["v_l"] = new_sun
@@ -911,7 +914,7 @@ def main():
             with torch.no_grad():
                 new_cache = compute_T_light_cache(
                     gaussians, torch.from_numpy(new_sun).cuda(),
-                    use_raster=use_raster_tlight, raster_res=tlight_raster_res,
+                    use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter,
                 ).detach()
             state["v_l"] = new_sun
             state["T_light"] = new_cache

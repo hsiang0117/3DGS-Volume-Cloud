@@ -56,12 +56,15 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool antialiasing,
 	const bool record_front_tau,
+	const bool light_tau_filter,
 	const bool debug)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
+  TORCH_CHECK(!light_tau_filter || (record_front_tau && (tau_precomp.numel() > 0 || means3D.size(0) == 0)),
+              "light_tau_filter requires an analytic-tau light pass");
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
@@ -144,6 +147,7 @@ RasterizeGaussiansCUDA(
 		antialiasing,
 		do_front_tau ? tau_front_TG_sum.contiguous().data<float>() : nullptr,
 		do_front_tau ? tau_front_G_sum.contiguous().data<float>() : nullptr,
+		light_tau_filter,
 		radii.contiguous().data<int>(),
 		debug);
   }
@@ -305,4 +309,39 @@ torch::Tensor markVisible(
   }
   
   return present;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeLightpassFullBackwardCUDA(
+    const torch::Tensor& means, const torch::Tensor& tau,
+    const torch::Tensor& scales, const torch::Tensor& rotations, const torch::Tensor& radii,
+    const torch::Tensor& view, const torch::Tensor& proj, const torch::Tensor& campos,
+    float tan_fovx, float tan_fovy, int height, int width,
+    const torch::Tensor& gs, const torch::Tensor& gw, const torch::Tensor& gtg, const torch::Tensor& gg,
+    const torch::Tensor& geom, int R, const torch::Tensor& binning, const torch::Tensor& image,
+    bool light_tau_filter, bool debug)
+{
+    const int P = means.size(0);
+    auto opts = means.options();
+    auto dm = torch::zeros_like(means), dt = torch::zeros_like(tau);
+    auto ds = torch::zeros_like(scales), dr = torch::zeros_like(rotations);
+    if (P != 0 && R != 0)
+    {
+        auto dm2 = torch::zeros({P, 3}, opts);
+        auto dq = torch::zeros({P, 4}, opts);
+        auto dcov = torch::zeros({P, 6}, opts);
+        CudaRasterizer::Rasterizer::lightpassBackwardFull(P, R, width, height,
+            means.contiguous().data_ptr<float>(), tau.contiguous().data_ptr<float>(),
+            scales.contiguous().data_ptr<float>(), rotations.contiguous().data_ptr<float>(),
+            radii.contiguous().data_ptr<int>(), view.contiguous().data_ptr<float>(),
+            proj.contiguous().data_ptr<float>(), campos.contiguous().data_ptr<float>(), tan_fovx, tan_fovy,
+            reinterpret_cast<char*>(geom.contiguous().data_ptr()),
+            reinterpret_cast<char*>(binning.contiguous().data_ptr()),
+            reinterpret_cast<char*>(image.contiguous().data_ptr()),
+            gs.contiguous().data_ptr<float>(), gw.contiguous().data_ptr<float>(),
+            gtg.contiguous().data_ptr<float>(), gg.contiguous().data_ptr<float>(),
+            dm2.data_ptr<float>(), dq.data_ptr<float>(), dt.data_ptr<float>(), dm.data_ptr<float>(),
+            dcov.data_ptr<float>(), ds.data_ptr<float>(), dr.data_ptr<float>(), light_tau_filter, debug);
+    }
+    return std::make_tuple(dm, dt, ds, dr);
 }
