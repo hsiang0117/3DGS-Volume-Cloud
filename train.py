@@ -64,6 +64,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
 
+        # Tick before topology changes so newborns receive the full settling period.
+        gaussians.advance_prune_grace(iteration)
         gaussians.update_learning_rate(iteration)
         gaussians.update_tonemap_learning_rate(iteration)  # no-op unless learnable tonemap
 
@@ -206,6 +208,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
+                gaussians.project_sigma_t()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 # Step the standalone tonemap optimizer (gradients flowed in
                 # via the shared loss.backward()). No-op unless --tonemap_learnable.

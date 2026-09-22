@@ -125,6 +125,10 @@ def _sh_basis_deg2(dirs):
 
 class GaussianModel:
 
+    SIGMA_T_MAX = 5.0
+    SIGMA_T_RAW_MAX = math.log(math.expm1(SIGMA_T_MAX))
+    PRUNE_GRACE_STEPS = 500
+
     # Learnable output tonemap (Narkowicz ACES rational form), shared across RGB:
     #     f(x) = (a x^2 + b x) / (c x^2 + d x + e)
     # (a,b,c,d) learned via softplus(raw) (positive ⇒ no poles for x>=0); `e` pinned
@@ -142,7 +146,8 @@ class GaussianModel:
         self.scaling_inverse_activation = torch.log
 
         self.rotation_activation = torch.nn.functional.normalize
-        self.sigma_t_activation = lambda x: torch.clamp(torch.nn.functional.softplus(x), max=5.0)
+        self.sigma_t_activation = lambda x: torch.clamp(
+            torch.nn.functional.softplus(x), max=self.SIGMA_T_MAX)
         # Inverse softplus (valid below the clamp): x = log(expm1(y)).
         self.sigma_t_inverse_activation = lambda y: torch.log(
             torch.expm1(torch.clamp(y, min=1e-6, max=4.999)))
@@ -198,6 +203,16 @@ class GaussianModel:
     @property
     def get_sigma_t(self):
         return self.sigma_t_activation(self._sigma_t)
+
+    @torch.no_grad()
+    def project_sigma_t(self):
+        """Keep raw density at or below softplus^-1(5), including after Adam steps.
+
+        The forward cap stays in place. At its boundary the clamp has a nonzero
+        derivative, so a saturated Gaussian can learn a lower density again.
+        Project in place to preserve the Parameter identity and Adam state.
+        """
+        self._sigma_t.clamp_(max=self.SIGMA_T_RAW_MAX)
 
     @property
     def get_omega(self):
@@ -265,6 +280,7 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._sigma_t = nn.Parameter(sigma_t_raw.requires_grad_(True))
+        self.project_sigma_t()
         self._omega = nn.Parameter(omega_raw.requires_grad_(True))
         self._g = nn.Parameter(g_raw.requires_grad_(True))
         self._w = nn.Parameter(w_raw.requires_grad_(True))
@@ -273,6 +289,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
+        self.project_sigma_t()
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         # Scale signal accumulates only the "growing-scale" direction.
@@ -284,6 +301,7 @@ class GaussianModel:
         self.contribution_denom = torch.zeros((self.get_xyz.shape[0],), device="cuda")
         # Prune-immunity counter: freshly split / cloned / resurrected points get N settling steps.
         self.prune_grace = torch.zeros((self.get_xyz.shape[0],), dtype=torch.int32, device="cuda")
+        self._prune_grace_iteration = 0
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -551,6 +569,7 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._sigma_t = nn.Parameter(torch.tensor(sigma_t, dtype=torch.float, device="cuda").requires_grad_(True))
+        self.project_sigma_t()
         self._omega = nn.Parameter(torch.tensor(omega, dtype=torch.float, device="cuda").requires_grad_(True))
         self._g = nn.Parameter(torch.tensor(g, dtype=torch.float, device="cuda").requires_grad_(True))
         self._w = nn.Parameter(torch.tensor(w, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -747,7 +766,7 @@ class GaussianModel:
             self.contribution_denom[:n_kept],
             torch.zeros((n_new_children,), device="cuda"),
         ])
-        new_grace = torch.full((n_new_children,), 500, dtype=torch.int32, device="cuda")
+        new_grace = torch.full((n_new_children,), self.PRUNE_GRACE_STEPS, dtype=torch.int32, device="cuda")
         self.prune_grace = torch.cat([
             self.prune_grace[:n_kept],
             new_grace,
@@ -839,7 +858,8 @@ class GaussianModel:
         self.contribution_denom = torch.cat([
             self.contribution_denom[:n_kept],
             torch.zeros((n_children,), device=device)])
-        grace = 500 if opt is None else int(getattr(opt, "densify_from_iter", 500))
+        # A settling period is independent of when densification first starts.
+        grace = self.PRUNE_GRACE_STEPS
         self.prune_grace = torch.cat([
             self.prune_grace[:n_kept],
             torch.full((n_children,), grace, dtype=torch.int32, device=device)])
@@ -903,13 +923,28 @@ class GaussianModel:
             self.contribution_denom[:n_kept],
             torch.zeros((n_added,), device="cuda"),
         ])
-        new_grace = torch.full((n_added,), 500, dtype=torch.int32, device="cuda")
+        new_grace = torch.full((n_added,), self.PRUNE_GRACE_STEPS, dtype=torch.int32, device="cuda")
         self.prune_grace = torch.cat([
             self.prune_grace[:n_kept],
             new_grace,
         ])
 
     # ---------- Physical densify / prune (cloud parameterisation) ----------
+
+    @torch.no_grad()
+    def advance_prune_grace(self, iteration):
+        """Advance once per training iteration, BEFORE creating/resurrecting points.
+
+        Repeated calls at the same iteration do nothing; skipped iterations use
+        their actual elapsed distance. A point born at i stays protected until
+        i + PRUNE_GRACE_STEPS, independent of the two pruning schedules.
+        """
+        elapsed = iteration - self._prune_grace_iteration
+        if elapsed < 0:
+            raise ValueError("Prune grace iteration must not move backwards")
+        if elapsed > 0:
+            self.prune_grace.sub_(elapsed).clamp_min_(0)
+            self._prune_grace_iteration = iteration
 
     def add_contribution_stats(self, contribution):
         """Per-step accumulator for Σ(α·T) per Gaussian.
@@ -952,6 +987,7 @@ class GaussianModel:
 
         Resurrection lives in tick_post_densify_maintenance(), not here.
         """
+        self.advance_prune_grace(iteration)
         # 1. Density growth (stock path, with adaptive threshold)
         denom_g = self.denom.clamp(min=1)
         grads = self.xyz_gradient_accum / denom_g
@@ -980,10 +1016,6 @@ class GaussianModel:
 
         # 2. Contribution-based prune (per-Gaussian prune_grace protects new-borns).
         self._prune_by_contribution(opt)
-
-        # Decay grace counter; the accumulator reset lives in tick_post_densify_maintenance().
-        with torch.no_grad():
-            self.prune_grace = (self.prune_grace - opt.densification_interval).clamp(min=0)
 
         self.tmp_radii = None
         torch.cuda.empty_cache()
@@ -1039,6 +1071,7 @@ class GaussianModel:
         """
         if iteration <= 0 or iteration >= getattr(opt, "densify_until_iter", float("inf")):
             return
+        self.advance_prune_grace(iteration)
         # Order matters: resurrect → prune → reset — the prune predicate gates on
         # `contribution_denom >= prune_min_visible_frames`, so zeroing first masks every point.
         # 1. Resurrect schedule
@@ -1052,9 +1085,6 @@ class GaussianModel:
         prune_iv = getattr(opt, "post_densify_prune_interval", 0)
         if prune_iv > 0 and iteration % prune_iv == 0:
             self._prune_by_contribution(opt)
-            with torch.no_grad():
-                # Match the grace decay rhythm used inside physical_densify_and_prune
-                self.prune_grace = (self.prune_grace - prune_iv).clamp(min=0)
 
         # 3. Accumulator reset (must come AFTER prune in this tick — see note above)
         reset_iv = getattr(opt, "contribution_reset_interval", 1000)
@@ -1085,7 +1115,7 @@ class GaussianModel:
             optimizable_tensors = self.replace_tensor_to_optimizer(new_sigma_t, "sigma_t")
             self._sigma_t = optimizable_tensors["sigma_t"]
             # Grant grace so they don't get pruned before σ_t has time to grow.
-            self.prune_grace[low_idx] = 500
+            self.prune_grace[low_idx] = self.PRUNE_GRACE_STEPS
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

@@ -265,6 +265,40 @@ python tools/eval_test_groups.py output/<run> [iteration]
 自动判断是否启用环境光。注意它们按 `resolution=-1`、黑底加载相机;若某 run 用非默认
 `-r/--resolution` 或 `-w` 训练,独立复算的分辨率口径会与训练内评测不同。
 
+### 云区指标
+
+`tools/eval_cloud_region.py` 同时报告全图、原始 VDB mask、扩张 mask、新增外环及矩形 crop。
+背景占比会影响指标的绝对值，但不必然缩小方法间的 PSNR 差距。
+
+```shell
+# Cloud-GS；掩膜默认 D:\dataset\CloudDatasetMasks，可用 --masks 覆盖：
+python tools/eval_cloud_region.py output/<run> --iteration 30000 --save
+
+# 官方 3DGS：在其仓库根目录、使用其 venv（需安装 lpips）：
+python D:/PythonProjects/3DGS-Volume-Cloud/tools/eval_cloud_region.py output/<run> --repo official --iteration 30000 --save
+
+# 只评估原始 mask / 全图 / crop，不附加扩张区域：
+python tools/eval_cloud_region.py output/<run> --dilate 0 --save
+```
+
+- 原始 mask 始终独立报告为 `*_mask_raw`；`--dilate 16` 默认额外报告方形核扩张的
+  `*_mask_dilated` 和新增外环 `*_ring`，不将它们混称为原始云体。
+- 默认 crop 为**原始 mask 的 bbox + 16 px margin**，与膨胀半径无关。
+  `--crop-base dilated --margin 16` 改用扩张 mask 的包围框；`--margin` 可显式调整边距。
+- 所有 PSNR 统一为 RGB 合并 MSE 后转 dB，再逐帧等权平均。区域 SSIM 是原图的
+  11×11 SSIM map 在 mask 内窗口中心的均值，边界窗口仍可包含区域外像素。
+- LPIPS 使用 VGG / v0.1，仅计算全图与矩形 crop；不把 mask 外置零，不对 crop 缩放。
+  输入统一为连续 NCHW float32，关闭 cuDNN TF32 并固定卷积选择，避免存储布局造成指标偏移。
+  `crop_area_share` 是 crop 占全图比例，`mask_raw_share_in_crop` 是原始 mask 占 crop 比例。
+- 掩膜是逐相机单通道二值 PNG（camXXX.png），来自 VDB 密度支持域射线求交，具体定义见
+  `_metadata/manifest.json`。相同云体、变换、相机内外参和分辨率下，不同光照与方法共用同一套。
+  脚本检查 mask 非空、二值且尺寸匹配，不自动缩放；`per_view` 使用完整帧路径，保留同机位多光照记录。
+- `--save` 写入包含迭代数、区域参数与时间戳的新 JSON，保留旧结果。
+  `--output FILE` 可指定一个尚不存在的文件。输出包含模型/配置/掩膜/相机文件哈希及指标定义。
+  `--iteration` 默认 -1（自动选最新并记录实际迭代），正式对比建议显式固定。
+- 当前支持 cloud / official 两种渲染路径、黑底数据，按 resolution=-1 加载相机。
+
+
 ### 交互 Viewer
 
 ```shell
