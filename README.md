@@ -230,13 +230,15 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--resurrect_fraction` | 0.05 | 每次 resurrect 的点数占比 |
 | `--post_densify_prune_interval` | 1000 | densify 期内的额外剪枝周期;0 关闭。**注:维护(resurrect/prune/reset)只在 densify 期运行,densify 结束后即停**——settle 期运行会与剪枝形成净销毁回路 |
 
-#### 针手术(结构性 aniso 硬上限)
+#### 针手术(极端各向异性分裂)
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--needle_split_interval` | 1000 | 手术周期;**0 = 关闭** |
-| `--needle_split_ratio` | 30.0 | 触发阈值(max/min 轴比)。每刀 ratio 减半,等效硬上限 |
-| `--needle_split_until_iter` | 29000 | 最后一次手术的截止迭代(留收尾期让子高斯安定) |
+| `--needle_split_ratio` | 30.0 | 分裂触发阈值(max/min 轴比) |
+| `--densify_until_iter` | 15000 | 与增密共用的截止迭代,严格小于该值时才允许针手术 |
+
+针手术直接复用增密门控 `iteration < densify_until_iter`。默认每 1000 步检查一次,最后一次检查为 14000 步;从 15000 步起不再增密或执行针手术,继续优化现有高斯的参数。调整 `--densify_until_iter` 会同步调整两者的截止时间。旧的独立参数 `--needle_split_until_iter` 已移除,训练命令请改用 `--densify_until_iter`。
 
 #### 调试与日志(train.py)
 

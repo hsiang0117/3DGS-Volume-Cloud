@@ -213,6 +213,53 @@ class TrainingLifecycleTests(unittest.TestCase):
         self.assertEqual(model._prune_by_contribution(opt), 2)
         self.assert_aligned(model)
 
+    def test_needle_and_densification_share_exclusive_cutoff(self):
+        import train
+
+        self.assertEqual(options().densify_until_iter, 15000)
+        cases = [(4, 2, [2]), (4, 1, [1, 2, 3]), (2, 2, []),
+                 (0, 1, []), (4, 0, []), (6, 2, [2, 4])]
+        for cutoff, interval, expected_needles in cases:
+            with self.subTest(cutoff=cutoff, interval=interval):
+                opt = options()
+                opt.iterations = 6
+                opt.densify_from_iter = 0
+                opt.densification_interval = 1
+                opt.densify_until_iter = cutoff
+                opt.needle_split_interval = interval
+                # A historical Namespace field must not reopen the shared window.
+                opt.needle_split_until_iter = 29000
+                model = tiny_model(opt)
+                camera = SimpleNamespace(original_image=torch.ones(3, 16, 16, device="cuda"))
+                step = [0]
+                dense_calls, needle_calls = [], []
+
+                def fake_render(_camera, gaussians, _pipe, _background):
+                    step[0] += 1
+                    value = gaussians.get_sigma_t.mean() / 10
+                    return {"render": value.expand(3, 16, 16).contiguous(),
+                            "viewspace_points": torch.zeros(4, 3, device="cuda", requires_grad=True),
+                            "visibility_filter": torch.ones(4, device="cuda", dtype=torch.bool),
+                            "radii": torch.ones(4, device="cuda"),
+                            "contribution": torch.ones(4, device="cuda")}
+
+                with (patch.object(train, "GaussianModel", return_value=model),
+                      patch.object(train, "Scene", return_value=SimpleNamespace(cameras_extent=1.0)),
+                      patch.object(train, "prepare_output_and_logger", return_value=None),
+                      patch.object(train, "CameraPrefetcher") as prefetcher,
+                      patch.object(train, "training_report"),
+                      patch.object(train, "render", side_effect=fake_render),
+                      patch.object(model, "add_densification_stats"),
+                      patch.object(model, "physical_densify_and_prune",
+                                   side_effect=lambda *args: dense_calls.append(step[0])),
+                      patch.object(model, "split_needles",
+                                   side_effect=lambda *args: needle_calls.append(step[0]) or 0)):
+                    prefetcher.return_value.next.return_value = camera
+                    train.training(SimpleNamespace(white_background=False), opt,
+                                   SimpleNamespace(tonemap_learnable=False), [], [])
+                self.assertEqual(dense_calls, list(range(1, cutoff)))
+                self.assertEqual(needle_calls, expected_needles)
+
     def test_training_loop_projects_each_step_and_ticks_outside_densify_window(self):
         import train
 

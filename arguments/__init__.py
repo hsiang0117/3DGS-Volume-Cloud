@@ -162,8 +162,8 @@ class OptimizationParams(ParamGroup):
         self.post_densify_prune_interval = 1000
         # Needle surgery: every `needle_split_interval` iterations, split Gaussians
         # whose max/min scale ratio exceeds `needle_split_ratio` into two children
-        # along the major axis; 0 disables.
+        # along the major axis; 0 disables. Runs only while
+        # iteration < densify_until_iter, using the same cutoff as densification.
         self.needle_split_interval = 1000
         self.needle_split_ratio = 30.0
-        self.needle_split_until_iter = 29_000   # last iteration surgery runs on
         super().__init__(parser, "Optimization Parameters")
