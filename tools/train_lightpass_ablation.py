@@ -159,7 +159,7 @@ def main():
     def recorded_render(*a, **kw):
         package = original_render(*a, **kw)
         latest_light.clear()
-        latest_light.update(T=package['T_light'], Lk=package['Lk'], contribution=package['contribution'])
+        latest_light.update(T=package['T_light'].detach(), Lk=package['Lk'].detach(), contribution=package['contribution'].detach())
         return package
 
 
