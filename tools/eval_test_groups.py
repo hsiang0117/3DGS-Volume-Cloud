@@ -19,6 +19,7 @@ from scene.dataset_readers import readCamerasFromTransforms
 from utils.camera_utils import cameraList_from_camInfos
 from utils.system_utils import searchForMaxIteration
 from gaussian_renderer import render
+from utils.lightpass_config import saved_lightpass_settings
 from utils.image_utils import psnr
 
 ap = argparse.ArgumentParser(description="Grouped test-set PSNR (held-out vs seen sun).")
@@ -54,8 +55,7 @@ print(f'T_light={"raster" if use_raster else "voxel"} | tonemap_aces={tonemap_ac
       f'| tonemap_learnable={tonemap_learnable} | env_lighting={env_lighting}')
 
 pipe = Namespace(tlight_voxel=not use_raster, tlight_raster_res=raster_res,
-                 tlight_tau_filter="tlight_tau_filter=True" in cfg,
-                 tlight_full_grad="tlight_full_grad=True" in cfg,
+                 **saved_lightpass_settings(cfg),
                  tonemap_aces=tonemap_aces, tonemap_learnable=tonemap_learnable,
                  env_lighting=env_lighting, env_sh_order=g.env_sh_order)
 bg = torch.zeros(3, device='cuda')

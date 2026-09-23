@@ -177,6 +177,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	bool prefiltered,
 	bool antialiasing,
 	bool light_tau_filter,
+	float light_filter_variance,
 	float* light_filter_scale)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -216,11 +217,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
-	constexpr float h_var = 0.3f;
+	const float h_var = light_filter_variance;
 	const float det_cov = cov.x * cov.z - cov.y * cov.y;
 	cov.x += h_var;
 	cov.z += h_var;
 	const float det_cov_plus_h_cov = cov.x * cov.z - cov.y * cov.y;
+	// No substitute covariance floor in the zero-dilation experiment.
+	// Cull singular/non-positive footprints instead of inverting them.
+	if (h_var == 0.0f && (!(det_cov_plus_h_cov > 0.0f) || !isfinite(det_cov_plus_h_cov)))
+		return;
 	float h_convolution_scaling = 1.0f;
 
 	if(antialiasing)
@@ -228,7 +233,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Keep the minimum pixel footprint but preserve the ideal 2D tau integral.
 	// This is independent of the camera AA flag. No floor that injects mass.
-	if (light_tau_filter)
+	if (light_tau_filter && h_var > 0.0f)
 		h_convolution_scaling = sqrtf(fmaxf(0.0f, det_cov) / det_cov_plus_h_cov);
 	light_filter_scale[idx] = h_convolution_scaling;
 
@@ -549,6 +554,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	bool prefiltered,
 	bool antialiasing,
 	bool light_tau_filter,
+	float light_filter_variance,
 	float* light_filter_scale)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
@@ -580,6 +586,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		prefiltered,
 		antialiasing,
 		light_tau_filter,
+		light_filter_variance,
 		light_filter_scale
 		);
 }

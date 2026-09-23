@@ -682,7 +682,7 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
-            # Defensive only: every caller (clone / split / needle surgery)
+            # Defensive only: every caller (clone / split)
             # supplies all seven per-point keys, and the optimizer holds exactly
             # those seven groups, so this branch does not currently trigger.
             # It guards a future global parameter added to this optimizer.
@@ -774,101 +774,6 @@ class GaussianModel:
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
-
-    def split_needles(self, ratio_threshold, opt=None):
-        """Surgical split of high-anisotropy Gaussians (ratio > threshold).
-
-        Fattens the thin axis (x2) rather than splitting the major axis: children
-        keep the parent's orientation and long axes, the min axis is doubled, and
-        σ_t is reduced to conserve total extinction mass (σ_t·∏s). The two children
-        are offset by ±σ_major/2 along the major axis so the pair approximately
-        covers the parent's footprint. Each pass halves the ratio of every offender.
-
-        Returns the number of Gaussians split.
-        """
-        if self.get_xyz.shape[0] == 0:
-            return 0
-        scaling = self.get_scaling
-        ratio = scaling.max(dim=1).values / scaling.min(dim=1).values.clamp(min=1e-6)
-        mask = ratio > ratio_threshold
-        n = int(mask.sum().item())
-        if n == 0:
-            return 0
-
-        sel_scaling = scaling[mask]                                    # (n,3)
-        major_idx = sel_scaling.argmax(dim=1)                          # (n,)
-        minor_idx = sel_scaling.argmin(dim=1)                          # (n,)
-        sigma_major = sel_scaling.gather(1, major_idx.unsqueeze(1))    # (n,1)
-        sigma_minor = sel_scaling.gather(1, minor_idx.unsqueeze(1))    # (n,1)
-
-        rots = build_rotation(self._rotation[mask])                    # (n,3,3)
-        major_dir = rots.gather(
-            2, major_idx.view(-1, 1, 1).expand(-1, 3, 1)).squeeze(-1)  # (n,3)
-
-        offset = major_dir * (sigma_major * 0.5)
-        parent_xyz = self.get_xyz[mask]
-        new_xyz = torch.cat([parent_xyz + offset, parent_xyz - offset], dim=0)
-
-        # Fatten the thin axis (x2) — ratio halves; σ_t is divided by 3.2, not the exact-mass /4.
-        child_scaling = sel_scaling.clone()
-        child_scaling.scatter_(1, minor_idx.unsqueeze(1), sigma_minor * 2.0)
-        new_scaling = self.scaling_inverse_activation(child_scaling.repeat(2, 1))
-
-        sigma_t = self.get_sigma_t[mask]                               # activated (n,1)
-        new_sigma_t = self.sigma_t_inverse_activation(
-            (sigma_t / 3.2).clamp(min=1e-6)).repeat(2, 1)
-
-        new_rotation = self._rotation[mask].repeat(2, 1)
-        new_omega = self._omega[mask].repeat(2, 1)
-        new_g = self._g[mask].repeat(2, 1)
-        new_w = self._w[mask].repeat(2, 1)
-
-        d = {
-            "xyz": new_xyz,
-            "sigma_t": new_sigma_t,
-            "omega": new_omega,
-            "g": new_g,
-            "w": new_w,
-            "scaling": new_scaling,
-            "rotation": new_rotation,
-        }
-        optimizable_tensors = self.cat_tensors_to_optimizer(d)
-        self._xyz = optimizable_tensors["xyz"]
-        self._sigma_t = optimizable_tensors["sigma_t"]
-        self._omega = optimizable_tensors["omega"]
-        self._g = optimizable_tensors["g"]
-        self._w = optimizable_tensors["w"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-
-        n_children = 2 * n
-        device = "cuda"
-        # tmp_radii exists only transiently inside the densify pass; absent when called from the tick.
-        tmp = getattr(self, "tmp_radii", None)
-        if tmp is not None and tmp.numel():
-            self.tmp_radii = torch.cat([tmp, torch.zeros(n_children, device=device)])
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
-        self.scale_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
-        n_kept = self.get_xyz.shape[0] - n_children
-        self.contribution_accum = torch.cat([
-            self.contribution_accum[:n_kept],
-            torch.zeros((n_children,), device=device)])
-        self.contribution_denom = torch.cat([
-            self.contribution_denom[:n_kept],
-            torch.zeros((n_children,), device=device)])
-        # A settling period is independent of when densification first starts.
-        grace = self.PRUNE_GRACE_STEPS
-        self.prune_grace = torch.cat([
-            self.prune_grace[:n_kept],
-            torch.full((n_children,), grace, dtype=torch.int32, device=device)])
-
-        # Remove the parents (mask refers to pre-cat indices; children appended after).
-        prune_filter = torch.cat(
-            [mask, torch.zeros(n_children, device=device, dtype=bool)])
-        self.prune_points(prune_filter)
-        return n
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)

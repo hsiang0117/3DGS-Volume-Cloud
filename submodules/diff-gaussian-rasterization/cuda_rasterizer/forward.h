@@ -49,6 +49,7 @@ namespace FORWARD
 		bool prefiltered,
 		bool antialiasing,
 		bool light_tau_filter,
+	float light_filter_variance,
 		float* light_filter_scale);
 
 	// Main rasterization method.

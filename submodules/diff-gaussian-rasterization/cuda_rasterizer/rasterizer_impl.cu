@@ -232,6 +232,7 @@ int CudaRasterizer::Rasterizer::forward(
 	float* tau_front_TG_sum,
 	float* tau_front_G_sum,
 	bool light_tau_filter,
+	float light_filter_variance,
 	int* radii,
 	bool debug)
 {
@@ -291,6 +292,7 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered,
 		antialiasing,
 		light_tau_filter,
+		light_filter_variance,
 		geomState.light_filter_scale
 	), debug)
 
@@ -523,7 +525,7 @@ void CudaRasterizer::Rasterizer::lightpassBackwardFull(
     char* geom_buffer, char* binning_buffer, char* image_buffer,
     const float* gs, const float* gw, const float* gtg, const float* gg,
     float* dmean2D, float* dconic, float* dtau, float* dmeans,
-    float* dcov, float* dscale, float* drot, bool light_tau_filter, bool debug)
+    float* dcov, float* dscale, float* drot, bool light_tau_filter, float light_filter_variance, bool debug)
 {
     GeometryState geom = GeometryState::fromChunk(geom_buffer, P);
     BinningState bin = BinningState::fromChunk(binning_buffer, R);
@@ -539,5 +541,5 @@ void CudaRasterizer::Rasterizer::lightpassBackwardFull(
         1.0f, geom.cov3D, view, proj, width/(2.0f*tan_fovx), height/(2.0f*tan_fovy),
         tan_fovx, tan_fovy, (const glm::vec3*)campos, (const float3*)dmean2D,
         dconic, nullptr, dtau, (glm::vec3*)dmeans, nullptr, dcov, nullptr,
-        (glm::vec3*)dscale, (glm::vec4*)drot, false, light_tau_filter, true), debug);
+        (glm::vec3*)dscale, (glm::vec4*)drot, false, light_tau_filter, light_filter_variance, true), debug);
 }

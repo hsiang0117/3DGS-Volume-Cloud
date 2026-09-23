@@ -130,7 +130,7 @@ def compute_T_light_voxel(means3D, tau_v_l, scales, v_l, grid_res=128):
 
 
 def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
-                           v_l, image_size=512, tau_filter=False, full_grad=False):
+                           v_l, image_size=512, tau_filter=False, full_grad=True, filter_variance=0.0):
     """
     Per-Gaussian sun transmittance via a light-space rasterization pass.
 
@@ -148,7 +148,9 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
     differentiates all continuous recording/normalization/probe and projected
     geometry paths. Sun-camera framing, sorted order, support and discrete
     gates stay fixed in the VJP. tau_filter=True preserves the ideal 2D tau
-    integral while retaining the 0.3-pixel^2 sampling footprint; it does not
+    integral while retaining the filter_variance-pixel^2 sampling footprint.
+    filter_variance=0 disables light dilation and makes amplitude compensation
+    identically one, including its derivative. This does not
     claim exact nonlinear transmittance filtering or continuous volume mixing.
 
     Returns:
@@ -219,6 +221,7 @@ def compute_T_light_raster(means3D, tau_v_l, scales, rotations,
             # light-space order, so stock centre-depth sort is correct.
             antialiasing=False,
             light_tau_filter=bool(tau_filter),
+            light_filter_variance=float(filter_variance),
         )
 
     # Outside no_grad: the lightpass autograd Function carries gradient from
@@ -403,7 +406,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             means3D, tau_v_l, s, pc.get_rotation,
             v_l, image_size=int(getattr(pipe, "tlight_raster_res", 512)),
             tau_filter=bool(getattr(pipe, "tlight_tau_filter", False)),
-            full_grad=bool(getattr(pipe, "tlight_full_grad", False)))
+            full_grad=bool(getattr(pipe, "tlight_full_grad", True)),
+            filter_variance=float(getattr(pipe, "tlight_filter_variance", 0.0)))
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):

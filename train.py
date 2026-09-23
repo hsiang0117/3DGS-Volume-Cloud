@@ -196,16 +196,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             # prune shrinks P and this iteration's indices (visibility_filter / radii) go stale.
             gaussians.tick_post_densify_maintenance(opt, iteration)
 
-            # Needle surgery shares the exclusive densification cutoff. Placed after
-            # other structure changes so the optimizer sees consistent tensors.
-            needle_iv = getattr(opt, "needle_split_interval", 0)
-            if (needle_iv > 0 and iteration % needle_iv == 0
-                    and iteration < opt.densify_until_iter):
-                n_split = gaussians.split_needles(
-                    getattr(opt, "needle_split_ratio", 30.0), opt)
-                if n_split > 0:
-                    print(f"\n[ITER {iteration}] needle surgery: split {n_split} (ratio > {opt.needle_split_ratio})")
-
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.project_sigma_t()

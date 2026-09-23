@@ -159,6 +159,7 @@ __global__ void computeCov2DCUDA(int P,
 	float* dL_dcov,
 	bool antialiasing,
 	bool light_tau_filter,
+	float light_filter_variance,
 	bool exact_light)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -208,7 +209,7 @@ __global__ void computeCov2DCUDA(int P,
 	float c_yy = cov2D[1][1];
 	
 	const float raw_xx = c_xx, raw_xy = c_xy, raw_yy = c_yy;
-	constexpr float h_var = 0.3f;
+	const float h_var = light_filter_variance;
 	float d_inside_root = 0.f;
 	if(antialiasing)
 	{
@@ -248,7 +249,7 @@ __global__ void computeCov2DCUDA(int P,
 		dL_dc_xy = dL_dz;
 	}
 	
-	if (light_tau_filter)
+	if (light_tau_filter && h_var > 0.0f)
 	{
 		const float d0 = raw_xx * raw_yy - raw_xy * raw_xy;
 		const float d1 = c_xx * c_yy - c_xy * c_xy;
@@ -696,6 +697,7 @@ void BACKWARD::preprocess(
 	glm::vec4* dL_drot,
 	bool antialiasing,
 	bool light_tau_filter,
+	float light_filter_variance,
 	bool exact_light)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
@@ -720,6 +722,7 @@ void BACKWARD::preprocess(
 		dL_dcov3D,
 		antialiasing,
 		light_tau_filter,
+		light_filter_variance,
 		exact_light);
 
 	// Propagate gradients for remaining steps: finish 3D mean gradients,

@@ -68,17 +68,14 @@ class ModelParams(ParamGroup):
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
         # T_light source: light-space rasterization (sun-camera shadow pass,
-        # record_front_tau + native lightpass backward). Optional full continuous
-        # light gradients are controlled below. --tlight_voxel selects the
+        # record_front_tau + full continuous lightpass backward, no dilation).
+        # --tlight_voxel selects the
         # 128^3 voxel cache instead (a fallback flag rather than
         # tlight_raster=True, so the DEFAULT is expressed by an absent flag and
         # old cfgs without the key still resolve to raster); the viewer matches
         # the source a model was trained with via cfg_args.
         self.tlight_voxel = False
         self.tlight_raster_res = 512
-        # Independent light-pass experiments; old checkpoints keep legacy behavior.
-        self.tlight_tau_filter = False
-        self.tlight_full_grad = False
         # Apply the fixed Narkowicz ACES curve to the final image so loss and
         # metrics live in the GT's display space; render() lifts the per-Gaussian
         # radiance clamp to HDR in this mode. Disable with --no-tonemap_aces for a
@@ -101,6 +98,13 @@ class PipelineParams(ParamGroup):
         self.env_sh_order = 2          # SH order for sky radiance E_lm and visibility V_lm (SH2 = 9 coeffs)
         self.env_transfer_dirs = 48    # # hemisphere directions sampled for the V_lm precompute
         super().__init__(parser, "Pipeline Parameters")
+
+    def extract(self, args):
+        from utils.lightpass_config import training_lightpass_settings
+        group = super().extract(args)
+        # Persist fixed behavior for reproducible viewer/evaluation; not CLI flags.
+        vars(group).update(training_lightpass_settings())
+        return group
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
@@ -163,10 +167,4 @@ class OptimizationParams(ParamGroup):
         # Interval of the extra prune pass run inside the densify window;
         # 0 disables.
         self.post_densify_prune_interval = 1000
-        # Needle surgery: every `needle_split_interval` iterations, split Gaussians
-        # whose max/min scale ratio exceeds `needle_split_ratio` into two children
-        # along the major axis; 0 disables. Runs only while
-        # iteration < densify_until_iter, using the same cutoff as densification.
-        self.needle_split_interval = 1000
-        self.needle_split_ratio = 30.0
         super().__init__(parser, "Optimization Parameters")

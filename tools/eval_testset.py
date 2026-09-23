@@ -20,6 +20,7 @@ from scene.dataset_readers import readCamerasFromTransforms
 from utils.camera_utils import cameraList_from_camInfos
 from utils.system_utils import searchForMaxIteration
 from gaussian_renderer import render
+from utils.lightpass_config import saved_lightpass_settings
 from utils.loss_utils import l1_loss, ssim          # same funcs as train.py
 from utils.image_utils import psnr, get_lpips_fn    # same funcs as train.py
 
@@ -46,8 +47,7 @@ g = GaussianModel()
 g.load_ply(ply)
 env_lighting = (g.env_net is not None) and (g._sky_transfer.numel() > 0)
 pipe = Namespace(tlight_voxel=not use_raster, tlight_raster_res=raster_res,
-                 tlight_tau_filter="tlight_tau_filter=True" in cfg,
-                 tlight_full_grad="tlight_full_grad=True" in cfg,
+                 **saved_lightpass_settings(cfg),
                  tonemap_aces="tonemap_aces=True" in cfg,
                  tonemap_learnable="tonemap_learnable=True" in cfg,
                  env_lighting=env_lighting, env_sh_order=g.env_sh_order)

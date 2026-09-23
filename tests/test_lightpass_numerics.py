@@ -14,12 +14,12 @@ from gaussian_renderer import classify_T_light
 from utils.graphics_utils import getProjectionMatrix
 
 
-def settings(filtered=False):
+def settings(filtered=False, variance=0.3):
     return GaussianRasterizationSettings(image_height=10,image_width=12,tanfovx=1.,tanfovy=1.,
         bg=torch.zeros(3,device='cuda'),scale_modifier=1.,viewmatrix=torch.eye(4,device='cuda'),
         projmatrix=getProjectionMatrix(.1,20.,1.5707963267948966,1.5707963267948966).T.cuda(),
         sh_degree=0,campos=torch.zeros(3,device='cuda'),prefiltered=False,debug=True,antialiasing=False,
-        light_tau_filter=filtered)
+        light_tau_filter=filtered, light_filter_variance=variance)
 
 
 def fixture(case='normal',dtype=torch.float32):
@@ -49,7 +49,7 @@ def project(inputs,sett):
     A=J@view[:3,:3].T
     cov=A@cov3@A.transpose(1,2)
     rawdet=cov[:,0,0]*cov[:,1,1]-cov[:,0,1].square()
-    c=cov+torch.eye(2,device='cuda',dtype=means.dtype)*.3
+    c=cov+torch.eye(2,device='cuda',dtype=means.dtype)*sett.light_filter_variance
     det=c[:,0,0]*c[:,1,1]-c[:,0,1].square()
     conic=torch.stack([c[:,1,1],-c[:,0,1],c[:,0,0]],dim=1)/det[:,None]
     scale=torch.sqrt(rawdet.clamp_min(0)/det) if sett.light_tau_filter else torch.ones_like(tau)
@@ -100,12 +100,13 @@ def transmittance(outputs):
 
 
 class LightpassTests(unittest.TestCase):
+    variance=0.3
     def test_forward_dense_reference_and_gradients(self):
         results=[]
         for case in ['normal','saturated']:
             for filtered in [False,True]:
                 with self.subTest(case=case,filtered=filtered):
-                    sett=settings(filtered)
+                    sett=settings(filtered,self.variance)
                     cuda_in=fixture(case)
                     ref_in=[x.detach().double().requires_grad_(True) for x in cuda_in]
                     actual=rasterize_lightpass(*cuda_in,sett,full_grad=True)
@@ -138,7 +139,7 @@ class LightpassTests(unittest.TestCase):
     def test_partial_control_preserves_surrogate_tau_derivative(self):
         for filtered in [False,True]:
             inputs=fixture()
-            sett=settings(filtered)
+            sett=settings(filtered,self.variance)
             actual=rasterize_lightpass(*inputs,sett,full_grad=False)
             ref_in=[x.detach().double().requires_grad_(True) for x in inputs]
             expected=reference(ref_in,sett,partial=True)
@@ -149,12 +150,12 @@ class LightpassTests(unittest.TestCase):
 
     def test_filter_preserves_analytic_tau_integral(self):
         inputs=fixture()
-        _,_,packed,d0,d1,h=project(inputs,settings(True))
+        _,_,packed,d0,d1,h=project(inputs,settings(True,self.variance))
         torch.testing.assert_close(inputs[1]*torch.sqrt(d0),packed*torch.sqrt(d1),rtol=2e-6,atol=1e-7)
-        self.assertTrue(bool((h<1).all()))
+        self.assertTrue(bool((h<1).all()) if self.variance>0 else bool((h==1).all()))
 
     def test_finite_differences(self):
-        sett=settings(True)
+        sett=settings(True,self.variance)
         inputs=fixture()
         coeff=torch.tensor([.3,-.7,.4,1.1],device='cuda')
         def loss(values):
@@ -175,9 +176,13 @@ class LightpassTests(unittest.TestCase):
 
     def test_empty_input(self):
         inputs=[torch.empty(shape,device='cuda',requires_grad=True) for shape in [(0,3),(0,),(0,3),(0,4)]]
-        out=rasterize_lightpass(*inputs,settings(True),full_grad=True)
+        out=rasterize_lightpass(*inputs,settings(True,self.variance),full_grad=True)
         grad=torch.autograd.grad(sum(out[i].sum() for i in [0,1,3,4]),inputs)
         self.assertTrue(all(g.numel()==0 for g in grad))
+
+
+class NoDilationTests(LightpassTests):
+    variance=0.0
 
 
 if __name__=='__main__':

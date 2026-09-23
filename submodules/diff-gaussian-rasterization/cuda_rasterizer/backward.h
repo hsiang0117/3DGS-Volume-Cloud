@@ -96,6 +96,7 @@ namespace BACKWARD
 		glm::vec4* dL_drot,
 		bool antialiasing,
 		bool light_tau_filter = false,
+		float light_filter_variance = 0.3f,
 		bool exact_light = false);
 }
 

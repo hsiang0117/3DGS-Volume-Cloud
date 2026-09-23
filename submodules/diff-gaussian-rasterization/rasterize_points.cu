@@ -11,6 +11,7 @@
 
 #include <math.h>
 #include <torch/extension.h>
+#include <cmath>
 #include <cstdio>
 #include <sstream>
 #include <iostream>
@@ -57,12 +58,17 @@ RasterizeGaussiansCUDA(
 	const bool antialiasing,
 	const bool record_front_tau,
 	const bool light_tau_filter,
+	const float light_filter_variance,
 	const bool debug)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
+  TORCH_CHECK(std::isfinite(light_filter_variance) && light_filter_variance >= 0.0f,
+              "light_filter_variance must be finite and nonnegative");
+  TORCH_CHECK(record_front_tau || light_filter_variance == 0.3f,
+              "Only the light pass supports configurable dilation");
   TORCH_CHECK(!light_tau_filter || (record_front_tau && (tau_precomp.numel() > 0 || means3D.size(0) == 0)),
               "light_tau_filter requires an analytic-tau light pass");
   const int P = means3D.size(0);
@@ -148,6 +154,7 @@ RasterizeGaussiansCUDA(
 		do_front_tau ? tau_front_TG_sum.contiguous().data<float>() : nullptr,
 		do_front_tau ? tau_front_G_sum.contiguous().data<float>() : nullptr,
 		light_tau_filter,
+		light_filter_variance,
 		radii.contiguous().data<int>(),
 		debug);
   }
@@ -319,7 +326,7 @@ RasterizeLightpassFullBackwardCUDA(
     float tan_fovx, float tan_fovy, int height, int width,
     const torch::Tensor& gs, const torch::Tensor& gw, const torch::Tensor& gtg, const torch::Tensor& gg,
     const torch::Tensor& geom, int R, const torch::Tensor& binning, const torch::Tensor& image,
-    bool light_tau_filter, bool debug)
+    bool light_tau_filter, float light_filter_variance, bool debug)
 {
     const int P = means.size(0);
     auto opts = means.options();
@@ -341,7 +348,7 @@ RasterizeLightpassFullBackwardCUDA(
             gs.contiguous().data_ptr<float>(), gw.contiguous().data_ptr<float>(),
             gtg.contiguous().data_ptr<float>(), gg.contiguous().data_ptr<float>(),
             dm2.data_ptr<float>(), dq.data_ptr<float>(), dt.data_ptr<float>(), dm.data_ptr<float>(),
-            dcov.data_ptr<float>(), ds.data_ptr<float>(), dr.data_ptr<float>(), light_tau_filter, debug);
+            dcov.data_ptr<float>(), ds.data_ptr<float>(), dr.data_ptr<float>(), light_tau_filter, light_filter_variance, debug);
     }
     return std::make_tuple(dm, dt, ds, dr);
 }

@@ -1,4 +1,4 @@
-"""Run paired light-pass experiments with shape/light/gradient monitoring.
+"""Run training with shape/light/gradient monitoring.
 
 The training camera RNG is independent and a full prefetch queue never drops a
 frame, so every variant sees an identical sequence. The physical trainer, its
@@ -6,7 +6,7 @@ loss, optimizer and topology rules are otherwise unchanged.
 
 Example (from repository root):
     python tools/train_lightpass_ablation.py -s D:/dataset/CloudDatasetZenith \
-        -m output/<new-run> --tlight_tau_filter --tlight_full_grad --eval
+        -m output/<new-run> --eval
 
 No losses, renderer kernels, optimizer updates, or topology rules are replaced.
 The monitor runs before this iteration's topology changes and optimizer step.

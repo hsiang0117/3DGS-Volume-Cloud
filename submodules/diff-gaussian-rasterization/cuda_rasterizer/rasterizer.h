@@ -61,6 +61,7 @@ namespace CudaRasterizer
 			float* tau_front_TG_sum,
 			float* tau_front_G_sum,
 			bool light_tau_filter,
+	float light_filter_variance,
 			int* radii = nullptr,
 			bool debug = false);
 
@@ -86,7 +87,7 @@ namespace CudaRasterizer
 			char* geom_buffer, char* binning_buffer, char* image_buffer,
 			const float* grad_sum, const float* grad_wsum, const float* grad_TG, const float* grad_G,
 			float* dmean2D, float* dconic, float* dtau, float* dmeans,
-			float* dcov, float* dscale, float* drot, bool light_tau_filter, bool debug);
+			float* dcov, float* dscale, float* drot, bool light_tau_filter, float light_filter_variance, bool debug);
 
 		static void backward(
 			const int P, int D, int M, int R,

@@ -236,10 +236,10 @@ def main():
             raise ValueError('Environment lighting requested, but checkpoint sidecars failed to load')
         if cfg.get('tonemap_learnable', False) and model.get_tonemap_coeffs is None:
             raise ValueError('Learnable tonemap requested, but coefficients failed to load')
+        from utils.lightpass_config import saved_lightpass_settings
         pipe = argparse.Namespace(tlight_voxel=cfg.get('tlight_voxel', False),
                                   tlight_raster_res=cfg.get('tlight_raster_res', 512),
-                                  tlight_tau_filter=cfg.get('tlight_tau_filter', False),
-                                  tlight_full_grad=cfg.get('tlight_full_grad', False),
+                                  **saved_lightpass_settings(cfg),
                                   tonemap_aces=cfg.get('tonemap_aces', False),
                                   tonemap_learnable=cfg.get('tonemap_learnable', False),
                                   env_lighting=use_env, env_sh_order=model.env_sh_order)

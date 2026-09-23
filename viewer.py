@@ -25,6 +25,7 @@ import viser
 
 from scene.gaussian_model import GaussianModel
 from scene.cameras import MiniCam
+from utils.lightpass_config import saved_lightpass_settings
 from gaussian_renderer import render, compute_T_light_voxel, compute_T_light_raster, normalized_gaussian_line_integral
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import build_rotation
@@ -95,7 +96,7 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
 
 @torch.no_grad()
 def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
-                          use_raster: bool = False, raster_res: int = 512, tau_filter: bool = False) -> torch.Tensor:
+                          use_raster: bool = False, raster_res: int = 512, tau_filter: bool = False, filter_variance: float = 0.0) -> torch.Tensor:
     """Compute T_light for the given sun direction.
 
     Mirrors the per-Gaussian τ derivation inside render() so the cache matches
@@ -125,6 +126,7 @@ def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
             v_l,
             image_size=raster_res,
             tau_filter=tau_filter,
+            filter_variance=filter_variance,
         )
         return T.view(-1, 1)
     return compute_T_light_voxel(
@@ -319,6 +321,9 @@ def main():
     use_raster_tlight = True
     tlight_raster_res = 512
     tlight_tau_filter = False
+    tlight_filter_variance = 0.0
+    # Training metadata only: the viewer never calls backward.
+    trained_tlight_full_grad = True
     # Tonemap: cfg flags say whether a curve was trained and which kind; learnable
     # coeffs are confirmed after load_ply (tonemap.json sidecar).
     forced_tonemap = {"on": True, "off": False}.get(args.tonemap, None)
@@ -332,6 +337,7 @@ def main():
         try:
             with open(cfg_path) as f:
                 cfg = f.read()
+            print(f"[viewer] Training config: {cfg_path}")
         except Exception as e:
             print(f"[viewer] cfg_args unreadable ({e}); falling back to the PROJECT "
                   f"defaults for T_light / tonemap — pass --tlight and --tonemap "
@@ -356,7 +362,10 @@ def main():
     # --tlight raster), take the resolution the model was trained with.
     # Purely informational when raster is not used.
     if cfg is not None:
-        tlight_tau_filter = "tlight_tau_filter=True" in cfg
+        light_settings = saved_lightpass_settings(cfg)
+        tlight_tau_filter = light_settings['tlight_tau_filter']
+        trained_tlight_full_grad = light_settings['tlight_full_grad']
+        tlight_filter_variance = light_settings['tlight_filter_variance']
         m = re.search(r"tlight_raster_res=(\d+)", cfg)
         if m:
             v = int(m.group(1))
@@ -376,6 +385,11 @@ def main():
         cfg_tonemap_aces = True
     print(f"[viewer] T_light source: {'raster' if use_raster_tlight else 'voxel'}"
           f"{f' ({tlight_raster_res}^2)' if use_raster_tlight else ''}")
+    filter_label = ("ON" if tlight_tau_filter else "OFF") if use_raster_tlight else "N/A (voxel)"
+    print(f"[viewer] T_light tau filter: {filter_label} (from cfg_args)")
+    print(f"[viewer] T_light dilation variance: {tlight_filter_variance} pixel^2 (from cfg_args)")
+    print(f"[viewer] Training full light gradients: {trained_tlight_full_grad} "
+          "(training only; no effect on viewer forward rendering)")
 
     print(f"[viewer] Loading {args.ply} ...")
     gaussians = GaussianModel()
@@ -433,7 +447,7 @@ def main():
     t0 = time.time()
     T_light = compute_T_light_cache(
         gaussians, torch.from_numpy(initial_sun).cuda(),
-        use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter,
+        use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter, filter_variance=tlight_filter_variance,
     ).detach()
     torch.cuda.synchronize()
     print(f"[viewer] T_light ready in {time.time() - t0:.2f}s. Shape = {tuple(T_light.shape)}")
@@ -513,6 +527,16 @@ def main():
 
     server = viser.ViserServer(port=args.port)
     server.scene.world_axes.visible = True
+    light_source_label = f"raster {tlight_raster_res} x {tlight_raster_res}" if use_raster_tlight else "voxel 128^3"
+    server.gui.add_markdown(
+        f"**Model:** `{os.path.basename(run_dir)}`  \n"
+        f"**Light pass:** {light_source_label}  \n"
+        f"**Tau footprint compensation:** {filter_label}  \n"
+        f"**Light dilation variance:** {tlight_filter_variance} pixel²  \n"
+        f"**Full light gradients during training:** {trained_tlight_full_grad}  \n"
+        "The gradient setting affects training only. "
+        "Light-pass settings are read from the model config on startup."
+    )
 
     # Sun direction arrow: drawn outside the cloud bbox, pointing along the
     # *light propagation* direction. Updated via the handle's `position` + `wxyz`.
@@ -807,7 +831,7 @@ def main():
         with torch.no_grad():
             new_cache = compute_T_light_cache(
                 gaussians, torch.from_numpy(new_sun).cuda(),
-                use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter,
+                use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter, filter_variance=tlight_filter_variance,
             ).detach()
         torch.cuda.synchronize()
         state["v_l"] = new_sun
@@ -914,7 +938,7 @@ def main():
             with torch.no_grad():
                 new_cache = compute_T_light_cache(
                     gaussians, torch.from_numpy(new_sun).cuda(),
-                    use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter,
+                    use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter, filter_variance=tlight_filter_variance,
                 ).detach()
             state["v_l"] = new_sun
             state["T_light"] = new_cache

@@ -42,13 +42,14 @@ T_light = 每个高斯沿太阳方向的"前方遮挡透射率"。默认实现�
 
 - 远距窄 FOV 透视相机伪装方向光太阳(视差 <2%,免改 EWA 雅可比);
 - CUDA `record_front_tau` 通道:深度序遍历中,每高斯记录其前方累积 τ 的 α·T 加权均值(整个向阳 footprint 上的能量加权,而非中心点采样);
-- **原生可微 backward**:默认保留旧的部分梯度(τ 路径,权重与光照足迹冻结);`--tlight_full_grad` 补齐权重、归一化、弱密度备用透射率及投影位置/尺度/旋转的连续梯度。太阳相机构图、排序、覆盖与阈值分支仍视为常量;
+- **完整连续梯度默认开启**:包含 τ、权重、归一化、弱密度备用透射率及投影位置/尺度/旋转的梯度。太阳相机构图、排序、覆盖与阈值分支仍视为常量;
+- **光照 pass 完全不扩张**:投影协方差不再加 `0.3I`，也无需幅值补偿；相机主 pass 的采样扩张保持原样。以上行为固定为默认，不需要额外训练参数;
 - 深埋高斯(early-termination 导致 wsum=0)显式映射为全阴影,防反转;
 - `--tlight_voxel` 回退到旧的 128³ 体素缓存路径(与 raster 之前训练的模型配套;viewer 的 `--tlight auto` 读 cfg_args 自动匹配)。
 
-### 针手术(结构性 aniso 控制,默认开启)
+### 各向异性控制
 
-软正则压不住的高各向异性尾巴由 `split_needles` 结构性重写:每 1000 迭代,ratio>30 的高斯增肥薄轴 ×2(ratio 减半)、σ_t/3.2 近似守恒消光截面、沿主轴劈成两子。等效硬上限,不与光度梯度拔河。
+保留 log-ratio 软正则（默认 `lambda_aniso=0.001`、`aniso_ratio_max=5`）。针手术的结构性分裂、训练调用和参数已删除；常规致密化与剪枝继续保留。
 
 ### 物理化的致密化与维护
 
@@ -162,10 +163,8 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化;完整连续梯度由 --tlight_full_grad 控制);与 raster 之前训练的模型配套 |
+| `--tlight_voxel` | False | **回退**到旧 128³ 体素 T_light(默认为光照空间光栅化;默认完整连续梯度、零扩张);与 raster 之前训练的模型配套 |
 | `--tlight_raster_res` | 512 | 光照 pass 的太阳相机分辨率(阴影分辨率) |
-| `--tlight_tau_filter` | False | 光照实验:保留最小像素足迹,通过幅值补偿保持理想二维 τ 积分;不影响相机主 pass |
-| `--tlight_full_grad` | False | 光照实验:固定构图和离散分支,补齐光照估计器的连续梯度 |
 | `--tonemap_aces` | **True** | 默认开启:图像端套固定 Narkowicz ACES,匹配 UE filmic GT 空间。真·线性 GT 数据用 **`--no-tonemap_aces`** 关闭(默认 True 的 bool 走 `BooleanOptionalAction`),无需改源码 |
 | `--tonemap_learnable` | False | 可选:让 ACES 的 4 系数可学习(独立优化器,系数存 `tonemap.json`),保留作换其他 filmic 引擎的保险;开启时优先于固定 ACES |
 
@@ -231,16 +230,6 @@ eval 默认开启(test split 不并入训练),结束时在 test 集上输出 PSN
 | `--resurrect_interval` | 3000 | 每 N 迭代把贡献度最低的一批 σ_t 重置回 0.1(替代 stock reset_opacity)。**仅 densify 期间生效**——settle 期运行会与剪枝形成净销毁回路 |
 | `--resurrect_fraction` | 0.05 | 每次 resurrect 的点数占比 |
 | `--post_densify_prune_interval` | 1000 | densify 期内的额外剪枝周期;0 关闭。**注:维护(resurrect/prune/reset)只在 densify 期运行,densify 结束后即停**——settle 期运行会与剪枝形成净销毁回路 |
-
-#### 针手术(极端各向异性分裂)
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--needle_split_interval` | 1000 | 手术周期;**0 = 关闭** |
-| `--needle_split_ratio` | 30.0 | 分裂触发阈值(max/min 轴比) |
-| `--densify_until_iter` | 15000 | 与增密共用的截止迭代,严格小于该值时才允许针手术 |
-
-针手术直接复用增密门控 `iteration < densify_until_iter`。默认每 1000 步检查一次,最后一次检查为 14000 步;从 15000 步起不再增密或执行针手术,继续优化现有高斯的参数。调整 `--densify_until_iter` 会同步调整两者的截止时间。旧的独立参数 `--needle_split_until_iter` 已移除,训练命令请改用 `--densify_until_iter`。
 
 #### 调试与日志(train.py)
 
@@ -313,6 +302,10 @@ python viewer.py --ply output/<run>/.../point_cloud.ply --sky_dir data/sky_backd
 ```
 
 基于 viser:实时改变太阳方向(relighting)、可视化通道(RGB / T_light / σ_t / depth)、可调背景色、snap 到训练相机。`--tlight auto|voxel|raster` 控制阴影源(auto 读训练 run 的 cfg_args)。加载 Stage 2 模型时自动检测 env sidecar 并开启环境光(太阳滑块同时驱动 `T_sun` + `E_lm`,可勾选框 A/B 开关)。
+
+新训练自动将完整梯度、零扩张的固定设置写入 `cfg_args`，这些字段是复现信息，不再是训练命令行参数。Viewer 与评估工具读取同一配置：历史模型缺少字段时按旧版 0.3 扩张、无补偿处理；实验模型按其已保存设置处理。没有 `cfg_args` 时 viewer 使用当前项目默认值。启动日志与界面显示实际光照配置。请保留 `<run>/cfg_args` 与 `point_cloud/iteration_N/point_cloud.ply` 的目录结构。修改代码或重编译扩展后需要重启 viewer 进程。
+
+对比两个模型时请 snap 到同一相机与 time index，并保持输出尺寸、太阳、tonemap 和背景一致；默认自由视角由各模型的包围范围计算，初始视点可能不同。界面光照分辨率与 `Max render size` 是两个独立设置，后者控制显示图像尺寸。
 
 **天空背景(`--sky_dir`,可选,纯展示)**:给定一组 per-太阳高度的 HDR cubemap(见下),viewer 把云合成到真实天空前而非纯色底。太阳**高度**滑块选 cube、**方位**滑块旋转它(SkyAtmosphere 绕天顶轴旋转对称,唯一破对称的太阳随之转)。合成在 **rasterizer 内一趟完成**(逐像素 `bg_image` 线性 over + 单次 tonemap),"Sky backdrop" 勾选框开关,`Sky exposure`(默认 3.35)/`Sky warmth`(默认 0.09)对齐 UE 视口观感。**纯 viewer 展示,不进训练、不碰冻结的 albedo**;诊断通道保持纯色底。
 

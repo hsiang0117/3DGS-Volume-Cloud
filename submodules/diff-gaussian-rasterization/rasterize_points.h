@@ -40,6 +40,7 @@ RasterizeGaussiansCUDA(
 	const bool antialiasing,
 	const bool record_front_tau,
 	const bool light_tau_filter,
+	const float light_filter_variance,
 	const bool debug);
 
 torch::Tensor
@@ -63,7 +64,7 @@ RasterizeLightpassFullBackwardCUDA(
     const torch::Tensor& grad_sum, const torch::Tensor& grad_wsum,
     const torch::Tensor& grad_TG, const torch::Tensor& grad_G,
     const torch::Tensor& geom, int R, const torch::Tensor& binning, const torch::Tensor& image,
-    bool light_tau_filter, bool debug);
+    bool light_tau_filter, float light_filter_variance, bool debug);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

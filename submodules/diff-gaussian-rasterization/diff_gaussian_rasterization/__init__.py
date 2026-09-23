@@ -90,6 +90,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.antialiasing,
             raster_settings.record_front_tau,
             raster_settings.light_tau_filter,
+            raster_settings.light_filter_variance,
             raster_settings.debug
         )
 
@@ -214,6 +215,7 @@ class _RasterizeLightpass(torch.autograd.Function):
             raster_settings.antialiasing,
             True,   # record_front_tau
             raster_settings.light_tau_filter,
+            raster_settings.light_filter_variance,
             raster_settings.debug,
         )
         (num_rendered, _, radii, geomBuffer, binningBuffer, imgBuffer,
@@ -243,7 +245,7 @@ class _RasterizeLightpass(torch.autograd.Function):
                 raster_settings.tanfovx, raster_settings.tanfovy,
                 raster_settings.image_height, raster_settings.image_width,
                 *gradients, geomBuffer, ctx.num_rendered, binningBuffer, imgBuffer,
-                raster_settings.light_tau_filter, raster_settings.debug)
+                raster_settings.light_tau_filter, raster_settings.light_filter_variance, raster_settings.debug)
             return gm, gt, gs, gr, None, None
         dL_dtau = _C.rasterize_lightpass_backward(
             tau_precomp,
@@ -283,6 +285,8 @@ class GaussianRasterizationSettings(NamedTuple):
     # pass. None -> constant `bg` (training path, unchanged). Forward-only.
     bg_image : torch.Tensor = None
     light_tau_filter : bool = False
+    # Pixel squared; camera pass remains fixed at 0.3. Zero disables light dilation.
+    light_filter_variance : float = 0.3
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
