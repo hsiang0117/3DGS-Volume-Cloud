@@ -374,3 +374,48 @@ pip install --no-build-isolation --force-reinstall --no-deps ./submodules/diff-g
   url     = {https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/}
 }
 ```
+
+
+## 云体组件消融分支
+
+三条实验分支使用同一 Python 实现，仅训练默认常量不同；不需要额外训练参数：
+
+| 分支 | `component_ablation` 默认值 | 太阳透射 | 散射项 |
+|---|---|---|---|
+| `experiment/ablation-no-tlight` | `no_tlight` | `T_light=1` | 原六八度、权重可学习 |
+| `experiment/ablation-single-scattering` | `single_scattering` | 保留原太阳 pass | 仅 `n=0`，固定 `w0=1` |
+| `experiment/ablation-no-tlight-single-scattering` | `no_tlight_single_scattering` | `T_light=1` | 仅 `n=0`，固定 `w0=1` |
+
+训练默认值在 `utils/component_ablation.py`；`PipelineParams.extract()` 自动将模式
+写入 `<run>/cfg_args`。在 Uniform（env-off）上按相同训练预算从头训练，输出目录使用
+`<timestamp>_ablation_<mode>`。本改动不涉及 CUDA，无需重编译扩展。
+
+无太阳透射模式只去掉云内沿太阳方向的遮挡/衰减，保留 HG 散射角、`g`、RGB `omega`、
+观察方向的光学厚度/opacity 和原显示映射。即使调用方传了预计算太阳缓存，renderer 也
+会先按模式令 `T_light=1`，避免意外复用完整模型的缓存。Stage 2 的 `T_sun`、天空 MLP 与
+`precompute_sky_transfer` 独立保持原逻辑：`T_sky` 不被这个分支关闭。
+
+单次散射模式严格保留 `scatter_sum = T_light * HG(g, cos_theta)`，而不是让 `w0` 继续学习，
+也不是把整个 `scatter_sum` 清零。为保持原 PLY、Adam 分组和增密/剪枝生命周期兼容，
+仍保留六列 `_w` 占位参数与 `w` optimizer group。单次模式 forward 完全不读取 `_w`，
+因此其梯度为 `None`，Adam 不更新它，也不会为未用过的权重分配一阶/二阶 moment。
+不能直接删除 `w` group：当前 `prune_points` 与两种增密路径依赖返回的 `w` 键。
+保存的 `w_*` 是未使用的格式占位，活跃散射公式由 `cfg_args` 中的模式决定。
+
+Viewer 和三个评估入口（`eval_testset.py`、`eval_test_groups.py`、`eval_cloud_region.py`）
+从模型 `cfg_args` 读取模式；它不受当前 checkout 的训练默认值影响。旧模型没有该字段时
+按 `full` 读取。请保留 `<run>/cfg_args` 与标准 PLY 目录结构；仅复制裸 PLY 无法恢复消融
+模式。Viewer 的太阳滑块仍驱动 HG 和环境项，无太阳透射模式的 `T_light` 通道恒为 1。
+未打本补丁的 main renderer/viewer 不适用于新消融模型；请使用任意一个上述实验分支的
+mode-aware renderer/viewer，通过模型 `cfg_args` 恢复正确模式，无需将兼容模块合入 main。
+
+三分支共用修正后的 camera prefetch 协议：队列满时保留当前 camera 并重试入队，直到成功
+或收到 stop，不丢弃已抽中的训练样本。保留原 Python/NumPy/Torch seed=0 和无放回 stack
+抽样语义，不新增采样超参。消费端按真实 `camera.image_path` 查回数据 JSON 元数据，输出
+`training_sampling.jsonl` 与 `training_sampling_manifest.json`；序列 SHA 包含每步 iteration、
+相对 file_path、cam_index、time_index、image_name，排除 branch/run/绝对路径，便于三臂配对核对。
+正常完成必须记录完整 30,000 条；manifest 中 test 消费数量应为 0。保留原 test/save 7k/30k
+安排，没有额外增加 15k 节点或计时项。
+
+历史 full 模型没有 sampling sequence 记录，且使用队列满时可能丢样的旧预取协议。
+它只能作为历史参考，不能与新三臂声称严格配对的采样对照；不要把旧模型与本次协议混称。
