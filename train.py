@@ -233,6 +233,53 @@ def _resolve_stage1_ply(stage1_model):
     sys.exit(f"Could not find a point_cloud.ply under {stage1_model}")
 
 
+def _inherit_stage1_render_settings(pipe, stage1_ply):
+    """Restore the selected Stage-1 checkpoint's formula before saving Stage-2 cfg.
+
+    An ablation PLY alone cannot identify its formula. Require cfg_args beside
+    the PLY, or in its standard run ancestor; never guess from this branch.
+    """
+    import ast
+    import hashlib
+    from pathlib import Path
+    from utils.lightpass_config import saved_lightpass_settings
+
+    ply = Path(stage1_ply).resolve()
+    # Flat PLY / iteration dir / canonical run/point_cloud/iteration_N PLY.
+    candidates = [parent / "cfg_args" for parent in list(ply.parents)[:3]]
+    cfg_path = next((path for path in candidates if path.is_file()), None)
+    if cfg_path is None:
+        raise FileNotFoundError(
+            f"Stage-2 ablation requires the Stage-1 cfg_args for {ply}. "
+            "Keep the run directory with cfg_args; a bare PLY does not record "
+            "component_ablation and cannot safely determine its rendering formula.")
+    raw = cfg_path.read_bytes()
+    text = raw.decode("utf-8-sig").strip()
+    node = ast.parse(text, mode="eval").body
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "Namespace" and not node.args
+            and all(k.arg is not None for k in node.keywords)):
+        raise ValueError(f"Stage-1 cfg_args must be a literal Namespace(...): {cfg_path}")
+    config = {k.arg: ast.literal_eval(k.value) for k in node.keywords}
+    vars(pipe).update(saved_lightpass_settings(config))
+    # Preserve the native legacy source-selection rule used by eval/viewer.
+    pipe.tlight_voxel = (bool(config["tlight_voxel"]) if "tlight_voxel" in config
+                         else not bool(config.get("tlight_raster", False)))
+    pipe.tlight_raster_res = int(config.get("tlight_raster_res", 512))
+    if pipe.tlight_raster_res <= 0:
+        raise ValueError(f"Invalid Stage-1 tlight_raster_res in {cfg_path}")
+    pipe.tonemap_aces = bool(config.get("tonemap_aces", False))
+    pipe.tonemap_learnable = bool(config.get("tonemap_learnable", False))
+    print(f"[stage2] inherited mode={pipe.component_ablation} from {cfg_path}")
+    print(f"[stage2] inherited sun pass={'voxel' if pipe.tlight_voxel else 'raster'} "
+          f"res={pipe.tlight_raster_res}, tau_filter={pipe.tlight_tau_filter}, "
+          f"full_grad={pipe.tlight_full_grad}, variance={pipe.tlight_filter_variance}; "
+          f"ACES={pipe.tonemap_aces}, learnable_tonemap={pipe.tonemap_learnable}")
+    return {"stage1_cfg_path": str(cfg_path),
+            "stage1_cfg_sha256": hashlib.sha256(raw).hexdigest(),
+            "stage1_ply": str(ply)}
+
+
 def _stage2_env_ref_dirs():
     """Reference sun directions (OpenGL world, up=+Y) for env diagnostics."""
     out = []
@@ -329,10 +376,12 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
     The Stage-1 output is left untouched; results go to this run's -m / model_path."""
     pipe.env_lighting = True
     stage1_ply = _resolve_stage1_ply(stage1_model)
+    stage1_cfg_provenance = _inherit_stage1_render_settings(pipe, stage1_ply)
     print(f"[stage2] freezing Stage-1 model: {stage1_ply}")
 
     tb_writer = prepare_output_and_logger(dataset, pipe, opt,
-                                          extra={"stage2": True, "stage1_model": stage1_model})
+                                          extra={"stage2": True, "stage1_model": stage1_model,
+                                                 **stage1_cfg_provenance})
 
     gaussians = GaussianModel()
     gaussians.load_ply(stage1_ply)
@@ -387,6 +436,9 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
                 progress_bar.update(10)
             if tb_writer:
                 tb_writer.add_scalar("stage2/total_loss", loss.item(), iteration)
+            # Reuse this step's training forward; no extra render or sample.
+            if iteration % 1000 == 0:
+                save_periodic_render(scene.model_path, iteration, image, viewpoint_cam.image_name)
             if iteration in saving_iterations:
                 print(f"\n[stage2 ITER {iteration}] Saving (PLY + env sidecar)")
                 scene.save(iteration)

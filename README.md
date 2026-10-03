@@ -419,3 +419,23 @@ mode-aware renderer/viewer，通过模型 `cfg_args` 恢复正确模式，无需
 
 历史 full 模型没有 sampling sequence 记录，且使用队列满时可能丢样的旧预取协议。
 它只能作为历史参考，不能与新三臂声称严格配对的采样对照；不要把旧模型与本次协议混称。
+
+
+### 消融模型的 Stage 2
+
+Stage 2 必须保留对应 Stage 1 的 `cfg_args`：传入完整 run 目录、标准 iteration 目录，
+或仍位于该 run 目录树内的 PLY。裸 PLY 不包含消融模式，缺 cfg 时入口明确拒绝，
+不会用当前分支默认值猜测模式。Stage 2 在保存新 `cfg_args` 前，从源模型恢复
+`component_ablation`、太阳 pass 设置与 ACES/learnable 显示开关，并打印有效模式和
+源 cfg 路径；新 cfg 同时保存源 cfg 的 SHA256 与实际 PLY 路径。旧 cfg 没有消融字段
+时按 `full` 读取。使用任意已打补丁的实验分支加载另一模式时，也以模型 cfg 为准。
+
+Stage 2 仍冻结位置、密度、反照率、HG 参数、散射权重、尺度与旋转，仅拟合全局 EnvNet。
+独立的天空透射预计算 `T_sky` 保持原逻辑；无太阳透射模式只关闭逐帧 `T_light`。
+不改变默认 30k 预算、7k/30k test/save 节点或主分支。
+
+Stage 2 与 Stage 1 一样，每 1,000 步将当前训练机位/太阳方向的已有输出保存到
+`render_test/iter_NNNNNN_<image_name>.png`，完整 30k 训练应有 30 张预览。
+复用该步 EnvNet 更新前的训练前向结果，不额外渲染、不改变采样或梯度；预览 PNG
+沿用原保存函数的量化方式，只用于进度检查，不作为正式 Mask 指标输入。
+完整训练的进程墙钟时间包含这部分保存开销，优化器更新和原日志计时语义保持不变。
