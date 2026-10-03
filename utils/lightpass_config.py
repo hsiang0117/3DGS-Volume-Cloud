@@ -1,12 +1,14 @@
 """Fixed training behavior and read-only compatibility with saved light passes."""
 import ast
 import math
+from utils.component_ablation import training_component_ablation, saved_component_ablation
 
 
 def training_lightpass_settings():
     # Saved automatically in cfg_args, never registered as training arguments.
     return dict(tlight_tau_filter=False, tlight_full_grad=True,
-                tlight_filter_variance=0.0)
+                tlight_filter_variance=0.0,
+                component_ablation=training_component_ablation())
 
 
 def saved_lightpass_settings(config):
@@ -27,4 +29,5 @@ def saved_lightpass_settings(config):
         raise ValueError('Invalid tlight_filter_variance in cfg_args')
     return dict(tlight_tau_filter=bool(config.get('tlight_tau_filter', False)),
                 tlight_full_grad=bool(config.get('tlight_full_grad', False)),
-                tlight_filter_variance=variance)
+                tlight_filter_variance=variance,
+                component_ablation=saved_component_ablation(config))

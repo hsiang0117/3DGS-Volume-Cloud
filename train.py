@@ -1,4 +1,4 @@
-﻿#
+#
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -24,6 +24,7 @@ from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.camera_utils import CameraPrefetcher
+from utils.training_sample_log import TrainingSampleRecorder, SAMPLING_PROTOCOL
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -56,6 +57,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    sampling = TrainingSampleRecorder(scene.model_path, dataset.source_path, opt.iterations,
+                                      getattr(pipe, "component_ablation", "full"),
+                                      "stage2" if getattr(pipe, "env_lighting", False) else "stage1")
     prefetcher = CameraPrefetcher(scene, queue_size=2)
     ema_loss_for_log = 0.0
 
@@ -71,6 +75,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         # Pick a random Camera (image already prefetched by background worker)
         viewpoint_cam = prefetcher.next()
+        sampling.record(iteration, viewpoint_cam)
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -205,6 +210,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 if gaussians.tonemap_optimizer is not None:
                     gaussians.tonemap_optimizer.step()
                     gaussians.tonemap_optimizer.zero_grad(set_to_none = True)
+
+    prefetcher.shutdown()
+    sampling.finish()
 
 def _resolve_stage1_ply(stage1_model):
     """Resolve a Stage-1 model path (output dir, iteration dir, or .ply) to a point_cloud.ply."""
@@ -345,6 +353,9 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
           f"(env_lr={opt.env_lr}); pure-black bg, full-image supervision (no mask)")
 
     background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")  # pure black
+    sampling = TrainingSampleRecorder(scene.model_path, dataset.source_path, opt.iterations,
+                                      getattr(pipe, "component_ablation", "full"),
+                                      "stage2" if getattr(pipe, "env_lighting", False) else "stage1")
     prefetcher = CameraPrefetcher(scene, queue_size=2)
     ema_loss_for_log = 0.0
 
@@ -352,6 +363,7 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
     for iteration in range(1, opt.iterations + 1):
         gaussians.update_env_learning_rate(iteration)
         viewpoint_cam = prefetcher.next()
+        sampling.record(iteration, viewpoint_cam)
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image = render_pkg["render"]
@@ -387,6 +399,9 @@ def training_stage2(dataset, opt, pipe, testing_iterations, saving_iterations, s
         if hasattr(viewpoint_cam, "release_loaded"):
             viewpoint_cam.release_loaded()
     progress_bar.close()
+
+    prefetcher.shutdown()
+    sampling.finish()
 
     # Final eval: env-on (held-out vs seen split) + env-off baseline (env contribution).
     _log_env_params(gaussians, tag="final")
@@ -427,6 +442,8 @@ def prepare_output_and_logger(args, pipe=None, opt=None, extra=None):
         merged.update(vars(opt))
     if extra is not None:
         merged.update(extra)
+    merged["training_sampler_protocol"] = SAMPLING_PROTOCOL
+    merged["training_seed"] = 0  # CLI safe_state; no new seed hyperparameter
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**merged)))
 
