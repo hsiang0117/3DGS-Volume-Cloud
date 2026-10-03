@@ -153,11 +153,13 @@ class CameraPrefetcher:
                 # Warm failure is not fatal: the cam is still queued, and the
                 # consumer hits the same error synchronously.
                 print(f"[prefetcher] warm failed for {cam.image_name}: {e}")
-            try:
-                self._q.put(cam, timeout=1.0)
-            except queue.Full:
-                # Loop back to check stop signal; producer was preempted.
-                continue
+            # Queue backpressure must not discard the already sampled camera.
+            while not self._stop.is_set():
+                try:
+                    self._q.put(cam, timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
 
     def next(self):
         return self._q.get()

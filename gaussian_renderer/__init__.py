@@ -15,6 +15,8 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.general_utils import build_rotation
 from utils.graphics_utils import getProjectionMatrix
+from utils.component_ablation import (pipeline_component_ablation,
+    bypass_sun_transmittance, use_single_scattering)
 
 
 # One-shot latch for the "learnable tonemap requested but tonemap.json missing"
@@ -392,11 +394,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # rescales each basis term (HG·T_eff).
     ms_b = 0.5    # transmittance power decay (fixed)
     ms_c = 0.5    # phase isotropization rate (fixed)
-    num_octaves = 6
-    w = pc.get_w  # (P,6), >=0
+    component_ablation = pipeline_component_ablation(pipe)
+    single_scattering = use_single_scattering(component_ablation)
+    num_octaves = 1 if single_scattering else 6
+    # Strict n=0 uses unit energy; unused w stays a PLY/optimizer placeholder.
+    w = None if single_scattering else pc.get_w  # (P,6), >=0
 
     tau_v_l = mass * line_int_v_l
-    if precomputed_T_light is not None:
+    if bypass_sun_transmittance(component_ablation):
+        # Override even a caller-provided cache: this mode removes only the
+        # per-frame sun pass, not independent Stage-2 sky visibility.
+        T_light = torch.ones_like(mass)
+    elif precomputed_T_light is not None:
         T_light = precomputed_T_light
     elif getattr(pipe, "tlight_voxel", False):
         # 128^3 voxel cache (light-space rasterization is the default path).
@@ -411,7 +420,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     scatter_sum = torch.zeros_like(mass)  # (P,1)
     for n in range(num_octaves):
-        energy = w[:, n:n+1]                      # (P,1) learnable per-Gaussian
+        energy = 1.0 if single_scattering else w[:, n:n+1]
         g_eff = g * (ms_c ** n)
         T_eff = torch.pow(T_light.clamp(min=1e-8), ms_b ** n)
         denom_hg = torch.pow(1.0 + g_eff * g_eff - 2.0 * g_eff * cos_theta, 1.5) + eps

@@ -26,6 +26,7 @@ import viser
 from scene.gaussian_model import GaussianModel
 from scene.cameras import MiniCam
 from utils.lightpass_config import saved_lightpass_settings
+from utils.component_ablation import bypass_sun_transmittance
 from gaussian_renderer import render, compute_T_light_voxel, compute_T_light_raster, normalized_gaussian_line_integral
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import build_rotation
@@ -35,6 +36,7 @@ from sky_backdrop import SkyBackdrop, camera_ray_dirs
 # --- Pipeline stub (mirrors arguments.PipelineParams, no argparse needed) ---
 @dataclass
 class _ViewerPipe:
+    component_ablation: str = "full"  # checkpoint mode, not branch training default
     # T_light comes in via precomputed_T_light (compute_T_light_cache), so render()
     # never reaches its own T_light branch.
     tlight_voxel: bool = True
@@ -96,7 +98,8 @@ def viser_to_minicam(cam, width: int, height: int, z_near: float = 0.01, z_far: 
 
 @torch.no_grad()
 def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
-                          use_raster: bool = False, raster_res: int = 512, tau_filter: bool = False, filter_variance: float = 0.0) -> torch.Tensor:
+                          use_raster: bool = False, raster_res: int = 512, tau_filter: bool = False, filter_variance: float = 0.0,
+                          component_ablation: str = "full") -> torch.Tensor:
     """Compute T_light for the given sun direction.
 
     Mirrors the per-Gaussian τ derivation inside render() so the cache matches
@@ -107,6 +110,8 @@ def compute_T_light_cache(gaussians: GaussianModel, v_l: torch.Tensor,
     trained with, since σ_t/albedo calibrate against their training-time shadow
     field.
     """
+    if bypass_sun_transmittance(component_ablation):
+        return torch.ones_like(gaussians.get_sigma_t)
     v_l = v_l.to(device="cuda", dtype=torch.float32)
     v_l = v_l / (torch.linalg.norm(v_l) + 1e-8)
     s = gaussians.get_scaling
@@ -322,6 +327,7 @@ def main():
     tlight_raster_res = 512
     tlight_tau_filter = False
     tlight_filter_variance = 0.0
+    component_ablation = "full"  # absent legacy model metadata means full
     # Training metadata only: the viewer never calls backward.
     trained_tlight_full_grad = True
     # Tonemap: cfg flags say whether a curve was trained and which kind; learnable
@@ -366,6 +372,7 @@ def main():
         tlight_tau_filter = light_settings['tlight_tau_filter']
         trained_tlight_full_grad = light_settings['tlight_full_grad']
         tlight_filter_variance = light_settings['tlight_filter_variance']
+        component_ablation = light_settings['component_ablation']
         m = re.search(r"tlight_raster_res=(\d+)", cfg)
         if m:
             v = int(m.group(1))
@@ -391,6 +398,9 @@ def main():
     print(f"[viewer] Training full light gradients: {trained_tlight_full_grad} "
           "(training only; no effect on viewer forward rendering)")
 
+    print(f"[viewer] Component ablation: {component_ablation} (model cfg_args)")
+    if bypass_sun_transmittance(component_ablation):
+        print("[viewer] Sun transmittance disabled: T_light=1; HG and environment lighting preserved.")
     print(f"[viewer] Loading {args.ply} ...")
     gaussians = GaussianModel()
     gaussians.load_ply(args.ply)
@@ -448,6 +458,7 @@ def main():
     T_light = compute_T_light_cache(
         gaussians, torch.from_numpy(initial_sun).cuda(),
         use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter, filter_variance=tlight_filter_variance,
+        component_ablation=component_ablation,
     ).detach()
     torch.cuda.synchronize()
     print(f"[viewer] T_light ready in {time.time() - t0:.2f}s. Shape = {tuple(T_light.shape)}")
@@ -517,6 +528,7 @@ def main():
             backdrop = None
 
     pipe = _ViewerPipe()
+    pipe.component_ablation = component_ablation
     pipe.tonemap_aces = tonemap_aces
     pipe.tonemap_learnable = tonemap_learnable
     pipe.env_lighting = env_on
@@ -527,10 +539,12 @@ def main():
 
     server = viser.ViserServer(port=args.port)
     server.scene.world_axes.visible = True
-    light_source_label = f"raster {tlight_raster_res} x {tlight_raster_res}" if use_raster_tlight else "voxel 128^3"
+    light_source_label = ("disabled (T_light=1)" if bypass_sun_transmittance(component_ablation) else
+                          (f"raster {tlight_raster_res} x {tlight_raster_res}" if use_raster_tlight else "voxel 128^3"))
     server.gui.add_markdown(
         f"**Model:** `{os.path.basename(run_dir)}`  \n"
         f"**Light pass:** {light_source_label}  \n"
+        f"**Component ablation:** {component_ablation}  \n"
         f"**Tau footprint compensation:** {filter_label}  \n"
         f"**Light dilation variance:** {tlight_filter_variance} pixel²  \n"
         f"**Full light gradients during training:** {trained_tlight_full_grad}  \n"
@@ -832,6 +846,7 @@ def main():
             new_cache = compute_T_light_cache(
                 gaussians, torch.from_numpy(new_sun).cuda(),
                 use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter, filter_variance=tlight_filter_variance,
+                component_ablation=component_ablation,
             ).detach()
         torch.cuda.synchronize()
         state["v_l"] = new_sun
@@ -939,6 +954,7 @@ def main():
                 new_cache = compute_T_light_cache(
                     gaussians, torch.from_numpy(new_sun).cuda(),
                     use_raster=use_raster_tlight, raster_res=tlight_raster_res, tau_filter=tlight_tau_filter, filter_variance=tlight_filter_variance,
+                    component_ablation=component_ablation,
                 ).detach()
             state["v_l"] = new_sun
             state["T_light"] = new_cache
